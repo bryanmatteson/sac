@@ -23,7 +23,14 @@ Native writes hold exclusive publication authority and acknowledge only after
 data and slot durability barriers. Failed or uncertain publication requires
 reconciliation. Recovery never promotes an orphan commit from hash validity
 alone. Extraction uses confined operations, fresh staging and no-clobber
-installation; links and stored executable permissions are not applied. Native
+installation. Contained extraction (`unpack`, `ArchiveReader::extract`) maps
+names outside a portable set and applies no links or stored permissions; use it
+for untrusted input. Tree extraction (`extract`, `ArchiveReader::extract_tree`)
+restores recorded names, symbolic links whose targets can name paths outside
+the tree, and permission bits without set-user-ID, set-group-ID or sticky.
+Neither writes an entry through a link. `privacy-wrap` keeps its private copy
+of the plaintext beside the input, without a name, and never at the wrapper's
+destination. Native
 writable publication and confined extraction currently require a Unix host.
 
 Optional signature verification uses caller-supplied trust policy. age privacy

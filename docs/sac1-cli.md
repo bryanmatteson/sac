@@ -16,6 +16,8 @@ sac pack ./files live.sac --live
 sac list archive.sac
 sac verify archive.sac
 sac read archive.sac images/program.bin --offset 262130 --length 65536 > range.bin
+sac pack ./files archive.sac --preserve
+sac extract archive.sac ./restored
 sac unpack archive.sac ./extracted
 sac compact archive.sac compact.sac
 sac recover damaged-slots.sac ./recovered-files
@@ -62,6 +64,11 @@ while they are captured; the tool does not claim a filesystem snapshot of a
 concurrently changing source tree. The builder's owned temporary directory is
 excluded when it falls within the selected source. New archives store minimal
 metadata; they do not implicitly grant permission to execute extracted files.
+`pack --preserve` also records the core `mode` (permission bits, including
+set-user-ID, set-group-ID and sticky) and `mtime` metadata of each file and
+directory. The snapshot ID then depends on those values: two copies of the same
+bytes with different modification times have different IDs. Without
+`--preserve`, the ID depends only on names, bytes and link targets.
 Payload chunks default to 256 KiB. `pack --chunk-size 1048576` selects fixed
 1 MiB bulk boundaries; chunk size is checked against the canonical frame cap.
 
@@ -98,6 +105,31 @@ original components in the report. Archive names cannot select tool-owned report
 paths. File operations are relative to confined directory handles, reject link
 traversal, and install the completed directory atomically without clobbering an
 existing empty directory. Unsupported confinement/publication hosts reject.
+
+## Extract
+
+`extract` installs a new directory that is the recorded tree. It validates the
+physical selected extent and authenticates content before publication, as
+`unpack` does. Entries keep their recorded names, and symbolic links are
+created. Recorded `mode` permission bits and `mtime` are applied to files and
+directories. The process file-creation mask applies, as it does to new files.
+Set-user-ID, set-group-ID and sticky bits are never applied, and each directory
+stays accessible to its owner. An archive packed without `--preserve` restores
+with default permissions and no execute permission.
+
+`extract` does not change an archive to fit the host. A name that the
+destination filesystem cannot hold, or two names that it does not distinguish
+(for example `A` and `a` on a case-insensitive filesystem), is an `Unsupported`
+error, and nothing is installed. Use `unpack` for such archives. A symbolic link
+target is restored as recorded and can name a path outside the tree; no entry is
+written through a link. Use `unpack` for archives from a source that you do not
+trust. The destination is staged privately and installed atomically without
+clobbering an existing path. No `report.cbor` is written.
+
+Both commands check the entry, byte and depth limits against the complete
+expanded namespace before they create the first file. Each file is handed to the
+storage device as it is written, and one durability barrier covers all of them
+before installation.
 
 ## Damaged files: recover, recover-live and salvage
 

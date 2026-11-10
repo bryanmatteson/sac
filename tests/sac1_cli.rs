@@ -1250,3 +1250,130 @@ fn metadata_cli_live_edits_export_compaction_and_limits() {
             .success()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn every_interrupted_append_recovers_in_a_fresh_process() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("input.txt");
+    fs::write(&source, b"payload").unwrap();
+    let live = tmp.path().join("live.sac");
+    run(&["pack".as_ref(), arg(&source), arg(&live), "--live".as_ref()]);
+    let value = tmp.path().join("value.json");
+    for round in 0..3 {
+        // An interrupted writer leaves appended bytes that no slot selects.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&live)
+            .unwrap()
+            .write_all(&[round; 64])
+            .unwrap();
+        fs::write(&value, format!("\"round {round}\"")).unwrap();
+        run(&[
+            "metadata".as_ref(),
+            "set".as_ref(),
+            arg(&live),
+            "org.example.round".as_ref(),
+            arg(&value),
+            "--json".as_ref(),
+        ]);
+    }
+    run(&["verify".as_ref(), arg(&live)]);
+    assert_eq!(
+        run(&["read".as_ref(), arg(&live), "input.txt".as_ref()]).stdout,
+        b"payload"
+    );
+    // Each recovery keeps the input it replaced under a name of its own.
+    let preserved = fs::read_dir(tmp.path())
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("live.sac1-recovery-")
+        })
+        .count();
+    assert_eq!(preserved, 3);
+}
+
+#[cfg(unix)]
+#[test]
+fn preserved_tree_round_trips_through_extract() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    fs::create_dir_all(source.join("Mixed Case")).unwrap();
+    fs::create_dir(source.join("bin")).unwrap();
+    fs::create_dir(source.join("empty")).unwrap();
+    let document = source.join("Mixed Case/Read Me.TXT");
+    fs::write(&document, b"document").unwrap();
+    let tool = source.join("bin/tool");
+    fs::write(&tool, b"#!/bin/sh\n").unwrap();
+    fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink("bin/tool", source.join("link")).unwrap();
+    let written = UNIX_EPOCH + Duration::new(1_234_567_890, 123_456_789);
+    for path in [&document, &source.join("empty")] {
+        fs::File::open(path).unwrap().set_modified(written).unwrap();
+    }
+
+    let archive = tmp.path().join("preserved.sac");
+    run(&[
+        "pack".as_ref(),
+        arg(&source),
+        arg(&archive),
+        "--preserve".as_ref(),
+    ]);
+    let tree = tmp.path().join("tree");
+    let result = run(&["extract".as_ref(), arg(&archive), arg(&tree)]);
+    let result: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(result["schema"], "sac.tree-extraction.v1");
+    assert_eq!(result["files"], "2");
+    assert_eq!(
+        fs::read(tree.join("Mixed Case/Read Me.TXT")).unwrap(),
+        b"document"
+    );
+    assert_eq!(
+        fs::read_link(tree.join("link")).unwrap(),
+        Path::new("bin/tool")
+    );
+    assert_eq!(fs::read(tree.join("link")).unwrap(), b"#!/bin/sh\n");
+    assert!(tree.join("empty").is_dir());
+    let owner = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o700;
+    assert_eq!(owner(&tree.join("bin/tool")), 0o700);
+    assert_eq!(owner(&tree.join("Mixed Case/Read Me.TXT")), 0o600);
+    for path in ["Mixed Case/Read Me.TXT", "empty"] {
+        assert_eq!(
+            fs::metadata(tree.join(path)).unwrap().modified().unwrap(),
+            written,
+            "{path}"
+        );
+    }
+    // An existing destination is never replaced or merged into.
+    let again = command()
+        .args(["extract".as_ref(), arg(&archive), arg(&tree)])
+        .output()
+        .unwrap();
+    assert_eq!(again.status.code(), Some(1));
+
+    // Without --preserve the archive grants no execute permission.
+    let plain = tmp.path().join("plain.sac");
+    pack(&source, &plain);
+    let plain_tree = tmp.path().join("plain-tree");
+    run(&["extract".as_ref(), arg(&plain), arg(&plain_tree)]);
+    assert_eq!(owner(&plain_tree.join("bin/tool")), 0o600);
+    assert_eq!(
+        fs::read(plain_tree.join("Mixed Case/Read Me.TXT")).unwrap(),
+        b"document"
+    );
+    // The contained layout is unchanged: names outside the portable set map.
+    let contained = tmp.path().join("contained");
+    run(&["unpack".as_ref(), arg(&archive), arg(&contained)]);
+    assert!(contained.join("report.cbor").is_file());
+    assert!(contained.join("content/bin/tool").is_file());
+    assert!(!contained.join("content/Mixed Case").exists());
+    assert_eq!(owner(&contained.join("content/bin/tool")), 0o600);
+}

@@ -268,6 +268,136 @@ fn extraction_maps_unsafe_names_preserves_report_and_never_clobbers() {
     );
 }
 
+#[cfg(all(feature = "native", unix))]
+#[test]
+fn tree_extraction_restores_names_or_refuses_what_the_host_cannot_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = packed(&[
+        ("Read Me.TXT", b"mixed case and a space"),
+        ("nested/Deep File", b"nested"),
+        ("report.cbor", b"archive file"),
+    ]);
+    let store = PositionalStore::open(bytes).unwrap();
+    let reader = ArchiveReader::open(
+        &store,
+        store.reader().snapshot().unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    let destination = dir.path().join("tree");
+    let report = reader.extract_tree(&destination).unwrap();
+    assert_eq!((report.files, report.mapped_entries), (3, 0));
+    assert_eq!(
+        std::fs::read(destination.join("Read Me.TXT")).unwrap(),
+        b"mixed case and a space"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("nested/Deep File")).unwrap(),
+        b"nested"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("report.cbor")).unwrap(),
+        b"archive file"
+    );
+    assert!(reader.extract_tree(&destination).is_err());
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, ["tree"]);
+
+    // Two names that differ only by case are one name on some filesystems.
+    // The tree is then refused whole; it is never silently merged or renamed.
+    let bytes = packed(&[("A", b"upper"), ("a", b"lower")]);
+    let store = PositionalStore::open(bytes).unwrap();
+    let reader = ArchiveReader::open(
+        &store,
+        store.reader().snapshot().unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    let destination = dir.path().join("case");
+    match reader.extract_tree(&destination) {
+        Ok(_) => {
+            assert_eq!(std::fs::read(destination.join("A")).unwrap(), b"upper");
+            assert_eq!(std::fs::read(destination.join("a")).unwrap(), b"lower");
+        }
+        Err(error) => {
+            assert!(matches!(error, sac::v1::Error::Unsupported(_)), "{error}");
+            assert!(!destination.exists());
+        }
+    }
+}
+
+#[cfg(all(feature = "native", unix))]
+#[test]
+fn extraction_checks_expanded_entry_limits_before_touching_the_filesystem() {
+    use sac::v1::cbor::{Value, encode};
+    // Each level names the level below twice, so 20 small pages expand to
+    // more than a million entries.
+    let mut store = MemoryStore::sealed();
+    let file = Value::Array(vec![
+        Value::Bytes(b"f".to_vec()),
+        Value::Uint(0),
+        Value::Map(vec![]),
+        Value::Array(vec![
+            Value::Uint(1),
+            Value::Uint(0),
+            Value::Bytes(b"x".to_vec()),
+        ]),
+    ]);
+    let mut directory = store
+        .put(3, 1, &encode(&Value::Array(vec![file])), &[])
+        .unwrap();
+    for _ in 0..20 {
+        let child = |name: &[u8]| {
+            Value::Array(vec![
+                Value::Bytes(name.to_vec()),
+                Value::Uint(1),
+                Value::Map(vec![]),
+                Value::Uint(0),
+            ])
+        };
+        directory = store
+            .put(
+                3,
+                1,
+                &encode(&Value::Array(vec![child(b"a"), child(b"b")])),
+                &[directory],
+            )
+            .unwrap();
+    }
+    let snapshot = sac::v1::resources::snapshot(&mut store, directory, vec![], vec![]).unwrap();
+    store.publish(snapshot).unwrap();
+    let store = PositionalStore::open(store.as_bytes().to_vec()).unwrap();
+    let reader = ArchiveReader::open(
+        &store,
+        store.reader().snapshot().unwrap(),
+        Limits {
+            max_entries: 10_000,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    // The destination's parent does not exist. Reaching the filesystem first
+    // would report that instead of the exhausted entry limit.
+    let dir = tempfile::tempdir().unwrap();
+    for destination in [
+        dir.path().join("missing/contained"),
+        dir.path().join("missing/tree"),
+    ] {
+        let contained = destination.ends_with("contained");
+        let error = if contained {
+            reader.extract(&destination)
+        } else {
+            reader.extract_tree(&destination)
+        }
+        .unwrap_err();
+        assert!(matches!(error, sac::v1::Error::Limit(_)), "{error}");
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
 #[cfg(feature = "native")]
 #[test]
 fn salvage_rebuilds_damaged_locators_and_requires_root_authority() {

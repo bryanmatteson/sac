@@ -10,8 +10,8 @@ The current wire format is **SAC1**. Each file starts with the four ASCII bytes
 
 ## What you can do with SAC
 
-- **Pack a file tree** into one sealed archive. Unpack it later into a new
-  directory.
+- **Pack a file tree** into one sealed archive. Extract the same tree later
+  into a new directory.
 - **Read one byte range** of one file. The reader authenticates only the
   objects that the range needs. It does not read the full archive.
 - **Keep a live store.** A live store is a SAC file that a local writer updates
@@ -65,12 +65,17 @@ sac inspect portable.sac
 sac verify portable.sac
 sac list portable.sac
 sac read portable.sac images/program.bin --offset 4096 --length 512 > range.bin
+sac extract portable.sac ./restored
 sac unpack portable.sac ./recovered
 ```
 
-- `pack` writes a sealed archive. Add `--live` to write a live store.
-- `unpack` makes a new directory. The files are in its `content/`
-  subdirectory. A report is in `report.cbor`.
+- `pack` writes a sealed archive. Add `--live` to write a live store. Add
+  `--preserve` to record permission bits and modification times.
+- `extract` makes a new directory that is the packed tree: the recorded names,
+  symbolic links, permission bits and modification times.
+- `unpack` makes a new directory for input that you do not trust. The files are
+  in its `content/` subdirectory with host-neutral names, and no link or
+  permission is applied. A report is in `report.cbor`.
 - A command that makes a new file or directory does not overwrite an existing
   path.
 - Each command accepts finite limits for input, output, temporary storage,

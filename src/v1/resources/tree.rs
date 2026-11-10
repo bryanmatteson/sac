@@ -512,8 +512,11 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         )
     }
     pub fn add_directory(&mut self, path: &[Vec<u8>]) -> Result<()> {
+        self.add_directory_with_metadata(path, empty_metadata())
+    }
+    pub fn add_directory_with_metadata(&mut self, path: &[Vec<u8>], metadata: Value) -> Result<()> {
         let root = store_leaf(self.store, &[])?.1;
-        self.insert(path, empty_metadata(), EntryData::Directory(root), false)
+        self.insert(path, metadata, EntryData::Directory(root), false)
     }
     pub fn add_symlink(&mut self, path: &[Vec<u8>], target: &[u8]) -> Result<()> {
         if target.len() > 4096 {

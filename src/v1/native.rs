@@ -2283,14 +2283,27 @@ impl NativeStore {
         }
         let result = (|| {
             let source = self.pin()?;
-            let temporary = self.path.with_extension(format!(
-                "sac1-compact-{}-{}",
-                std::process::id(),
-                next_file_identity()
-            ));
             let mut incarnation = [0; 16];
             File::open("/dev/urandom")?.read_exact(&mut incarnation)?;
-            let mut target = Self::create_policy(&temporary, wire::Preamble::live(incarnation)?)?;
+            // A candidate left by a killed process can carry a recycled
+            // process ID and the same counter value. It is never ours.
+            let mut attempts = 0;
+            let (temporary, mut target) = loop {
+                let temporary = self.path.with_extension(format!(
+                    "sac1-compact-{}-{}",
+                    std::process::id(),
+                    next_file_identity()
+                ));
+                match Self::create_policy(&temporary, wire::Preamble::live(incarnation)?) {
+                    Ok(target) => break (temporary, target),
+                    Err(Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 4096 =>
+                    {
+                        attempts += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
             target.cache = self.cache.clone();
             target.io = self.io.clone();
             target.compaction_target = true;
@@ -3020,11 +3033,25 @@ impl Compaction {
         if cancelled() {
             return Err(Error::Limit("compaction elapsed work"));
         }
-        let backup = self
-            .source_path
-            .with_extension(format!("sac1-recovery-{}", next_file_identity()));
         verify_file_path(&self.source.file, &self.source_path)?;
-        std::fs::hard_link(&self.source_path, &backup)?;
+        // A preserved recovery input from an earlier interrupted writer keeps
+        // its name. The process-local counter restarts in every process, so
+        // an existing name means "taken", never "ours": choose another one.
+        let mut attempts = 0;
+        let backup = loop {
+            let candidate = self
+                .source_path
+                .with_extension(format!("sac1-recovery-{}", next_file_identity()));
+            match std::fs::hard_link(&self.source_path, &candidate) {
+                Ok(()) => break candidate,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::AlreadyExists && attempts < 4096 =>
+                {
+                    attempts += 1;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         self.recovery_backup = Some(backup.clone());
         verify_file_path(&self.source.file, &backup)?;
         sync_parent(&backup)?;

@@ -520,7 +520,7 @@ impl NativeStore {
         self.free_frames = None;
         drop(live);
         drop(journal_reservation);
-        stats.moved_bytes = resume(self.file.get_mut().unwrap(), &dir)?;
+        stats.moved_bytes = resume(self.file.get_mut().unwrap(), &dir, false)?;
         self.refresh_after_maintenance()?;
         stats.file_bytes_after = self.file_len();
         stats.allocated_bytes_after = allocated(self.file.get_mut().unwrap())?;
@@ -646,32 +646,56 @@ pub(super) fn recover(file: &mut File) -> Result<()> {
         }
     }
     if dir.join("manifest").exists() {
-        resume(file, &dir)?;
+        resume(file, &dir, true)?;
     }
     if dir.join("reuse").exists() {
         let bytes = checked_read(&dir, "reuse", MAX_REDO)?;
         if bytes.len() < 40 {
             return Err(corrupt("reuse record"));
         }
-        let mut header = [0; 128];
-        read_at(file, &mut header, 0)?;
-        if blake3::hash(&header).as_bytes() != &bytes[..32] {
-            return Err(corrupt("reuse file identity"));
-        }
+        let frame = &bytes[40..];
         let offset = u64_at(&bytes, 32);
-        if offset < 12288
-            || wire::frame_span(&bytes[40..])? != bytes.len() - 40
-            || offset
-                .checked_add((bytes.len() - 40) as u64)
-                .is_none_or(|n| n > file.metadata().map(|m| m.len()).unwrap_or(0))
-        {
+        if offset < BOOTSTRAP_SIZE as u64 || wire::frame_span(frame)? != frame.len() {
             return Err(corrupt("reuse extent"));
         }
-        write_at(file, &bytes[40..], offset)?;
-        durable(file)?;
+        let length = file.metadata()?.len();
+        let inside = offset
+            .checked_add(frame.len() as u64)
+            .is_some_and(|n| n <= length);
+        if reuse_identity(file)?
+            .iter()
+            .any(|identity| identity[..] == bytes[..32])
+        {
+            if !inside {
+                return Err(corrupt("reuse extent"));
+            }
+            write_at(file, frame, offset)?;
+            durable(file)?;
+        } else if inside {
+            // The record was written for another state of this inode: the
+            // file was restored or replaced under it. It is stale, and safe
+            // to drop, only when no torn write of this frame is present.
+            let mut header = [0; 56];
+            read_at(file, &mut header, offset)?;
+            if wire::frame_span(&header).ok() != Some(frame.len()) {
+                return Err(corrupt("reuse file identity"));
+            }
+        }
         remove(&dir, "reuse")?;
     }
     Ok(())
+}
+/// Identities a reuse record can carry for the file's current state. The
+/// preamble with both publication slots is unchanged between a record's write
+/// and its replay, and differs for every other published state of the file.
+/// The second form is the preamble-only identity of earlier builds.
+fn reuse_identity(file: &File) -> Result<[[u8; 32]; 2]> {
+    let mut bootstrap = vec![0; BOOTSTRAP_SIZE];
+    read_at(file, &mut bootstrap, 0)?;
+    Ok([
+        *blake3::hash(&bootstrap).as_bytes(),
+        *blake3::hash(&bootstrap[..128]).as_bytes(),
+    ])
 }
 pub(super) fn reuse(file: &mut File, offset: u64, bytes: &[u8]) -> Result<()> {
     let dir = leases::domain(file)?;
@@ -679,10 +703,8 @@ pub(super) fn reuse(file: &mut File, offset: u64, bytes: &[u8]) -> Result<()> {
     if leases::pending(&dir) {
         return Err(Error::RecoveryRequired);
     }
-    let mut header = [0; 128];
-    read_at(file, &mut header, 0)?;
     let mut redo = Vec::with_capacity(40 + bytes.len());
-    redo.extend(blake3::hash(&header).as_bytes());
+    redo.extend(reuse_identity(file)?[0]);
     redo.extend(offset.to_le_bytes());
     redo.extend(bytes);
     checked_write(&dir, "reuse", &redo)?;
@@ -696,7 +718,147 @@ pub(super) fn reuse(file: &mut File, offset: u64, bytes: &[u8]) -> Result<()> {
     durable(file)?;
     remove(&dir, "reuse")
 }
-fn resume(file: &mut File, dir: &Path) -> Result<u64> {
+fn frame_present(
+    file: &File,
+    decoder: &mut wire::FrameDecoder,
+    frame: &mut Vec<u8>,
+    reference: ObjectRef,
+    first: u64,
+    bound: u64,
+    length: u64,
+) -> Result<bool> {
+    if reference
+        .address
+        .offset
+        .checked_add(u64::from(reference.address.length))
+        .is_none_or(|end| end > bound.min(length))
+    {
+        return Ok(false);
+    }
+    frame.resize(reference.address.length as usize, 0);
+    read_at(file, frame, reference.address.offset)?;
+    Ok(decoder.decode(reference, frame, first, bound).is_ok())
+}
+/// Whether a journal found at open still describes this file. The journal is
+/// stored outside the container and found by device and inode, so a file that
+/// was restored or replaced under the same inode inherits it. Every frame the
+/// remaining steps read must be where the journal says it is before the first
+/// destructive write: moved rows at their destination, the pending batch in
+/// its redo record, and the other rows at their source.
+///
+/// `Ok(false)` means the journal is stale: the file selects a head whose whole
+/// closure is intact without it, so dropping the journal loses nothing.
+/// Anything else is an error, and no byte of the file has been changed.
+fn journal_matches(
+    file: &File,
+    plan: &mut File,
+    manifest: &[u8],
+    done: u64,
+    replay: Option<(u64, &[u8])>,
+) -> Result<bool> {
+    let old = wire::Preamble::decode(&manifest[..128])?;
+    let root = spill::decode_ref(&manifest[256..300])?;
+    let generation = u64_at(manifest, 300);
+    let count = u64_at(manifest, 308);
+    let end = u64_at(manifest, 316);
+    let original_end = u64_at(manifest, 356);
+    let first = old.first_record_offset();
+    let length = file.metadata()?.len();
+    let mut current = [0; 128];
+    read_at(file, &mut current, 0)?;
+    // This transaction completed and the file has published again since.
+    // Finalizing a second time would replace those newer heads.
+    if current[..] == manifest[128..256]
+        && Reader::open_at(file).is_ok_and(|reader| {
+            reader
+                .publication
+                .is_some_and(|p| p.generation > generation.saturating_add(1))
+        })
+    {
+        return Ok(false);
+    }
+    let unmoved = replay.map_or(done, |(next, _)| next);
+    let mut decoder = wire::FrameDecoder::default();
+    let mut frame = Vec::new();
+    // The slide starts only under the old preamble and ends before the new one.
+    let mut consistent = done == count || current[..] == manifest[..128];
+    plan.seek(SeekFrom::Start(0))?;
+    for row_index in 0..count {
+        if !consistent {
+            break;
+        }
+        let mut row = [0; PLAN_ROW];
+        plan.read_exact(&mut row)?;
+        let source = spill::decode_ref(&row[..44])?;
+        let mut moved = source;
+        moved.address.offset = u64_at(&row, 44);
+        consistent = if row_index < done {
+            frame_present(file, &mut decoder, &mut frame, moved, first, end, length)?
+        } else if let Some((_, redo)) = replay.filter(|_| row_index < unmoved) {
+            moved
+                .address
+                .offset
+                .checked_sub(u64_at(redo, 8))
+                .and_then(|at| usize::try_from(at).ok())
+                .and_then(|at| redo[16..].get(at..at.checked_add(moved.address.length as usize)?))
+                .is_some_and(|bytes| decoder.decode(moved, bytes, first, end).is_ok())
+        } else {
+            frame_present(
+                file,
+                &mut decoder,
+                &mut frame,
+                source,
+                first,
+                original_end,
+                length,
+            )?
+        };
+    }
+    // Until finalization the file still ends at the head this plan was made
+    // for. A longer or differently published file is another version of it.
+    if consistent && done < count {
+        consistent = length == original_end && original_end >= first + 160 && {
+            let mut bytes = [0; 160];
+            read_at(file, &mut bytes, original_end - 160)?;
+            wire::Trailer::decode(&bytes, &old, original_end - 160, length).is_ok_and(|trailer| {
+                trailer.commit.hash == root.hash
+                    && trailer.generation.checked_add(1) == Some(generation)
+            })
+        };
+    }
+    if consistent {
+        return Ok(true);
+    }
+    let mismatch = || corrupt("maintenance journal does not match this file");
+    let reader = match Reader::open_at(file) {
+        Ok(reader) => reader,
+        Err(Error::Io(error)) => return Err(error.into()),
+        Err(_) => return Err(mismatch()),
+    };
+    let Some(publication) = reader
+        .publication
+        .filter(|_| reader.recovery_diagnostics.is_empty())
+    else {
+        return Err(mismatch());
+    };
+    let options = ReclamationOptions::default();
+    let selected = FrozenFile {
+        file: file.try_clone()?,
+        header: reader.header,
+        end: reader.committed_end(),
+    };
+    match mark(
+        &selected,
+        &[publication.root],
+        &options,
+        temporary::Budget::new(options.limits.max_temp_bytes),
+    ) {
+        Ok(_) => Ok(false),
+        Err(Error::Io(error)) => Err(error.into()),
+        Err(_) => Err(mismatch()),
+    }
+}
+fn resume(file: &mut File, dir: &Path, recovering: bool) -> Result<u64> {
     let m = checked_read(dir, "manifest", 512)?;
     if m.len() != 372 {
         return Err(corrupt("in-place manifest"));
@@ -801,6 +963,7 @@ fn resume(file: &mut File, dir: &Path) -> Result<u64> {
     if done > count {
         return Err(corrupt("maintenance progress count"));
     }
+    let mut replay = None;
     if dir.join("redo").exists() {
         let redo = checked_read(dir, "redo", MAX_REDO)?;
         if redo.len() < 16 {
@@ -816,11 +979,31 @@ fn resume(file: &mut File, dir: &Path) -> Result<u64> {
             {
                 return Err(corrupt("maintenance redo extent"));
             }
-            write_at(file, &redo[16..], u64_at(&redo, 8))?;
-            durable(file)?;
-            checked_write(dir, "progress", &next.to_le_bytes())?;
-            done = next;
+            replay = Some((next, redo));
         }
+    }
+    // The transaction that just wrote this journal holds the file and its
+    // exclusive gate. A journal found at open is bound to the file first.
+    if recovering
+        && !journal_matches(
+            file,
+            &mut plan,
+            &m,
+            done,
+            replay.as_ref().map(|(next, redo)| (*next, redo.as_slice())),
+        )?
+    {
+        remove(dir, "manifest")?;
+        for name in ["plan", "progress", "redo"] {
+            remove(dir, name)?;
+        }
+        return Ok(0);
+    }
+    if let Some((next, redo)) = replay {
+        write_at(file, &redo[16..], u64_at(&redo, 8))?;
+        durable(file)?;
+        checked_write(dir, "progress", &next.to_le_bytes())?;
+        done = next;
     }
     let mut decoder = wire::FrameDecoder::default();
     let mut frame = Vec::with_capacity(maximum_span);

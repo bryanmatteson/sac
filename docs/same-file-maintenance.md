@@ -54,6 +54,20 @@ when diagnosing recovery. Copying a partially compacted source without its
 journal does not produce a recoverable archive. Fully completed SAC files remain
 self-contained and independently readable.
 
+A journal is found by device and inode, so a file that is restored or replaced
+in place under the same inode inherits a pending journal. Writable open
+therefore binds a journal to the file before it changes one byte. Each frame
+that the remaining steps read must be where the journal says it is: moved frames
+at their destination, the pending batch in its redo record, and all other frames
+at their source. Before finalization, the file must also still end at the head
+that the plan was made for. If the file does not agree, and the head that it
+selects admits with its complete closure intact, the journal is stale: it is
+removed and the file is opened unchanged. That is the result of restoring a
+backup over an interrupted compaction. If the file does not agree and is not
+complete without the journal, open fails with an integrity error, the file and
+the journal are unchanged, and `sac salvage` remains available. A reused-frame
+record is bound to the preamble and both publication slots in the same way.
+
 The syscall adapter supports macOS `F_PUNCHHOLE` and Linux
 `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`; filesystem support is required.
 It discards only complete 16 KiB allocation units strictly inside dead stored

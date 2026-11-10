@@ -15,9 +15,10 @@ type Result<T> = std::result::Result<T, AnyError>;
 const DEFAULT_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const HELP: &str = "sac — generic SAC1 tools
 usage:
-  sac pack <source-directory-or-file> <archive|-> [--live] [--chunk-size N]
+  sac pack <source-directory-or-file> <archive|-> [--live] [--preserve] [--chunk-size N]
   sac list <archive|->
   sac verify <archive|->
+  sac extract <archive|-> <new-directory>
   sac unpack <archive|-> <new-destination>
   sac recover <archive|-> <new-destination>
   sac read <archive|URL|-> <resource> [--offset N] [--length N] [--http-statistics]
@@ -44,7 +45,11 @@ Common limits: --max-input-bytes N --max-output-bytes N --max-temp-bytes N
                --max-entries N --max-seconds N --max-memory-bytes N
 N is an unsigned decimal integer. Defaults: 64 GiB input/output, 128 GiB
 temporary storage, 1,000,000 entries, one hour. Commands creating a new
-destination never overwrite an existing path. Same-file maintenance edits
+destination never overwrite an existing path. pack --preserve records
+permission bits and modification times. extract restores the tree itself:
+recorded names, symbolic links, permission bits and modification times.
+unpack writes content/ and report.cbor with host-neutral names and applies
+no links or permissions. Same-file maintenance edits
 owner-private live files under native reader coordination. Recovery preserves source bytes and never promotes an
 orphan live commit. All commands use the current SAC1 format.
 ";
@@ -72,6 +77,7 @@ struct Args {
     command: String,
     paths: Vec<OsString>,
     live: bool,
+    preserve: bool,
     metadata_json: bool,
     no_punch: bool,
     strip_local: bool,
@@ -120,6 +126,7 @@ impl Args {
             command: command.into(),
             paths: Vec::new(),
             live: false,
+            preserve: false,
             metadata_json: false,
             no_punch: false,
             strip_local: false,
@@ -189,6 +196,13 @@ impl Args {
                     return Err(failure("Usage", "--live is only valid with pack"));
                 }
                 out.live = true;
+                continue;
+            }
+            if !literal && argument == "--preserve" {
+                if out.command != "pack" {
+                    return Err(failure("Usage", "--preserve is only valid with pack"));
+                }
+                out.preserve = true;
                 continue;
             }
             if !literal && argument == "--http-statistics" {
@@ -283,8 +297,8 @@ impl Args {
         }
         let count = match out.command.as_str() {
             "help" | "--help" | "-h" => return Ok(out),
-            "pack" | "unpack" | "recover" | "recover-live" | "salvage" | "read" | "compact"
-            | "privacy-wrap" | "privacy-open" => 2,
+            "pack" | "extract" | "unpack" | "recover" | "recover-live" | "salvage" | "read"
+            | "compact" | "privacy-wrap" | "privacy-open" => 2,
             "list" | "verify" | "inspect" | "compact-in-place" | "reclaim" | "metadata-list" => 1,
             "metadata-get" | "metadata-remove" | "metadata-export" => 2,
             "metadata-set" => 3,
@@ -646,6 +660,36 @@ impl<S: sac::v1::ObjectStore> sac::v1::ObjectStore for BoundedStore<S> {
     }
 }
 
+/// The core `mode` and `mtime` metadata of one source entry.
+#[cfg(unix)]
+fn recorded_metadata(metadata: &cap_std::fs::Metadata) -> Result<sac::v1::cbor::Value> {
+    use cap_std::fs::MetadataExt;
+    use sac::v1::cbor::Value;
+    let seconds = metadata.mtime();
+    let nanoseconds = u64::try_from(metadata.mtime_nsec())
+        .ok()
+        .filter(|n| *n <= 999_999_999)
+        .ok_or_else(|| failure("Unsupported", "source modification time is out of range"))?;
+    Ok(sac::v1::cbor::text_map(vec![
+        ("mode", Value::Uint(u64::from(metadata.mode() & 0o7777))),
+        (
+            "mtime",
+            Value::Array(vec![
+                if seconds < 0 {
+                    Value::NInt(seconds.unsigned_abs() - 1)
+                } else {
+                    Value::Uint(seconds as u64)
+                },
+                Value::Uint(nanoseconds),
+            ]),
+        ),
+    ]))
+}
+#[cfg(not(unix))]
+fn recorded_metadata(_: &cap_std::fs::Metadata) -> Result<sac::v1::cbor::Value> {
+    Err(failure("Unsupported", "--preserve requires a Unix host"))
+}
+
 fn add_source<S: sac::v1::ObjectStore>(
     builder: &mut sac::v1::resources::ArchiveBuilder<'_, S>,
     source: &Path,
@@ -691,12 +735,16 @@ fn add_source<S: sac::v1::ObjectStore>(
             ));
         }
         let metadata = directory.symlink_metadata(name)?;
-        let empty = Value::Map(Vec::new());
+        let recorded = if args.preserve {
+            recorded_metadata(&metadata)?
+        } else {
+            Value::Map(Vec::new())
+        };
         if metadata.is_symlink() {
             let target = directory.read_link_contents(name)?;
             builder.add_symlink(path, &os_bytes(target.as_os_str())?)?;
         } else if metadata.is_dir() {
-            builder.add_directory(path)?;
+            builder.add_directory_with_metadata(path, recorded)?;
             let child = directory.open_dir(name)?;
             for entry in child.entries()? {
                 let entry = entry?;
@@ -737,7 +785,7 @@ fn add_source<S: sac::v1::ObjectStore>(
                     "source changed to a non-regular file",
                 ));
             }
-            builder.add_reader_with_metadata(path, file, empty)?;
+            builder.add_reader_with_metadata(path, file, recorded)?;
         } else {
             return Err(failure("Unsupported", "source contains a special file"));
         }
@@ -961,7 +1009,7 @@ fn execute(args: Args) -> Result<()> {
                 )?;
             }
             return emit(
-                &json!({"schema":"sac.privacy.v1","operation":args.command,"output":args.paths[1]}),
+                &json!({"schema":"sac.privacy.v1","operation":args.command,"output":Path::new(&args.paths[1]).display().to_string()}),
             );
         }
         #[cfg(not(feature = "privacy-age"))]
@@ -1173,6 +1221,13 @@ fn execute(args: Args) -> Result<()> {
             let report = reader.extract(Path::new(&args.paths[1]))?;
             emit(
                 &json!({"schema":"sac.extraction-result.v1","snapshot":snapshot.hash.to_string(),"destination":Path::new(&args.paths[1]).display().to_string(),"report":{"entries":report.entries.to_string(),"files":report.files.to_string(),"logical_bytes":report.logical_bytes.to_string(),"mapped_entries":report.mapped_entries.to_string(),"report_path":report.report_path.display().to_string(),"physical_checked":report.physical_checked,"core_checked":report.core_checked,"profile_checked":report.profile_checked},"recovery_diagnostics":source.reader().recovery_diagnostics}),
+            )?;
+        }
+        "extract" => {
+            source.validate_with_limits(reader.limits())?;
+            let report = reader.extract_tree(Path::new(&args.paths[1]))?;
+            emit(
+                &json!({"schema":"sac.tree-extraction.v1","snapshot":snapshot.hash.to_string(),"destination":Path::new(&args.paths[1]).display().to_string(),"entries":report.entries.to_string(),"files":report.files.to_string(),"logical_bytes":report.logical_bytes.to_string(),"recovery_diagnostics":source.reader().recovery_diagnostics}),
             )?;
         }
         "read" => read_resource(&reader, &args)?,

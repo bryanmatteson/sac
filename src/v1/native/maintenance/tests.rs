@@ -196,6 +196,128 @@ fn killed_processes_recover_before_admission() {
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino, "{point}");
     }
 }
+fn crash(path: &Path, point: &str) {
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "v1::native::maintenance::tests::crash_child",
+            "--nocapture",
+        ])
+        .env("SAC_TEST_MAINTENANCE_FILE", path)
+        .env("SAC_TEST_MAINTENANCE_FAULT", point)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(86), "{point}");
+}
+/// Replace the contents of the same inode, as copying a backup over a path does.
+fn restore(path: &Path, bytes: &[u8]) {
+    let ino = std::fs::metadata(path).unwrap().ino();
+    std::fs::write(path, bytes).unwrap();
+    assert_eq!(std::fs::metadata(path).unwrap().ino(), ino);
+}
+fn journal(path: &Path) -> PathBuf {
+    leases::domain(&File::open(path).unwrap()).unwrap()
+}
+#[test]
+fn journal_of_an_interrupted_slide_never_changes_a_restored_file_it_does_not_describe() {
+    // The first three points leave a file the journal still describes once the
+    // backup is back: nothing durable depends on moved frames, so the slide
+    // completes. At the later points the journal records moved frames that
+    // the restored file does not have. It is stale and must be dropped.
+    for (point, stale) in [
+        ("manifest", false),
+        ("redo", false),
+        ("partial-data", false),
+        ("progress", true),
+        ("preamble", true),
+        ("slot", true),
+        ("truncate", true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live");
+        let store = fixture(&path);
+        let hash = store.root().unwrap().root.hash;
+        drop(store);
+        let backup = std::fs::read(&path).unwrap();
+        crash(&path, point);
+        restore(&path, &backup);
+        let store = NativeStore::open(&path, true).unwrap();
+        verify(&store, hash);
+        drop(store);
+        assert!(!leases::pending(&journal(&path)), "{point}");
+        if stale {
+            assert_eq!(std::fs::read(&path).unwrap(), backup, "{point}");
+        }
+        let store = NativeStore::open(&path, true).unwrap();
+        verify(&store, hash);
+    }
+}
+#[test]
+fn journal_is_dropped_when_an_older_version_of_the_file_is_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live");
+    let mut store = NativeStore::create_live(&path, [24; 16]).unwrap();
+    publish(&mut store, 1);
+    publish(&mut store, 2);
+    let older = store.root().unwrap().root.hash;
+    let backup = std::fs::read(&path).unwrap();
+    publish(&mut store, 3);
+    drop(store);
+    for point in ["manifest", "progress", "truncate"] {
+        crash(&path, point);
+        restore(&path, &backup);
+        let store = NativeStore::open(&path, true).unwrap();
+        verify_data(&store, older, 2);
+        drop(store);
+        assert!(!leases::pending(&journal(&path)), "{point}");
+        assert_eq!(std::fs::read(&path).unwrap(), backup, "{point}");
+        let mut store = NativeStore::open(&path, true).unwrap();
+        publish(&mut store, 3);
+    }
+}
+#[test]
+fn damaged_slide_output_fails_closed_and_resumes_after_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live");
+    let store = fixture(&path);
+    let hash = store.root().unwrap().root.hash;
+    drop(store);
+    // Every frame has moved and the old layout is gone.
+    crash(&path, "preamble");
+    let good = std::fs::read(&path).unwrap();
+    let mut damaged = good.clone();
+    damaged[BOOTSTRAP_SIZE + 4096] ^= 1;
+    restore(&path, &damaged);
+    assert!(matches!(
+        NativeStore::open(&path, true),
+        Err(Error::Corrupt(message)) if message.contains("journal does not match")
+    ));
+    assert_eq!(std::fs::read(&path).unwrap(), damaged);
+    assert!(leases::pending(&journal(&path)));
+    restore(&path, &good);
+    let store = NativeStore::open(&path, true).unwrap();
+    verify(&store, hash);
+}
+#[test]
+fn reuse_record_for_another_version_of_the_file_is_dropped_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("live");
+    let mut store = NativeStore::create_live(&path, [24; 16]).unwrap();
+    publish(&mut store, 1);
+    publish(&mut store, 2);
+    let older = store.root().unwrap().root.hash;
+    let backup = std::fs::read(&path).unwrap();
+    publish(&mut store, 3);
+    drop(store);
+    crash(&path, "reuse-redo");
+    assert!(journal(&path).join("reuse").exists());
+    restore(&path, &backup);
+    let store = NativeStore::open(&path, true).unwrap();
+    verify_data(&store, older, 2);
+    drop(store);
+    assert!(!leases::pending(&journal(&path)));
+    assert_eq!(std::fs::read(&path).unwrap(), backup);
+}
 #[test]
 fn pin_child() {
     let Some(path) = std::env::var_os("SAC_TEST_PIN_FILE") else {

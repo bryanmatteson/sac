@@ -154,17 +154,43 @@ fn destination(path: &Path, limits: &PrivacyLimits) -> Result<PathBuf> {
         .unwrap_or(Path::new("."))
         .to_path_buf())
 }
-fn stage(input: &Path, parent: &Path, work: &Work<'_>) -> Result<tempfile::NamedTempFile> {
+fn open_input(input: &Path, work: &Work<'_>) -> Result<File> {
     if !std::fs::metadata(input)?.is_file() {
         return Err(corrupt("privacy input must be a regular file"));
     }
-    let mut source = File::open(input)?;
+    let source = File::open(input)?;
     if !source.metadata()?.is_file() {
         return Err(corrupt("privacy input must be a regular file"));
     }
     if source.metadata()?.len() > work.limits.max_input_bytes {
         return Err(Error::Limit("privacy input bytes"));
     }
+    Ok(source)
+}
+/// A private, stable copy of the plaintext to wrap. The copy has no name, so
+/// an interrupted process leaves nothing behind. It is made beside the input,
+/// or in the host temporary directory when the input's directory is not
+/// writable. It is never made at the destination: writing a wrapper to other
+/// media must not carry the plaintext there.
+fn stage_plaintext(input: &Path, work: &Work<'_>) -> Result<File> {
+    let mut source = open_input(input, work)?;
+    let beside = input
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut copy = match tempfile::tempfile_in(beside) {
+        Ok(file) => file,
+        Err(_) => tempfile::tempfile()?,
+    };
+    io::copy(
+        &mut source,
+        &mut output(&mut copy, work, work.limits.max_input_bytes),
+    )?;
+    copy.seek(SeekFrom::Start(0))?;
+    Ok(copy)
+}
+fn stage(input: &Path, parent: &Path, work: &Work<'_>) -> Result<tempfile::NamedTempFile> {
+    let mut source = open_input(input, work)?;
     let mut temp = temporary(parent)?;
     io::copy(
         &mut source,
@@ -326,8 +352,8 @@ pub fn wrap_file(
         start: Instant::now(),
         temp: Cell::new(0),
     };
-    let mut plaintext = stage(input.as_ref(), &parent, &work)?;
-    sealed(plaintext.as_file(), &work, false)?;
+    let mut plaintext = stage_plaintext(input.as_ref(), &work)?;
+    sealed(&plaintext, &work, false)?;
     let mut ciphertext = temporary(&parent)?;
     let encryptor = age::Encryptor::with_recipients(keys.iter().map(|k| k as &dyn age::Recipient))
         .map_err(|_| corrupt("age recipient set rejected"))?;
@@ -338,8 +364,8 @@ pub fn wrap_file(
             limits.max_output_bytes,
         ))
         .map_err(|_| corrupt("age encryption initialization failed"))?;
-    plaintext.as_file_mut().seek(SeekFrom::Start(0))?;
-    io::copy(plaintext.as_file_mut(), &mut writer)?;
+    plaintext.seek(SeekFrom::Start(0))?;
+    io::copy(&mut plaintext, &mut writer)?;
     writer
         .finish()
         .map_err(|_| corrupt("age encryption failed"))?;
