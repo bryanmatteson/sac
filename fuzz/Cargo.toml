@@ -1,0 +1,36 @@
+[package]
+name = "sac-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.sac]
+path = ".."
+
+# Isolate from the parent package: an empty workspace table makes this its own
+# workspace root, so the project's `cargo build` / `cargo test` on stable never
+# pulls in this nightly-only crate.
+[workspace]
+
+[[bin]]
+name = "read_sac1"
+path = "fuzz_targets/read_sac1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "write_sac1"
+path = "fuzz_targets/write_sac1.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1

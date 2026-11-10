@@ -1,0 +1,125 @@
+{
+  "format": "SAC1",
+  "vectors": [
+    {
+      "file": "valid/compressed.sac",
+      "valid": true,
+      "sha256": "a728ee0e37e5d4e1bfada24d34d7491ef260f85c5fd2d57f2b51fec1909bd0b3",
+      "snapshot": "27803bd24affdc58fd1a6460985e90ab93e50edb445f163fa28e26db9fee08e3",
+      "content_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "error_class": null
+    },
+    {
+      "file": "invalid/discarded-section-draft.sac",
+      "valid": false,
+      "sha256": "75e9bf1335395573d2030b1da9cdbd7e2c02e2524112b48b48a3333f6f467380",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "valid/live.sac",
+      "valid": true,
+      "sha256": "952d3e6fe781b52990b11813f79ae4e0df420980879f35350fbf67debdee4008",
+      "snapshot": "93414f98fdba4b0dbb034026449fcfa7be2eeb2ce293824600f03e5886d22fcb",
+      "content_hex": "68656c6c6f20534143310a",
+      "error_class": null
+    },
+    {
+      "file": "invalid/nonzero-preamble-reserved.sac",
+      "valid": false,
+      "sha256": "20bc47dc02de658644a830207d9ebe5e35d732932124d3a689eff77b60f62d81",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "valid/opaque-profile.sac",
+      "valid": true,
+      "sha256": "d56bf057b26c988d794966eb2101a528ea1004fe97bc2e70bd7113e0bb4dabb4",
+      "snapshot": "d70dd569229d48ed9506947425bab8a9a3969baba45dc000e3ac69bb1329158f",
+      "content_hex": "68656c6c6f20534143310a",
+      "error_class": null
+    },
+    {
+      "file": "valid/optional-core-capability.sac",
+      "valid": true,
+      "sha256": "3056fa1dc35abb53c36781ce4466bcb3f00e645f797d89e59f396e7aa4d9f3b1",
+      "snapshot": "a6b9aeb4501641c512c2d4bfa9ead886cbad2d8520e450b50ac34d5d8b3398ef",
+      "content_hex": "68656c6c6f20534143310a",
+      "error_class": null
+    },
+    {
+      "file": "invalid/required-core-capability.sac",
+      "valid": false,
+      "sha256": "2b113f863fecb9c717e2fec49a2d2c04acd1dd65d17f7c8eb7fb11228342a0b2",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": "unsupported"
+    },
+    {
+      "file": "valid/required-profile-capability.sac",
+      "valid": true,
+      "sha256": "9845cb9dbb8bac1bc9f445c55e7c9c001eb38f210a6a45ef81087d6a8d580a38",
+      "snapshot": "cf070de5ab7bbc5a9e37b6eb507fa96937b622d9bfae258f903bd2317b9664df",
+      "content_hex": "68656c6c6f20534143310a",
+      "error_class": null
+    },
+    {
+      "file": "invalid/reserved-core-schema-in-profile.sac",
+      "valid": false,
+      "sha256": "7485dce3db7a4bf992e97d46740f11451368b27a56d451e7e9c1d3055feecf50",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": "unsupported"
+    },
+    {
+      "file": "valid/sealed.sac",
+      "valid": true,
+      "sha256": "867f88b9151a050d7bec3c69d4ca3538d0594367f396026a7d28ce81ac93d66b",
+      "snapshot": "93414f98fdba4b0dbb034026449fcfa7be2eeb2ce293824600f03e5886d22fcb",
+      "content_hex": "68656c6c6f20534143310a",
+      "error_class": null
+    },
+    {
+      "file": "invalid/superseded-eight-byte-magic.sac",
+      "valid": false,
+      "sha256": "da7d63c21187acfceffc2e2271411b37b1a78013275180ed485130990494c6ce",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "invalid/superseded-prerelease.sac",
+      "valid": false,
+      "sha256": "cce123df1213920dfb01d2e9bbda9568e233980f7d1b271ef14e490e2218fd2b",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "invalid/trailer-checksum.sac",
+      "valid": false,
+      "sha256": "0187cc3232a6dfba3ab15fe1af0b2a0fa2a6fd93a1ad0aaada8403c36d9c95c8",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "invalid/trailing-byte.sac",
+      "valid": false,
+      "sha256": "72b4a32450536afce3a6dc54e5fe18d0f7d37f78448978a1d7923a11713d9628",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    },
+    {
+      "file": "invalid/truncated-magic-only.sac",
+      "valid": false,
+      "sha256": "0c1b2eec3657f703064d64c292ff20eb1d2cc7f21216210f7ffa2a9f46f433df",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": null
+    }
+  ]
+}

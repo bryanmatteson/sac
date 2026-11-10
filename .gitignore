@@ -1,0 +1,8 @@
+.DS_Store
+**/target
+# Cargo.lock is tracked because the crate ships the production sac binary.
+# Keep codec and privacy dependencies reproducible.
+**/*.rs.bk
+**/__pycache__/
+**/*.pyc
+.venv/

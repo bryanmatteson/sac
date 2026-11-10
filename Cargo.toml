@@ -1,0 +1,64 @@
+[package]
+name        = "sac"
+version     = "0.2.0"
+edition     = "2024"
+rust-version = "1.90"
+authors     = ["Bryan Matteson"]
+license     = "MIT"
+description = "Sealed Artifact Container (SAC) — authenticated SAC1 containers and live stores"
+repository  = "https://github.com/bryanmatteson/sac"
+readme      = "README.md"
+categories  = ["encoding", "parser-implementations"]
+keywords    = ["sac", "container", "binary-format", "blake3", "merkle"]
+# Keep the published package to the crate and specification; executable
+# conformance vectors, fuzz targets and recovery tools live in the repository.
+exclude = [
+    "conformance/",
+    "fuzz/",
+    "tools/",
+    "docs/",
+    "examples/",
+    "tests/",
+]
+
+[features]
+# Portable core-only readers use bounded pure-Rust mandatory-codec decoding.
+default = ["native", "trust", "privacy-age"]
+trust = ["dep:ed25519-dalek"]
+compression = ["dep:zstd"]
+native = ["compression", "dep:tempfile", "dep:same-file", "dep:cap-std", "dep:rustix", "dep:libc"]
+serde = ["dep:serde"]
+http = ["dep:reqwest"]
+privacy-age = ["native", "dep:age"]
+
+[dependencies]
+age                   = { version = "0.12.1", default-features = false, optional = true }
+blake3                = "1"
+ed25519-dalek         = { version = "2", optional = true }
+hex                   = "0.4"
+serde                 = { version = "1", features = ["derive"], optional = true }
+serde_json            = { version = "1", features = ["preserve_order"] }
+thiserror             = "2"
+unicode-normalization = "0.1"
+zstd                  = { version = "0.13", optional = true }
+
+ruzstd                = "0.8"
+reqwest               = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
+tempfile              = { version = "3", optional = true }
+same-file             = { version = "1", optional = true }
+cap-std               = { version = "3", optional = true }
+libc                  = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix                = { version = "1.1.4", features = ["fs"], optional = true }
+
+[[bin]]
+name = "sac"
+path = "src/bin/sac.rs"
+required-features = ["native"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "warn"
