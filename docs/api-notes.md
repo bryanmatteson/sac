@@ -21,6 +21,12 @@ keep pending writes coalesced and bound read-ahead to the written prefix. Reader
 pins and publication drain the buffer before exposing bytes or running the
 ordered durability barriers. Appending alone does not publish data.
 
+Before each write, a native writer checks that the destination name, in the
+directory that it opened, still names its file. A replaced or removed
+destination file fails that write. A replaced ancestor directory does not fail
+a write: each publication and maintenance operation examines the complete
+path, and `NativeStore::verify_current_path` does so at any time.
+
 ## Parallel encoding
 
 `NativeStore::set_encode_threads(n)` lets resource builders hash and compress
@@ -76,6 +82,14 @@ and Linux; explicit bounded byte reads and the normal file cache remain
 available.
 
 ## Verified objects and closure copies
+
+When a closure copy moves an object between native stores, the destination
+stores the Zstandard bytes of the source frame again. The bytes come from the
+read that authenticated the object, so a cache hit has none and the
+destination compresses the object. A raw source frame, a commit and a snapshot
+also take the destination's encoder. A copy from a file that this library
+wrote has the same bytes with and without this path; a copy from a file with
+frames from a different encoder keeps those frames.
 
 `VerifiedObject` carries immutable bytes and their authenticated identity from a
 store read into a closure copy. Native and private staging writers reuse that

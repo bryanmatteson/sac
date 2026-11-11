@@ -393,6 +393,28 @@ impl FrameEncoder {
             let _ = level;
             object.write_canonical(&mut self.frame);
         }
+        self.finish(object, hash, codec)
+    }
+    /// A frame for `object` from the Zstandard bytes of another frame. A
+    /// decoder authenticated those bytes as the canonical bytes of this
+    /// object; only the child locators differ.
+    #[cfg(feature = "compression")]
+    pub(crate) fn encode_stored(
+        &mut self,
+        object: &CanonicalObject,
+        hash: ObjectHash,
+        compressed: &[u8],
+    ) -> Result<&[u8]> {
+        check_input(&object.bytes, &object.children)?;
+        validate_core_object(object)?;
+        self.frame.clear();
+        self.frame.resize(FRAME, 0);
+        self.frame.extend_from_slice(compressed);
+        self.finish(object, hash, 1)
+    }
+    // The stored bytes are in the frame. Add the child locators, the padding
+    // and the header.
+    fn finish(&mut self, object: &CanonicalObject, hash: ObjectHash, codec: u8) -> Result<&[u8]> {
         let stored = self.frame.len() - FRAME;
         for child in &object.children {
             self.frame

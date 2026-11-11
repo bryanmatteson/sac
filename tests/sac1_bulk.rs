@@ -518,3 +518,76 @@ fn parallel_encoding_writes_the_same_file_bytes_as_one_thread() {
         }
     }
 }
+
+#[test]
+fn native_copy_stores_compressed_frames_again_with_the_same_file_bytes() {
+    use sac::v1::NativeStore;
+    use sac::v1::native::{ClosureCopy, NativeReader};
+    // A source that gives the copier only decoded objects, so the destination
+    // compresses each one.
+    struct Decoded<'a>(&'a NativeReader);
+    impl ObjectStore for Decoded<'_> {
+        fn get(&self, r: ObjectRef) -> Result<CanonicalObject> {
+            self.0.get(r)
+        }
+        fn get_verified_shared(&self, r: ObjectRef) -> Result<std::sync::Arc<CanonicalObject>> {
+            self.0.get_verified_shared(r)
+        }
+        fn put(&mut self, _: u16, _: u16, _: &[u8], _: &[ObjectRef]) -> Result<ObjectRef> {
+            unreachable!()
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let source_path = directory.path().join("source.sac");
+    let snapshot = {
+        let mut store = NativeStore::create_live(&source_path, [5; 16]).unwrap();
+        let mut builder = ArchiveBuilder::bulk(&mut store, Limits::default()).unwrap();
+        builder.set_chunk_size(64 * 1024).unwrap();
+        // Compressible and incompressible chunks, and inline files in pages.
+        let mut mixed = vec![0u8; 700 * 1024];
+        blake3::Hasher::new().finalize_xof().fill(&mut mixed);
+        for block in mixed.chunks_mut(4096).step_by(2) {
+            block.fill(b'a');
+        }
+        builder
+            .add_file(&path_from_str("mixed").unwrap(), &mixed)
+            .unwrap();
+        for ordinal in 0..300u32 {
+            builder
+                .add_file(
+                    &path_from_str(&format!("small/{ordinal:04}")).unwrap(),
+                    format!("file {ordinal} ").repeat(40).as_bytes(),
+                )
+                .unwrap();
+        }
+        let snapshot = builder.finish().unwrap();
+        store.publish(snapshot).unwrap();
+        snapshot
+    };
+    let copy = |name: &str, relocate: bool| {
+        // A new reader has an empty cache: each object comes from its frame.
+        let reader = NativeReader::open(&source_path).unwrap();
+        let path = directory.path().join(name);
+        let mut destination = NativeStore::create_live(&path, [6; 16]).unwrap();
+        let mut copier = ClosureCopy::new().unwrap();
+        let copied = if relocate {
+            copier.copy_root(&reader, &mut destination, snapshot)
+        } else {
+            copier.copy_root(&Decoded(&reader), &mut destination, snapshot)
+        }
+        .unwrap();
+        assert_eq!(copied.hash, snapshot.hash);
+        destination.publish(copied).unwrap();
+        drop(destination);
+        let reopened = NativeReader::open(&path).unwrap();
+        reopened.validate().unwrap();
+        let archive = ArchiveReader::open(&reopened, copied, Limits::default()).unwrap();
+        archive.verify().unwrap();
+        std::fs::read(&path).unwrap()
+    };
+    let relocated = copy("relocated.sac", true);
+    let compressed = copy("compressed.sac", false);
+    assert!(relocated == compressed);
+    // The source holds compressed frames, so the copy had some to store again.
+    assert!(relocated.len() < 700 * 1024);
+}

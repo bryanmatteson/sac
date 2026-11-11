@@ -147,6 +147,7 @@ fn directory_reader<S: ObjectStore + ?Sized>(
         directory,
         limits,
         has_profiles: true,
+        rows: Default::default(),
     }
 }
 

@@ -89,6 +89,23 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   compressed frame made a new codec context.
 - Read the name of each directory row during a lookup without a second scan
   of its other fields, and pass over rows without recursion.
+- Check the destination before each native write with one lookup of its name
+  in the directory that the writer opened, instead of a walk of the complete
+  path. A replaced or removed destination file fails the write, as before. A
+  replaced ancestor directory fails at the next publication or maintenance
+  operation, which examine the complete path.
+- Store the Zstandard bytes of a source frame again when a closure copy moves
+  an object between native stores, instead of compressing the same canonical
+  bytes. The bytes come from the read that authenticated the object; a cache
+  hit, a raw frame and a commit or snapshot take the encoder as before. A
+  source that this library wrote gives the same destination bytes.
+- Keep the row positions of the directory pages that an `ArchiveReader` has
+  examined, to a maximum of 1 MiB. A later lookup in a page of 16 rows or
+  more is a binary search. A page whose keys are not in order keeps the pass
+  over each row.
+- Put an entry into a directory leaf from the encoded rows of the page, and
+  read a page's height without its rows. An edit decoded each entry of the
+  page twice and encoded the page twice. The pages have the same bytes.
 - Keep at most 1 MiB of the parents that a closure copy is inside. A parent
   whose children are complete is not read and authenticated a second time. A
   copier with disk-only metadata keeps none.

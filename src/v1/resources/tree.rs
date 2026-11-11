@@ -167,31 +167,177 @@ pub(crate) fn directory(object: &CanonicalObject) -> Result<DirectoryNode> {
     }
 }
 
+// One leaf row. A child reference takes its index in `children`, in the order
+// of first use.
+fn entry_row(entry: &Entry, children: &mut Vec<ObjectRef>) -> Value {
+    let (kind, value) = match &entry.data {
+        EntryData::File { length, data } => {
+            let (storage, value) = match data {
+                FileData::Inline(b) => (0, Value::Bytes(b.clone())),
+                FileData::Extents(r) => (1, uint(child_index(children, *r))),
+            };
+            (0, array(vec![uint(*length), uint(storage), value]))
+        }
+        EntryData::Directory(r) => (1, uint(child_index(children, *r))),
+        EntryData::Symlink(target) => (2, Value::Bytes(target.clone())),
+    };
+    array(vec![
+        Value::Bytes(entry.name.clone()),
+        uint(kind),
+        entry.metadata.clone(),
+        value,
+    ])
+}
 pub(crate) fn encode_leaf(entries: &[Entry]) -> (Value, Vec<ObjectRef>) {
     let mut children = Vec::new();
     let rows = entries
         .iter()
-        .map(|entry| {
-            let (kind, value) = match &entry.data {
-                EntryData::File { length, data } => {
-                    let (storage, value) = match data {
-                        FileData::Inline(b) => (0, Value::Bytes(b.clone())),
-                        FileData::Extents(r) => (1, uint(child_index(&mut children, *r))),
-                    };
-                    (0, array(vec![uint(*length), uint(storage), value]))
-                }
-                EntryData::Directory(r) => (1, uint(child_index(&mut children, *r))),
-                EntryData::Symlink(target) => (2, Value::Bytes(target.clone())),
-            };
-            array(vec![
-                Value::Bytes(entry.name.clone()),
-                uint(kind),
-                entry.metadata.clone(),
-                value,
-            ])
-        })
+        .map(|entry| entry_row(entry, &mut children))
         .collect();
     (array(rows), children)
+}
+// The CBOR head of an array of `count` items.
+fn array_head(count: usize) -> Vec<u8> {
+    let mut head = cbor::encode(&uint(count as u64));
+    head[0] |= 4 << 5;
+    head
+}
+// The last key and the reference of each page that replaces one page.
+type Pages = Vec<(Vec<u8>, ObjectRef)>;
+#[cfg(test)]
+static SPLICE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Put one entry into a leaf page from the encoded rows of the page. The new
+/// page has the bytes that decoding every entry and encoding the changed list
+/// gives: a validated page holds deterministic CBOR, so an unchanged row keeps
+/// its bytes, and a row with a child reference changes only when its index
+/// in the new child table differs. `None` means that this page takes the
+/// decoded path: it must split, or it is larger than the writer's target.
+fn splice_leaf<S: ObjectStore + ?Sized>(
+    store: &mut S,
+    root: ObjectRef,
+    object: &CanonicalObject,
+    entry: &Entry,
+    replace: bool,
+    budget: &Budget,
+) -> Result<Option<Pages>> {
+    use crate::v1::cbor_view;
+    #[cfg(test)]
+    if SPLICE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(None);
+    }
+    if object.version != 1
+        || object.canonical_len() > DIRECTORY_LEAF_LIMIT
+        || object.canonical_len() > budget.directory_write_limit
+    {
+        return Ok(None);
+    }
+    let rows = cbor_view::admitted(&object.bytes)?
+        .array()?
+        .collect::<Result<Vec<_>>>()?;
+    let key = |row: &cbor_view::Item<'_>| row.first_field(4)?.bytes().map(<[u8]>::to_vec);
+    let mut failure = None;
+    let found = rows.binary_search_by(|row| match row.first_field(4).and_then(|k| k.bytes()) {
+        Ok(key) => key.cmp(entry.name.as_slice()),
+        Err(error) => {
+            failure = Some(error);
+            std::cmp::Ordering::Equal
+        }
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    let (position, replaced) = match found {
+        Ok(position) => {
+            if !replace {
+                let [_, kind, _, _] = rows[position].fields()?;
+                if kind.uint()? == 1 && matches!(entry.data, EntryData::Directory(_)) {
+                    return Ok(Some(vec![(key(rows.last().unwrap())?, root)]));
+                }
+                return Err(corrupt("duplicate resource path"));
+            }
+            (position, true)
+        }
+        Err(position) => (position, false),
+    };
+    let mut children = Vec::new();
+    let mut body = Vec::with_capacity(object.bytes.len() + 4096);
+    body.extend_from_slice(&array_head(rows.len() + usize::from(!replaced)));
+    let new_row = |body: &mut Vec<u8>, children: &mut Vec<ObjectRef>| {
+        body.extend_from_slice(&cbor::encode(&entry_row(entry, children)));
+    };
+    for (index, row) in rows.iter().enumerate() {
+        if index == position {
+            new_row(&mut body, &mut children);
+            if replaced {
+                continue;
+            }
+        }
+        let [_, kind, _, value] = row.fields()?;
+        // The item that holds a child index, and the row bytes before it.
+        let reference = match kind.uint()? {
+            0 => {
+                let [_, storage, data] = value.fields()?;
+                (storage.uint()? == 1).then_some(data)
+            }
+            1 => Some(value),
+            2 => None,
+            _ => return Err(corrupt("unknown directory entry type")),
+        };
+        let Some(reference) = reference else {
+            body.extend_from_slice(row.encoded());
+            continue;
+        };
+        let old = reference.uint()?;
+        let child = *usize::try_from(old)
+            .ok()
+            .and_then(|old| object.children.get(old))
+            .ok_or_else(|| corrupt("child index"))?;
+        let new = child_index(&mut children, child);
+        if new == old {
+            body.extend_from_slice(row.encoded());
+            continue;
+        }
+        // The index is the last item of the row.
+        let prefix = row.encoded().len() - reference.encoded().len();
+        body.extend_from_slice(&row.encoded()[..prefix]);
+        body.extend_from_slice(&cbor::encode(&uint(new)));
+    }
+    if position == rows.len() {
+        new_row(&mut body, &mut children);
+    }
+    let size = 8 + children.len() * 32 + body.len();
+    if children.len() > 1024 || size > DIRECTORY_LEAF_LIMIT || size > budget.directory_write_limit {
+        return Ok(None);
+    }
+    let reference = match store.rewrite_source(root)? {
+        Some(source) => store.rewrite(&source, 3, 1, &body, &children)?,
+        None => store.put(3, 1, &body, &children)?,
+    };
+    let last = if position >= rows.len() - usize::from(replaced) {
+        entry.name.clone()
+    } else {
+        key(rows.last().unwrap())?
+    };
+    Ok(Some(vec![(last, reference)]))
+}
+// The height of a directory page, without its rows.
+fn directory_height(object: &CanonicalObject) -> Result<u64> {
+    if object.version != 1 {
+        return Err(Error::Unsupported("directory schema".into()));
+    }
+    match object.kind {
+        3 => Ok(0),
+        4 => {
+            let height = crate::v1::cbor_view::admitted(&object.bytes)?
+                .first_field(2)?
+                .uint()?;
+            if !(1..=16).contains(&height) {
+                return Err(corrupt("directory branch height"));
+            }
+            Ok(height)
+        }
+        _ => Err(corrupt("expected directory node")),
+    }
 }
 fn encode_branch(height: u64, fences: &[(Vec<u8>, ObjectRef)]) -> (Value, Vec<ObjectRef>) {
     let mut children = Vec::new();
@@ -965,10 +1111,7 @@ fn update_directory<S: ObjectStore + ?Sized>(
         }
     };
     let object = budget.get(store, root)?;
-    let height = match directory(&object)? {
-        DirectoryNode::Leaf(_) => 0,
-        DirectoryNode::Branch { height, .. } => height,
-    };
+    let height = directory_height(&object)?;
     let changes = insert_page(store, root, entry, replace || path.len() > 1, budget, depth)?;
     finish_directory_pages(store, height, changes, budget)
 }
@@ -998,7 +1141,7 @@ pub(crate) fn lookup_entry<S: ObjectStore + ?Sized>(
     name: &[u8],
     budget: &mut Budget,
 ) -> Result<Option<Entry>> {
-    super::pages::lookup(store, root, name, budget)?
+    super::pages::lookup(store, root, name, budget, None)?
         .map(|entry| entry.owned())
         .transpose()
 }
@@ -1031,6 +1174,11 @@ fn insert_page<S: ObjectStore + ?Sized>(
 ) -> Result<Vec<(Vec<u8>, ObjectRef)>> {
     budget.depth(depth)?;
     let object = budget.get(store, root)?;
+    if object.kind == 3
+        && let Some(pages) = splice_leaf(store, root, &object, &entry, replace, budget)?
+    {
+        return Ok(pages);
+    }
     match directory(&object)? {
         DirectoryNode::Leaf(mut entries) => {
             let write_limit = if object.canonical_len() > budget.directory_write_limit {
@@ -1055,7 +1203,11 @@ fn insert_page<S: ObjectStore + ?Sized>(
             }
             let (v, c) = encode_leaf(&entries);
             if fits_leaf(&v, &c) && canonical_size(&v, &c) <= budget.directory_write_limit {
-                return Ok(vec![store_leaf_after(store, &entries, Some(root))?]);
+                let reference = put_tree_value(store, Some(root), 3, v, &c)?;
+                return Ok(vec![(
+                    entries.last().map(|e| e.name.clone()).unwrap_or_default(),
+                    reference,
+                )]);
             }
             batch::emit_leaves(store, &entries, budget, Some(root), write_limit)
         }
@@ -1067,12 +1219,11 @@ fn insert_page<S: ObjectStore + ?Sized>(
             fences.splice(i..i + 1, changes);
             let (v, c) = encode_branch(height, &fences);
             if fits(&v, &c) && canonical_size(&v, &c) <= budget.directory_write_limit {
-                return Ok(vec![store_branch_after(
-                    store,
-                    height,
-                    &fences,
-                    Some(root),
-                )?]);
+                if height > 16 || fences.len() < 2 {
+                    return Err(Error::Limit("directory tree height"));
+                }
+                let reference = put_tree_value(store, Some(root), 4, v, &c)?;
+                return Ok(vec![(fences.last().unwrap().0.clone(), reference)]);
             }
             batch::emit_branches(store, height, &fences, budget, Some(root))
         }
@@ -1618,5 +1769,82 @@ mod extent_sizing_tests {
         let (expected, children) = encode_extents(&[(24, None), (3, Some(child)), (65536, None)]);
         assert_eq!(store.get(root).unwrap().bytes, cbor::encode(&expected));
         assert_eq!(store.get(root).unwrap().children, children);
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+    use crate::v1::{MemoryStore, ObjectHash};
+    use std::sync::atomic::Ordering;
+
+    // Apply one sequence of edits and return each directory root and each
+    // edit result.
+    fn edit(spliced: bool) -> Vec<(ObjectHash, bool)> {
+        SPLICE_DISABLED.store(!spliced, Ordering::Relaxed);
+        let mut store = MemoryStore::sealed();
+        let mut root = None;
+        let mut seed = 7u64;
+        let mut results = Vec::new();
+        for step in 0..700u64 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let directory = (seed >> 20) % 4;
+            let file = (seed >> 30) % 70;
+            let choice = (seed >> 44) % 12;
+            let mut path = Vec::new();
+            if directory > 0 {
+                path.push(format!("d{directory}").into_bytes());
+            }
+            path.push(format!("f{file:02}").into_bytes());
+            let metadata = if seed & 1 == 0 {
+                Value::Map(Vec::new())
+            } else {
+                cbor::text_map(vec![("mode", Value::Uint(0o644 + (seed >> 8) % 8))])
+            };
+            let mut builder = match root {
+                Some(root) => ArchiveBuilder::from_directory(&mut store, root, Limits::default()),
+                None => ArchiveBuilder::new(&mut store),
+            };
+            builder.set_chunk_size(16 * 1024).unwrap();
+            // Some steps use a small page target, so pages split and old
+            // pages are larger than the target.
+            if (step / 50) % 3 == 1 {
+                builder.set_page_limit(8 * 1024).unwrap();
+            }
+            let small = vec![(seed >> 16) as u8; ((seed >> 24) % 900) as usize];
+            let result = match choice {
+                // A file in an extent tree: its row holds a child index.
+                0 => {
+                    let mut large = vec![0u8; 49 * 1024 + (seed % 100) as usize];
+                    large[..8].copy_from_slice(&seed.to_le_bytes());
+                    builder.set_file(&path, &large, metadata)
+                }
+                1 => builder.add_symlink(&path, b"target"),
+                2 => builder.add_file(&path, &small),
+                _ => builder.set_file(&path, &small, metadata),
+            };
+            let next = builder.finish_directory().unwrap();
+            results.push((next.hash, result.is_ok()));
+            root = Some(next);
+        }
+        SPLICE_DISABLED.store(false, Ordering::Relaxed);
+        results
+    }
+    #[test]
+    fn spliced_leaf_edits_give_the_pages_of_decoded_edits() {
+        let spliced = edit(true);
+        let decoded = edit(false);
+        assert_eq!(spliced, decoded);
+        // Some edits fail (a duplicate path), and the root changes.
+        assert!(spliced.iter().any(|(_, ok)| !ok));
+        assert!(
+            spliced
+                .windows(2)
+                .filter(|pair| pair[0].0 != pair[1].0)
+                .count()
+                > 300
+        );
     }
 }

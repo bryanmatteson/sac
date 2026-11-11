@@ -60,6 +60,10 @@ pub struct NativeStore {
     staging_temporary_budget: Option<temporary::Budget>,
     control_roots: Vec<ObjectRef>,
     encode_threads: usize,
+    // The directory that holds the destination, for the check before each
+    // write. None for a read-only store and on a host without `fstatat`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    directory: Option<File>,
 }
 // Coalesce small immutable frames before positional I/O. Reads that miss the
 // authenticated object cache drain this buffer only when they need buffered
@@ -121,6 +125,22 @@ fn append_frame(
     }
     Ok(())
 }
+/// The open directory of a writable destination.
+fn destination_directory(path: &Path) -> Result<Option<File>> {
+    #[cfg(unix)]
+    {
+        Ok(Some(File::open(
+            path.parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or(Path::new(".")),
+        )?))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
 fn options(writable: bool) -> OpenOptions {
     let mut o = OpenOptions::new();
     o.read(true).write(writable);
@@ -179,6 +199,7 @@ impl NativeStore {
         if path.try_exists()? {
             return Err(std::io::Error::from(std::io::ErrorKind::AlreadyExists).into());
         }
+        let directory = destination_directory(&path)?;
         let temporary = tempfile::Builder::new()
             .prefix(".sac1-create-")
             .tempfile_in(path.parent().unwrap())?;
@@ -223,6 +244,7 @@ impl NativeStore {
             staging_temporary_budget: None,
             control_roots: Vec::new(),
             encode_threads: 1,
+            directory,
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -240,6 +262,11 @@ impl NativeStore {
             file.try_lock().map_err(lock_error)?;
             verify_file_path(&file, &path)?;
         }
+        let directory = if writable {
+            destination_directory(&path)?
+        } else {
+            None
+        };
         #[cfg(unix)]
         if writable {
             maintenance::recover(&mut file)?;
@@ -302,6 +329,7 @@ impl NativeStore {
             staging_temporary_budget: None,
             control_roots: Vec::new(),
             encode_threads: 1,
+            directory,
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         #[cfg(unix)]
@@ -365,6 +393,38 @@ impl NativeStore {
     /// and its frame, in addition to the caller's operation memory limit.
     pub fn set_encode_threads(&mut self, threads: usize) {
         self.encode_threads = threads.clamp(1, 64);
+    }
+    /// The check before each write: the destination name, in the directory
+    /// that this writer opened, still names this writer's file. One lookup
+    /// from the open directory replaces a walk of the complete path. A
+    /// replaced or removed destination file fails here. A replaced ancestor
+    /// directory does not; every publication and maintenance operation
+    /// examines the complete path with [`Self::verify_current_path`].
+    fn verify_destination_entry(&self) -> Result<()> {
+        #[cfg(unix)]
+        if let (Some(directory), Some(name)) = (&self.directory, self.path.file_name()) {
+            use std::os::unix::fs::MetadataExt;
+            let named = rustix::fs::statat(directory, name, rustix::fs::AtFlags::empty());
+            if self.pending.is_some() {
+                return match named {
+                    Err(rustix::io::Errno::NOENT) => Ok(()),
+                    Err(error) => Err(std::io::Error::from(error).into()),
+                    Ok(_) => Err(corrupt("destination appeared during private creation")),
+                };
+            }
+            let named = named.map_err(std::io::Error::from)?;
+            let retained = self.file.lock().unwrap().metadata()?;
+            // The same integer conversions as `MetadataExt`.
+            return if (named.st_dev as u64, named.st_ino as u64) == (retained.dev(), retained.ino())
+            {
+                Ok(())
+            } else {
+                Err(corrupt(
+                    "stale publication: destination names a different incarnation",
+                ))
+            };
+        }
+        self.verify_current_path()
     }
     pub fn preserved_recovery_input(&self) -> Option<&Path> {
         self.recovery_preserved.as_deref()
@@ -1026,18 +1086,21 @@ impl NativeStore {
         self.append_hashed(object, hash)
     }
     fn append_hashed(&mut self, object: CanonicalObject, hash: ObjectHash) -> Result<ObjectRef> {
-        self.append_encoded(object, hash, None)
+        self.append_encoded(object, hash, None, None)
     }
     /// `prepared` is the frame of `object` at this store's compression level.
+    /// `compressed` is the Zstandard encoding of its canonical bytes.
     fn append_encoded(
         &mut self,
         object: CanonicalObject,
         hash: ObjectHash,
         prepared: Option<Vec<u8>>,
+        compressed: Option<&[u8]>,
     ) -> Result<ObjectRef> {
-        let frame: &[u8] = match &prepared {
-            Some(frame) => frame,
-            None => self
+        let frame: &[u8] = match (&prepared, compressed) {
+            (Some(frame), _) => frame,
+            (None, Some(compressed)) => self.encoder.encode_stored(&object, hash, compressed)?,
+            (None, None) => self
                 .encoder
                 .encode_hashed(&object, self.compression_level, hash)?,
         };
@@ -1187,45 +1250,15 @@ impl ObjectStore for NativeStore {
         self.get_shared(r).map(Arc::unwrap_or_clone)
     }
     fn get_shared(&self, r: ObjectRef) -> Result<Arc<CanonicalObject>> {
-        let end = self.physical_read_scope().unwrap().end;
-        wire::validate_address(r.address, self.reader.first_record_offset(), end)?;
-        if let Some(object) = self.cache.lock().unwrap().get(self.file_identity, r) {
-            return Ok(object);
-        }
-        let mut disk_end = if self.end == self.reader.committed_end() {
-            self.reader.trailer_offset()
-        } else {
-            self.end
-        };
-        let needs_flush = {
-            let buffer = self.append_buffer.lock().unwrap();
-            if buffer.failed {
-                return Err(Error::Poisoned);
-            }
-            if buffer.bytes.is_empty() {
-                false
-            } else if r.address.offset + u64::from(r.address.length) <= buffer.offset {
-                // An inherited lookup cannot observe the pending suffix. Keep
-                // small appends coalesced and cap read-ahead at the written
-                // prefix, so a metadata window never includes unflushed bytes.
-                disk_end = disk_end.min(buffer.offset);
-                false
-            } else {
-                true
-            }
-        };
-        if needs_flush {
-            flush_append(&self.file, &self.append_buffer)?;
-        }
-        read_object(
-            &self.file.lock().unwrap(),
-            self.reader.header.first_record_offset(),
-            disk_end,
-            &self.cache,
-            self.file_identity,
-            &self.io,
-            r,
-        )
+        self.shared_keeping(r, false).map(|read| read.0)
+    }
+    fn verified_object(&self, reference: ObjectRef) -> Result<VerifiedObject> {
+        let (object, compressed) = self.shared_keeping(reference, true)?;
+        Ok(VerifiedObject {
+            hash: reference.hash,
+            object,
+            compressed,
+        })
     }
     fn put(
         &mut self,
@@ -1234,7 +1267,7 @@ impl ObjectStore for NativeStore {
         bytes: &[u8],
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
-        self.put_checked_edges(kind, version, bytes, children, None, None)
+        self.put_checked_edges(kind, version, bytes, children, None, None, None)
     }
     fn prepare_width(&self) -> usize {
         self.encode_threads
@@ -1316,7 +1349,7 @@ impl ObjectStore for NativeStore {
         }
         // The checks of `put` for an object that has no children.
         self.check_writable()?;
-        self.verify_current_path()?;
+        self.verify_destination_entry()?;
         if let Some(reference) = self
             .root()
             .map(|p| p.root)
@@ -1330,7 +1363,7 @@ impl ObjectStore for NativeStore {
             self.validate_reference(reference)?;
             return Ok(reference);
         }
-        self.append_encoded(object, hash, Some(frame))
+        self.append_encoded(object, hash, Some(frame), None)
     }
     fn put_verified(
         &mut self,
@@ -1346,11 +1379,12 @@ impl ObjectStore for NativeStore {
             children,
             None,
             Some(source.hash()),
+            source.compressed.as_ref().map(|bytes| bytes.as_slice()),
         )
     }
     fn rewrite_source(&self, parent: ObjectRef) -> Result<Option<RewriteSource>> {
         self.check_writable()?;
-        self.verify_current_path()?;
+        self.verify_destination_entry()?;
         let committed_end = self.reader.committed_end();
         let readable_end = self.physical_read_scope().unwrap().end;
         wire::validate_address(
@@ -1403,7 +1437,7 @@ impl ObjectStore for NativeStore {
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
         self.check_writable()?;
-        self.verify_current_path()?;
+        self.verify_destination_entry()?;
         let current_end = self.physical_read_scope().unwrap().end;
         if source.identity != self.file_identity
             || source.committed_end > self.reader.committed_end()
@@ -1436,7 +1470,7 @@ impl ObjectStore for NativeStore {
                 .sum();
             drop(cache);
             if unverified_bytes <= u64::from(source.parent.address.length) * 2 {
-                return self.put_checked_edges(kind, version, bytes, children, None, None);
+                return self.put_checked_edges(kind, version, bytes, children, None, None, None);
             }
             // Reauthenticate this one parent occurrence without inserting any
             // child/layout status into a shared cache. This also detects a
@@ -1462,11 +1496,54 @@ impl ObjectStore for NativeStore {
                 return Err(corrupt("staged rewrite source layout changed"));
             }
         }
-        self.put_checked_edges(kind, version, bytes, children, Some(source), None)
+        self.put_checked_edges(kind, version, bytes, children, Some(source), None, None)
     }
 }
 
 impl NativeStore {
+    fn shared_keeping(&self, r: ObjectRef, keep: bool) -> Result<ObjectRead> {
+        let end = self.physical_read_scope().unwrap().end;
+        wire::validate_address(r.address, self.reader.first_record_offset(), end)?;
+        if let Some(object) = self.cache.lock().unwrap().get(self.file_identity, r) {
+            return Ok((object, None));
+        }
+        let mut disk_end = if self.end == self.reader.committed_end() {
+            self.reader.trailer_offset()
+        } else {
+            self.end
+        };
+        let needs_flush = {
+            let buffer = self.append_buffer.lock().unwrap();
+            if buffer.failed {
+                return Err(Error::Poisoned);
+            }
+            if buffer.bytes.is_empty() {
+                false
+            } else if r.address.offset + u64::from(r.address.length) <= buffer.offset {
+                // An inherited lookup cannot observe the pending suffix. Keep
+                // small appends coalesced and cap read-ahead at the written
+                // prefix, so a metadata window never includes unflushed bytes.
+                disk_end = disk_end.min(buffer.offset);
+                false
+            } else {
+                true
+            }
+        };
+        if needs_flush {
+            flush_append(&self.file, &self.append_buffer)?;
+        }
+        read_object_keeping(
+            &self.file.lock().unwrap(),
+            self.reader.header.first_record_offset(),
+            disk_end,
+            &self.cache,
+            self.file_identity,
+            &self.io,
+            r,
+            keep,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
     fn put_checked_edges(
         &mut self,
         kind: u16,
@@ -1475,9 +1552,10 @@ impl NativeStore {
         children: &[ObjectRef],
         source: Option<&RewriteSource>,
         authenticated_hash: Option<ObjectHash>,
+        compressed: Option<&[u8]>,
     ) -> Result<ObjectRef> {
         self.check_writable()?;
-        self.verify_current_path()?;
+        self.verify_destination_entry()?;
         check_input(bytes, children).inspect_err(|error| {
             eprintln!(
                 "canonical physical size rejected: kind={kind} version={version} payload_bytes={} children={}: {error}",
@@ -1545,7 +1623,15 @@ impl NativeStore {
             self.validate_reference(reference)?;
             return Ok(reference);
         }
-        self.append_hashed(object, hash)
+        // Zstandard bytes that a source authenticated as this object are
+        // what this store's encoder makes from the same canonical bytes.
+        // Store them again unless this store would keep the object raw.
+        let compressed = compressed.filter(|bytes| {
+            self.compression_level != 0
+                && !matches!(object.kind, 1 | 2)
+                && <[u8]>::len(bytes) < object.canonical_len()
+        });
+        self.append_encoded(object, hash, None, compressed)
     }
 }
 
@@ -1762,6 +1848,23 @@ impl ObjectStore for NativeReader {
             r,
         )
     }
+    fn verified_object(&self, reference: ObjectRef) -> Result<VerifiedObject> {
+        let (object, compressed) = read_object_keeping(
+            &self.file,
+            self.reader.first_record_offset(),
+            self.reader.trailer_offset(),
+            &self.cache,
+            self.file_identity,
+            &self.io,
+            reference,
+            true,
+        )?;
+        Ok(VerifiedObject {
+            hash: reference.hash,
+            object,
+            compressed,
+        })
+    }
     fn put(&mut self, _: u16, _: u16, _: &[u8], _: &[ObjectRef]) -> Result<ObjectRef> {
         Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
     }
@@ -1800,6 +1903,9 @@ fn rehint_to(
         generation = next.target.clone();
     }
 }
+/// An object, with the Zstandard bytes of its frame when the same read
+/// authenticated a compressed frame.
+type ObjectRead = (Arc<CanonicalObject>, Option<Arc<Vec<u8>>>);
 fn read_object(
     file: &File,
     first: u64,
@@ -1809,12 +1915,27 @@ fn read_object(
     io: &PhysicalCounters,
     r: ObjectRef,
 ) -> Result<Arc<CanonicalObject>> {
+    read_object_keeping(file, first, end, cache, identity, io, r, false).map(|read| read.0)
+}
+/// The object, and with `keep` the Zstandard bytes of its frame when this
+/// call read and authenticated a compressed frame. A cache hit has no frame.
+#[allow(clippy::too_many_arguments)]
+fn read_object_keeping(
+    file: &File,
+    first: u64,
+    end: u64,
+    cache: &Mutex<DecodedCache>,
+    identity: u64,
+    io: &PhysicalCounters,
+    r: ObjectRef,
+    keep: bool,
+) -> Result<ObjectRead> {
     wire::validate_address(r.address, first, end)?;
     let length = r.address.length as usize;
     let recycled = {
         let mut governing = cache.lock().unwrap();
         if let Some(object) = governing.get(identity, r) {
-            return Ok(object);
+            return Ok((object, None));
         }
         governing.take_read_buffer(length)
     };
@@ -1868,6 +1989,15 @@ fn read_object(
             counted_read_at(file, &mut frame, r.address.offset, io, ReadClass::Object)?;
         }
     }
+    // The decoder checks these bytes; they are used only after it succeeds.
+    let compressed = (keep && frame.get(4) == Some(&1))
+        .then(|| {
+            let stored = u32::from_le_bytes(frame.get(8..12)?.try_into().ok()?) as usize;
+            frame
+                .get(wire::FRAME..wire::FRAME.checked_add(stored)?)
+                .map(|bytes| Arc::new(bytes.to_vec()))
+        })
+        .flatten();
     let mut decoder = cache.lock().unwrap().take_decoder();
     let decoded = decoder.decode_owned(r, frame, first, end);
     let mut cache = cache.lock().unwrap();
@@ -1875,7 +2005,7 @@ fn read_object(
     let object = Arc::new(decoded?);
     cache.verify(identity, r, (object.kind, object.version));
     cache.insert_shared(identity, r, &object);
-    Ok(object)
+    Ok((object, compressed))
 }
 struct FileSource<'a> {
     file: &'a File,

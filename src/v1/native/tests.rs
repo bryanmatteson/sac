@@ -211,6 +211,27 @@ fn destination_fence_survives_replacement_and_old_pins_survive_compaction() {
         Err(Error::Busy)
     ));
 }
+#[cfg(unix)]
+#[test]
+fn replaced_ancestor_directory_is_rejected_at_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir(&home).unwrap();
+    let path = home.join("db.sac");
+    let mut store = NativeStore::create_live(&path, [2; 16]).unwrap();
+    let first = snapshot(&mut store, b"old");
+    store.publish(first).unwrap();
+    std::fs::rename(&home, dir.path().join("moved")).unwrap();
+    std::fs::create_dir(&home).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    // The check before a write looks in the directory that the writer
+    // opened, where its file still has its name. The write is not durable
+    // authority; the publication examines the complete path.
+    let next = snapshot(&mut store, b"new");
+    assert!(store.verify_current_path().is_err());
+    assert!(store.publish(next).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+}
 #[test]
 fn stale_descriptor_is_rejected_before_append() {
     let (dir, mut store) = store();

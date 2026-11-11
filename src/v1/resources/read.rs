@@ -36,6 +36,8 @@ pub struct ArchiveReader<'a, S: ObjectStore + ?Sized> {
     pub(crate) directory: ObjectRef,
     pub(crate) limits: Limits,
     pub(crate) has_profiles: bool,
+    // Row positions of the directory pages that lookups have examined.
+    pub(crate) rows: std::sync::Mutex<super::pages::RowIndexes>,
 }
 impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     pub fn open(store: &'a S, snapshot: ObjectRef, limits: Limits) -> Result<Self> {
@@ -69,6 +71,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
             directory,
             limits,
             has_profiles: !values(&fields[1])?.is_empty(),
+            rows: Default::default(),
         })
     }
     pub fn snapshot(&self) -> ObjectRef {
@@ -149,7 +152,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         let mut root = self.directory;
         for (i, name) in path.iter().enumerate() {
             budget.depth(i)?;
-            let Some(entry) = super::pages::lookup(self.store, root, name, budget)? else {
+            let Some(entry) =
+                super::pages::lookup(self.store, root, name, budget, Some(&self.rows))?
+            else {
                 return Ok(None);
             };
             if i + 1 == path.len() {

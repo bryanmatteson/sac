@@ -177,6 +177,11 @@ pub struct PhysicalReadScope {
 pub struct VerifiedObject {
     hash: ObjectHash,
     object: Arc<CanonicalObject>,
+    // The Zstandard bytes of the frame that the source read and
+    // authenticated as this object. A native destination stores them again
+    // instead of compressing the same canonical bytes.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    compressed: Option<Arc<Vec<u8>>>,
 }
 /// One object without children that a store encoded before its put. Only a
 /// store makes this value, so its identity is the hash of its own bytes.
@@ -246,6 +251,7 @@ pub trait ObjectStore {
         Ok(VerifiedObject {
             hash: reference.hash,
             object: self.get_verified_shared(reference)?,
+            compressed: None,
         })
     }
     /// Authenticated kind and version of one exact physical occurrence. Native
