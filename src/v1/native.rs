@@ -59,6 +59,7 @@ pub struct NativeStore {
     temporary_extent: Option<temporary::Reservation>,
     staging_temporary_budget: Option<temporary::Budget>,
     control_roots: Vec<ObjectRef>,
+    encode_threads: usize,
 }
 // Coalesce small immutable frames before positional I/O. Reads that miss the
 // authenticated object cache drain this buffer only when they need buffered
@@ -221,6 +222,7 @@ impl NativeStore {
             temporary_extent: None,
             staging_temporary_budget: None,
             control_roots: Vec::new(),
+            encode_threads: 1,
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -299,6 +301,7 @@ impl NativeStore {
             temporary_extent: None,
             staging_temporary_budget: None,
             control_roots: Vec::new(),
+            encode_threads: 1,
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         #[cfg(unix)]
@@ -354,6 +357,14 @@ impl NativeStore {
         } else {
             verify_file_path(&self.file.lock().unwrap(), &self.path)
         }
+    }
+    /// Let resource builders hash and compress up to `threads` byte objects
+    /// at the same time. The store still appends the frames one at a time, in
+    /// the order of the puts, so the file has the same bytes as with one
+    /// thread. The default is one thread. Each encoder thread holds one object
+    /// and its frame, in addition to the caller's operation memory limit.
+    pub fn set_encode_threads(&mut self, threads: usize) {
+        self.encode_threads = threads.clamp(1, 64);
     }
     pub fn preserved_recovery_input(&self) -> Option<&Path> {
         self.recovery_preserved.as_deref()
@@ -1015,9 +1026,21 @@ impl NativeStore {
         self.append_hashed(object, hash)
     }
     fn append_hashed(&mut self, object: CanonicalObject, hash: ObjectHash) -> Result<ObjectRef> {
-        let frame = self
-            .encoder
-            .encode_hashed(&object, self.compression_level, hash)?;
+        self.append_encoded(object, hash, None)
+    }
+    /// `prepared` is the frame of `object` at this store's compression level.
+    fn append_encoded(
+        &mut self,
+        object: CanonicalObject,
+        hash: ObjectHash,
+        prepared: Option<Vec<u8>>,
+    ) -> Result<ObjectRef> {
+        let frame: &[u8] = match &prepared {
+            Some(frame) => frame,
+            None => self
+                .encoder
+                .encode_hashed(&object, self.compression_level, hash)?,
+        };
         #[cfg(unix)]
         if object.kind == 7
             && let Some(offset) = self
@@ -1212,6 +1235,102 @@ impl ObjectStore for NativeStore {
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
         self.put_checked_edges(kind, version, bytes, children, None, None)
+    }
+    fn prepare_width(&self) -> usize {
+        self.encode_threads
+    }
+    fn prepare(
+        &self,
+        kind: u16,
+        version: u16,
+        bodies: &[&[u8]],
+    ) -> Result<Option<Vec<PreparedObject>>> {
+        let threads = self.encode_threads.min(bodies.len());
+        if threads < 2 {
+            return Ok(None);
+        }
+        self.check_writable()?;
+        let level = self.compression_level;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let encode = || -> Result<Vec<(usize, PreparedObject)>> {
+            let mut encoder = wire::FrameEncoder::default();
+            let mut encoded = Vec::new();
+            loop {
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(body) = bodies.get(index) else {
+                    return Ok(encoded);
+                };
+                check_input(body, &[])?;
+                let object = CanonicalObject {
+                    kind,
+                    version,
+                    bytes: body.to_vec(),
+                    children: Vec::new(),
+                };
+                let hash = object.hash();
+                let frame = encoder.encode_hashed(&object, level, hash)?.to_vec();
+                encoded.push((
+                    index,
+                    PreparedObject {
+                        object,
+                        hash,
+                        frame,
+                        level,
+                    },
+                ));
+            }
+        };
+        let groups = std::thread::scope(|scope| {
+            let workers: Vec<_> = (1..threads).map(|_| scope.spawn(encode)).collect();
+            let mut groups = vec![encode()];
+            for worker in workers {
+                groups.push(
+                    worker
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                );
+            }
+            groups
+        });
+        let mut prepared: Vec<Option<PreparedObject>> = bodies.iter().map(|_| None).collect();
+        for group in groups {
+            for (index, object) in group? {
+                prepared[index] = Some(object);
+            }
+        }
+        prepared
+            .into_iter()
+            .map(|object| object.ok_or_else(|| corrupt("prepared object missing")))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+    fn put_prepared(&mut self, prepared: PreparedObject) -> Result<ObjectRef> {
+        let PreparedObject {
+            object,
+            hash,
+            frame,
+            level,
+        } = prepared;
+        if level != self.compression_level || !object.children.is_empty() {
+            return self.put(object.kind, object.version, &object.bytes, &object.children);
+        }
+        // The checks of `put` for an object that has no children.
+        self.check_writable()?;
+        self.verify_current_path()?;
+        if let Some(reference) = self
+            .root()
+            .map(|p| p.root)
+            .filter(|r| r.hash == hash)
+            .or_else(|| self.reader.snapshot().filter(|r| r.hash == hash))
+        {
+            self.validate_reference(reference)?;
+            return Ok(reference);
+        }
+        if let Some(reference) = self.recent.get(hash)? {
+            self.validate_reference(reference)?;
+            return Ok(reference);
+        }
+        self.append_encoded(object, hash, Some(frame))
     }
     fn put_verified(
         &mut self,

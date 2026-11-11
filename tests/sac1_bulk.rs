@@ -191,7 +191,9 @@ fn closure_copy_reads_large_byte_leaves_once_and_reuses_completed_occurrences() 
     let mut copier = sac::v1::native::ClosureCopy::new().unwrap();
     let copied = copier.copy_root(&source, &mut target, root).unwrap();
     assert_eq!(copied.hash, root.hash);
-    assert_eq!(source.reads.get(), 128 + 2);
+    // Each leaf once, and the root once: the copier keeps the root while it
+    // copies the children.
+    assert_eq!(source.reads.get(), 128 + 1);
     for (ordinal, child) in target.get(copied).unwrap().children.iter().enumerate() {
         let bytes = target.get(*child).unwrap().bytes;
         assert_eq!(bytes.len(), 32 * 1024);
@@ -453,5 +455,66 @@ fn metadata_prevents_inline_placement_and_uses_bounded_extents() {
         std::fs::write(directory.join("metadata.sac"), store.as_bytes()).unwrap();
         std::fs::write(directory.join("metadata.expected.bin"), &payload).unwrap();
         std::fs::write(directory.join("metadata-fixture.json"), serde_json::to_vec_pretty(&serde_json::json!({"case":"metadata-outside-inline","writer_page_bytes":16384,"inline_payload_cap_bytes":8192,"files":2,"payload_bytes_per_file":payload.len(),"fixed_metadata_cbor_bytes_per_file":encode(&metadata).len(),"metadata_cbor_hex":hex::encode(encode(&metadata)),"storage":"extents","packed_bytes":store.as_bytes().len(),"snapshot":reader.snapshot().unwrap().hash.to_string()})).unwrap()).unwrap();
+    }
+}
+
+#[test]
+fn parallel_encoding_writes_the_same_file_bytes_as_one_thread() {
+    use sac::v1::cbor::Value;
+    let directory = tempfile::tempdir().unwrap();
+    // Random, repeated and zero chunks; a short last chunk; a file smaller
+    // than one chunk; and a chunk size below the inline limit.
+    let mut large = vec![0u8; 3 * 1024 * 1024 + 777];
+    blake3::Hasher::new().finalize_xof().fill(&mut large);
+    large[64 * 1024..128 * 1024].fill(0);
+    let repeated = large[..32 * 1024].to_vec();
+    large[512 * 1024..544 * 1024].copy_from_slice(&repeated);
+    let small = large[..70 * 1024].to_vec();
+    let build = |name: &str, threads: usize, chunk: usize| {
+        let path = directory.path().join(name);
+        let mut store = sac::v1::NativeStore::create_live(&path, [9; 16]).unwrap();
+        store.set_encode_threads(threads);
+        let snapshot = {
+            let mut builder = ArchiveBuilder::bulk(&mut store, Limits::default()).unwrap();
+            builder.set_chunk_size(chunk).unwrap();
+            builder
+                .add_file(&path_from_str("large").unwrap(), &large)
+                .unwrap();
+            builder
+                .add_reader(&path_from_str("small").unwrap(), &small[..])
+                .unwrap();
+            builder.finish().unwrap()
+        };
+        let root = {
+            let reader = ArchiveReader::open(&store, snapshot, Limits::default()).unwrap();
+            reader.directory_root()
+        };
+        // A persistent edit takes the `set_file` path.
+        let snapshot = {
+            let mut builder = ArchiveBuilder::from_directory(&mut store, root, Limits::default());
+            builder.set_chunk_size(chunk).unwrap();
+            builder
+                .set_file(
+                    &path_from_str("edited").unwrap(),
+                    &large[..1024 * 1024 + 5],
+                    Value::Map(Vec::new()),
+                )
+                .unwrap();
+            builder.finish().unwrap()
+        };
+        store.publish(snapshot).unwrap();
+        drop(store);
+        (snapshot, std::fs::read(&path).unwrap())
+    };
+    for chunk in [4 * 1024, 64 * 1024, 256 * 1024] {
+        let (expected_snapshot, expected) = build(&format!("one-{chunk}.sac"), 1, chunk);
+        for threads in [2, 3, 8] {
+            let (snapshot, bytes) = build(&format!("many-{chunk}-{threads}.sac"), threads, chunk);
+            assert_eq!(
+                snapshot, expected_snapshot,
+                "chunk {chunk}, {threads} threads"
+            );
+            assert!(bytes == expected, "chunk {chunk}, {threads} threads");
+        }
     }
 }

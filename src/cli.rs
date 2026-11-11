@@ -658,6 +658,38 @@ impl<S: sac::v1::ObjectStore> sac::v1::ObjectStore for BoundedStore<S> {
         );
         Ok(reference)
     }
+    fn prepare_width(&self) -> usize {
+        self.inner.prepare_width()
+    }
+    fn prepare(
+        &self,
+        kind: u16,
+        version: u16,
+        bodies: &[&[u8]],
+    ) -> sac::v1::Result<Option<Vec<sac::v1::PreparedObject>>> {
+        self.inner.prepare(kind, version, bodies)
+    }
+    // The same scratch charge as `put` for an object that has no children.
+    fn put_prepared(
+        &mut self,
+        prepared: sac::v1::PreparedObject,
+    ) -> sac::v1::Result<sac::v1::ObjectRef> {
+        let charge = (prepared.body().len() as u64)
+            .checked_add(64)
+            .ok_or(sac::v1::Error::Limit("scratch bytes"))?;
+        if charge > self.limit.saturating_sub(self.reserved) {
+            return Err(sac::v1::Error::Limit("scratch bytes"));
+        }
+        let reference = self.inner.put_prepared(prepared)?;
+        self.reserved = self.reserved.max(
+            reference
+                .address
+                .offset
+                .checked_add(u64::from(reference.address.length))
+                .ok_or(sac::v1::Error::Limit("scratch bytes"))?,
+        );
+        Ok(reference)
+    }
 }
 
 /// The core `mode` and `mtime` metadata of one source entry.
@@ -1034,6 +1066,13 @@ fn execute(args: Args) -> Result<()> {
         store.set_decoded_cache_budget(8 << 20);
         store.set_temporary_disk_budget(args.max_temp / 16)?;
         store.set_total_temporary_disk_budget(args.max_temp - args.max_temp / 4)?;
+        // Hash and compress file chunks on several threads. The archive has
+        // the same bytes as with one thread.
+        store.set_encode_threads(
+            std::thread::available_parallelism()
+                .map_or(1, std::num::NonZero::get)
+                .min(16),
+        );
         let mut store = BoundedStore {
             inner: store,
             reserved: 12_288,

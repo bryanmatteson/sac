@@ -15,6 +15,37 @@ pub fn view(bytes: &[u8]) -> Result<Item<'_>> {
     }
     admitted(bytes)
 }
+/// The header of a well-formed item, for navigation. `None` means that
+/// `header` gives the reason; this function makes no error value.
+#[inline(always)]
+fn valid_header(bytes: &[u8]) -> Option<(u8, u64, usize)> {
+    let first = *bytes.first()?;
+    let major = first >> 5;
+    let ai = first & 31;
+    if major == 7 {
+        return matches!(ai, 20..=22).then_some((major, u64::from(ai), 1));
+    }
+    if major > 5 || ai > 27 {
+        return None;
+    }
+    if ai < 24 {
+        return Some((major, u64::from(ai), 1));
+    }
+    let width = 1usize << (ai - 24);
+    let data = bytes.get(1..1 + width)?;
+    let mut n = 0u64;
+    for b in data {
+        n = (n << 8) | u64::from(*b);
+    }
+    let minimum = match width {
+        1 => 24,
+        2 => 256,
+        4 => 65536,
+        _ => 1u64 << 32,
+    };
+    (n >= minimum).then_some((major, n, 1 + width))
+}
+#[inline]
 fn header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
     let first = *bytes.first().ok_or_else(|| corrupt("truncated CBOR"))?;
     let major = first >> 5;
@@ -99,10 +130,90 @@ fn scan(bytes: &[u8], depth: usize, remaining: &mut usize, validate: bool) -> Re
         _ => Err(corrupt("CBOR major type")),
     }
 }
+/// The encoded length of the first item. This has the structure, depth and
+/// item-count checks of `scan` without its text and map-order checks, and it
+/// does not recurse: navigation calls it for each row of a page.
+fn skip(bytes: &[u8], remaining: &mut usize) -> Result<usize> {
+    // The items that remain in each open array or map. Rows nest a few
+    // levels; the recursive scan takes an item that nests more.
+    const INLINE_DEPTH: usize = 8;
+    let limit = *remaining;
+    let mut open = [0usize; INLINE_DEPTH];
+    let mut depth = 0;
+    let mut at = 0usize;
+    loop {
+        *remaining = remaining.checked_sub(1).ok_or(Error::Limit("CBOR items"))?;
+        let rest = bytes.get(at..).unwrap_or_default();
+        let (major, n, head) = match valid_header(rest) {
+            Some(header) => header,
+            None => header(rest)?,
+        };
+        match major {
+            0 | 1 | 7 => at += head,
+            2 | 3 => {
+                let end = at
+                    .checked_add(head)
+                    .and_then(|start| start.checked_add(usize::try_from(n).ok()?))
+                    .ok_or(Error::Limit("CBOR string"))?;
+                if end > bytes.len() {
+                    return Err(corrupt("truncated CBOR string"));
+                }
+                at = end;
+            }
+            4 | 5 => {
+                if depth >= INLINE_DEPTH {
+                    *remaining = limit;
+                    return scan(bytes, 0, remaining, false);
+                }
+                let count = usize::try_from(n)
+                    .map_err(|_| Error::Limit("CBOR items"))?
+                    .checked_mul(if major == 5 { 2 } else { 1 })
+                    .filter(|n| *n <= *remaining)
+                    .ok_or(Error::Limit("CBOR items"))?;
+                at += head;
+                if count > 0 {
+                    open[depth] = count;
+                    depth += 1;
+                    continue;
+                }
+            }
+            _ => return Err(corrupt("CBOR major type")),
+        }
+        // One item is complete. It can complete its containers.
+        loop {
+            if depth == 0 {
+                return Ok(at);
+            }
+            open[depth - 1] -= 1;
+            if open[depth - 1] > 0 {
+                break;
+            }
+            depth -= 1;
+        }
+    }
+}
 fn prefix(bytes: &[u8]) -> Result<Item<'_>> {
-    let (major, argument, head) = header(bytes)?;
-    let mut remaining = MAX_ITEMS;
-    let len = scan(bytes, 0, &mut remaining, false)?;
+    let (major, argument, head) = match valid_header(bytes) {
+        Some(header) => header,
+        None => header(bytes)?,
+    };
+    // An integer, a simple value or a string ends where its header says.
+    let len = match major {
+        0 | 1 | 7 => head,
+        2 | 3 => {
+            let end = head
+                .checked_add(usize::try_from(argument).map_err(|_| Error::Limit("CBOR string"))?)
+                .ok_or(Error::Limit("CBOR string"))?;
+            if end > bytes.len() {
+                return Err(corrupt("truncated CBOR string"));
+            }
+            end
+        }
+        _ => {
+            let mut remaining = MAX_ITEMS;
+            skip(bytes, &mut remaining)?
+        }
+    };
     Ok(Item {
         encoded: &bytes[..len],
         head,
@@ -159,6 +270,15 @@ impl<'a> Item<'a> {
             bytes: &self.encoded[self.head..],
             remaining: self.argument as usize,
         })
+    }
+    /// The first field of an array of exactly `count` fields. The other
+    /// fields are not examined.
+    pub fn first_field(self, count: usize) -> Result<Item<'a>> {
+        let mut iter = self.array()?;
+        if iter.len() != count {
+            return Err(corrupt("core array shape"));
+        }
+        iter.next().ok_or_else(|| corrupt("core array shape"))?
     }
     pub fn fields<const N: usize>(self) -> Result<[Item<'a>; N]> {
         let mut iter = self.array()?;
@@ -225,4 +345,71 @@ pub(crate) fn admitted(bytes: &[u8]) -> Result<Item<'_>> {
         major,
         argument,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v1::cbor::{self, Value};
+
+    // A small deterministic generator: nested arrays and maps, strings of
+    // several header widths, integers and simple values.
+    fn value(seed: &mut u64, depth: usize) -> Value {
+        *seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let choice = (*seed >> 33) % if depth < 5 { 8 } else { 5 };
+        let size = ((*seed >> 20) % 300) as usize;
+        match choice {
+            0 => Value::Uint(*seed >> 40),
+            1 => Value::NInt(*seed >> 50),
+            2 => Value::Bytes(vec![7; size]),
+            3 => Value::Text("x".repeat(size % 40)),
+            4 => Value::Null,
+            5 => Value::Array((0..size % 5).map(|_| value(seed, depth + 1)).collect()),
+            6 => Value::Array(Vec::new()),
+            _ => cbor::text_map(
+                [
+                    ("alpha", value(seed, depth + 1)),
+                    ("beta", value(seed, depth + 1)),
+                ]
+                .into_iter()
+                .take(size % 3)
+                .collect(),
+            ),
+        }
+    }
+    #[test]
+    fn flat_skip_agrees_with_the_recursive_scan() {
+        let mut seed = 1;
+        for _ in 0..2000 {
+            let encoded = cbor::encode(&value(&mut seed, 0));
+            // The complete item, each truncation of it, and trailing bytes.
+            let mut inputs: Vec<Vec<u8>> = (0..=encoded.len().min(48))
+                .map(|cut| encoded[..encoded.len() - cut].to_vec())
+                .collect();
+            inputs.push([&encoded[..], &[0xff, 0x00]].concat());
+            for input in inputs {
+                for limit in [MAX_ITEMS, 3] {
+                    let (mut left, mut right) = (limit, limit);
+                    let expected = scan(&input, 0, &mut left, false);
+                    let actual = skip(&input, &mut right);
+                    assert_eq!(format!("{expected:?}"), format!("{actual:?}"));
+                    if expected.is_ok() {
+                        assert_eq!(left, right);
+                    }
+                }
+            }
+        }
+        // Nesting to the limit, and one level more.
+        for levels in [MAX_DEPTH, MAX_DEPTH + 1] {
+            let mut input = vec![0x81; levels];
+            input.push(0x00);
+            let (mut left, mut right) = (MAX_ITEMS, MAX_ITEMS);
+            assert_eq!(
+                format!("{:?}", scan(&input, 0, &mut left, false)),
+                format!("{:?}", skip(&input, &mut right))
+            );
+        }
+    }
 }

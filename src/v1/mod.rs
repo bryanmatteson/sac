@@ -178,6 +178,23 @@ pub struct VerifiedObject {
     hash: ObjectHash,
     object: Arc<CanonicalObject>,
 }
+/// One object without children that a store encoded before its put. Only a
+/// store makes this value, so its identity is the hash of its own bytes.
+pub struct PreparedObject {
+    object: CanonicalObject,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    hash: ObjectHash,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    frame: Vec<u8>,
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
+    level: i32,
+}
+impl PreparedObject {
+    /// The body bytes that the caller gave to [`ObjectStore::prepare`].
+    pub fn body(&self) -> &[u8] {
+        &self.object.bytes
+    }
+}
 impl VerifiedObject {
     pub fn hash(&self) -> ObjectHash {
         self.hash
@@ -280,6 +297,30 @@ pub trait ObjectStore {
         bytes: &[u8],
         children: &[ObjectRef],
     ) -> Result<ObjectRef>;
+    /// The number of objects that [`ObjectStore::prepare`] encodes at the same
+    /// time. One means that this store encodes each object in its put.
+    fn prepare_width(&self) -> usize {
+        1
+    }
+    /// Encode objects that have no children before their puts. A store with
+    /// several encoder threads hashes and compresses the bodies together; the
+    /// caller then gives each result to [`ObjectStore::put_prepared`] in the
+    /// order in which it would have put the body, so the stored bytes do not
+    /// change. `None` means that this store does not encode ahead: use `put`.
+    fn prepare(
+        &self,
+        _kind: u16,
+        _version: u16,
+        _bodies: &[&[u8]],
+    ) -> Result<Option<Vec<PreparedObject>>> {
+        Ok(None)
+    }
+    /// Put one result of [`ObjectStore::prepare`]. The result is the same
+    /// reference that `put` returns for the same kind, version and body.
+    fn put_prepared(&mut self, prepared: PreparedObject) -> Result<ObjectRef> {
+        let object = prepared.object;
+        self.put(object.kind, object.version, &object.bytes, &[])
+    }
     /// Copy authenticated canonical bytes, relocating only child occurrences.
     /// The destination still admits every physical child normally. Adapters
     /// retain strict put unless they explicitly support this capability.

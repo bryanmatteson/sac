@@ -223,15 +223,73 @@ pub fn le32(bytes: &[u8], at: usize) -> u32 {
 pub fn le64(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
 }
+// Table `n` advances the checksum of one byte through `n` more zero bytes, so
+// eight lookups consume eight input bytes.
+const fn crc32c_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut byte = 0;
+    while byte < 256 {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = (crc >> 1) ^ (0x82f63b78u32 & 0u32.wrapping_sub(crc & 1));
+            bit += 1;
+        }
+        tables[0][byte] = crc;
+        byte += 1;
+    }
+    let mut table = 1;
+    while table < 8 {
+        let mut byte = 0;
+        while byte < 256 {
+            let previous = tables[table - 1][byte];
+            tables[table][byte] = (previous >> 8) ^ tables[0][(previous & 0xff) as usize];
+            byte += 1;
+        }
+        table += 1;
+    }
+    tables
+}
+static CRC32C: [[u32; 256]; 8] = crc32c_tables();
 fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0x82f63b78u32 & 0u32.wrapping_sub(crc & 1));
-        }
+    let mut words = bytes.chunks_exact(8);
+    for word in &mut words {
+        let low = u32::from_le_bytes(word[..4].try_into().unwrap()) ^ crc;
+        let high = u32::from_le_bytes(word[4..].try_into().unwrap());
+        crc = CRC32C[7][(low & 0xff) as usize]
+            ^ CRC32C[6][((low >> 8) & 0xff) as usize]
+            ^ CRC32C[5][((low >> 16) & 0xff) as usize]
+            ^ CRC32C[4][(low >> 24) as usize]
+            ^ CRC32C[3][(high & 0xff) as usize]
+            ^ CRC32C[2][((high >> 8) & 0xff) as usize]
+            ^ CRC32C[1][((high >> 16) & 0xff) as usize]
+            ^ CRC32C[0][(high >> 24) as usize];
+    }
+    for byte in words.remainder() {
+        crc = (crc >> 8) ^ CRC32C[0][((crc ^ u32::from(*byte)) & 0xff) as usize];
     }
     !crc
+}
+#[cfg(test)]
+#[test]
+fn table_checksum_agrees_with_the_bitwise_definition() {
+    fn bitwise(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for byte in bytes {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0x82f63b78u32 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        !crc
+    }
+    assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+    let mut bytes = [0u8; 257];
+    blake3::Hasher::new().finalize_xof().fill(&mut bytes);
+    for length in 0..=bytes.len() {
+        assert_eq!(crc32c(&bytes[..length]), bitwise(&bytes[..length]));
+    }
 }
 
 pub fn frame_span(header: &[u8]) -> Result<usize> {

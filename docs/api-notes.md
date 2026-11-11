@@ -21,6 +21,20 @@ keep pending writes coalesced and bound read-ahead to the written prefix. Reader
 pins and publication drain the buffer before exposing bytes or running the
 ordered durability barriers. Appending alone does not publish data.
 
+## Parallel encoding
+
+`NativeStore::set_encode_threads(n)` lets resource builders hash and compress
+up to `n` file chunks at the same time. `ObjectStore::prepare` encodes the
+chunk bodies and `ObjectStore::put_prepared` appends each result. The builder
+puts the results in the order of the chunks, so the file has the same bytes as
+with one thread. The default is one thread, and a store that does not encode
+ahead keeps the ordinary `put`. A builder reads as many chunks as the store
+encodes together, to a maximum of one quarter of `Limits::max_memory_bytes`;
+each encoder thread also holds one object and its frame. The whole-file digest
+is computed on one more thread during a parallel batch.
+`ExtentAccumulator::push_data_batch` gives the same path to a caller that
+builds its own extent trees.
+
 ## Allocation-sensitive reads
 
 For allocation-sensitive reads, `lookup_shared` retains an authenticated page
@@ -39,11 +53,14 @@ canonical identity once per inserted object.
 
 ## Caches
 
-Warm native cache hits update scalar recency timestamps; exact eviction repairs
-the bounded age indexes. Under payload churn, a small authenticated occurrence
+Native cache hits, inserts and evictions take constant time: decoded objects
+and authenticated occurrences are in hash maps with an exact
+least-recently-used order. Under payload churn, a small authenticated occurrence
 metadata working set is protected within the same cache budget (one eighth of
 it, capped at 4 MiB). This avoids decoding a large child again merely to link
-its exact physical edge. `ObjectStore::object_type` also reuses the
+its exact physical edge. The idle decoder stays in the cache when the cache is
+full, within one quarter of the budget; it is the last entry to go.
+`ObjectStore::object_type` also reuses the
 authenticated kind and version after payload eviction. Entries bind the file
 identity, expected hash, offset and span; every lookup checks the active
 reader's extent before using a cached result.

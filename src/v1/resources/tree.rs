@@ -342,6 +342,15 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         self.page_limit = bytes;
         Ok(())
     }
+    /// Chunks to read before their puts: the store's encoder width, within a
+    /// quarter of the operation memory limit for the chunks, their objects
+    /// and their frames.
+    fn encode_batch(&self) -> usize {
+        self.store
+            .prepare_width()
+            .min(self.limits.max_memory_bytes / self.chunk_size.max(1) / 4)
+            .max(1)
+    }
     fn inline_limit(&self) -> usize {
         INLINE_LIMIT.min(self.page_limit / 2)
     }
@@ -386,6 +395,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         let work = Budget::new(self.limits.clone());
         work.memory(
             self.chunk_size
+                .saturating_mul(self.encode_batch())
                 .max(self.inline_limit() + 1)
                 .saturating_mul(3)
                 .saturating_add(self.inline_limit() + 1),
@@ -420,7 +430,11 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             );
         }
         let mut reader = std::io::Cursor::new(prefix).chain(reader);
-        let mut bytes = vec![0u8; self.chunk_size.max(self.inline_limit() + 1)];
+        // Read as many chunks as the store encodes together. The chunk
+        // boundaries and the order of the puts are those of one chunk a time.
+        let chunks = self.encode_batch();
+        let capacity = self.chunk_size * chunks;
+        let mut bytes = vec![0u8; capacity.max(self.inline_limit() + 1)];
         let mut first = Vec::new();
         let mut length = 0u64;
         let mut accumulator = ExtentAccumulator::new();
@@ -428,9 +442,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         loop {
             work.time()?;
             let mut filled = 0;
-            while filled < self.chunk_size {
+            while filled < capacity {
                 work.time()?;
-                match reader.read(&mut bytes[filled..self.chunk_size]) {
+                match reader.read(&mut bytes[filled..capacity]) {
                     Ok(0) => break,
                     Ok(n) => filled += n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -440,25 +454,55 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             if filled == 0 {
                 break;
             }
-            length = length
-                .checked_add(filled as u64)
-                .ok_or(Error::Limit("file length"))?;
-            if length > self.limits.max_file_bytes
-                || length > self.limits.max_logical_bytes.saturating_sub(self.logical)
-            {
-                return Err(Error::Limit("logical input bytes"));
-            }
-            hasher.update(&bytes[..filled]);
-            if length <= self.inline_limit() as u64 {
-                first.extend_from_slice(&bytes[..filled]);
-            } else {
-                if !first.is_empty() {
-                    accumulator.push_data(self.store, &first)?;
-                    first.clear();
+            let parallel_digest = chunks > 1 && filled > self.chunk_size;
+            let mut put = |hasher: Option<&mut blake3::Hasher>| -> Result<()> {
+                let mut pending = Vec::with_capacity(chunks);
+                let mut hasher = hasher;
+                for chunk in bytes[..filled].chunks(self.chunk_size) {
+                    length = length
+                        .checked_add(chunk.len() as u64)
+                        .ok_or(Error::Limit("file length"))?;
+                    if length > self.limits.max_file_bytes
+                        || length > self.limits.max_logical_bytes.saturating_sub(self.logical)
+                    {
+                        return Err(Error::Limit("logical input bytes"));
+                    }
+                    if let Some(hasher) = hasher.as_deref_mut() {
+                        hasher.update(chunk);
+                    }
+                    if length <= self.inline_limit() as u64 {
+                        first.extend_from_slice(chunk);
+                    } else {
+                        if !first.is_empty() {
+                            // No earlier chunk of this file is pending: each
+                            // of them is in `first`.
+                            accumulator.push_data(self.store, &first)?;
+                            first.clear();
+                        }
+                        pending.push(chunk);
+                    }
                 }
-                accumulator.push_data(self.store, &bytes[..filled])?;
+                accumulator.push_data_batch(self.store, &pending)
+            };
+            if parallel_digest {
+                // The file digest does not depend on the objects. Compute it
+                // on another thread while this thread encodes and puts them.
+                let input = &bytes[..filled];
+                let whole = &mut hasher;
+                std::thread::scope(|scope| {
+                    let digest = scope.spawn(move || {
+                        whole.update(input);
+                    });
+                    let result = put(None);
+                    digest
+                        .join()
+                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+                    result
+                })?;
+            } else {
+                put(Some(&mut hasher))?;
             }
-            if filled < self.chunk_size {
+            if filled < capacity {
                 break;
             }
         }
@@ -536,8 +580,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             FileData::Inline(bytes.to_vec())
         } else {
             let mut a = ExtentAccumulator::new();
-            for b in bytes.chunks(self.chunk_size) {
-                a.push_data(self.store, b)?;
+            for group in bytes.chunks(self.chunk_size * self.encode_batch()) {
+                let chunks: Vec<&[u8]> = group.chunks(self.chunk_size).collect();
+                a.push_data_batch(self.store, &chunks)?;
             }
             FileData::Extents(a.finish(self.store)?.unwrap())
         };
@@ -1196,6 +1241,49 @@ impl ExtentAccumulator {
             Some(store.put(7, 1, bytes, &[])?)
         };
         self.push(store, bytes.len() as u64, r)
+    }
+    /// Push consecutive data ranges. The result is the same as one
+    /// [`Self::push_data`] for each range in order; a store that encodes
+    /// ahead hashes and compresses the ranges together first.
+    pub fn push_data_batch<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &mut S,
+        ranges: &[&[u8]],
+    ) -> Result<()> {
+        let zero: Vec<bool> = ranges
+            .iter()
+            .map(|bytes| bytes.iter().all(|b| *b == 0))
+            .collect();
+        let bodies: Vec<&[u8]> = ranges
+            .iter()
+            .zip(&zero)
+            .filter(|(bytes, zero)| !bytes.is_empty() && !**zero)
+            .map(|(bytes, _)| *bytes)
+            .collect();
+        let mut prepared = if bodies.len() > 1 {
+            store.prepare(7, 1, &bodies)?.map(Vec::into_iter)
+        } else {
+            None
+        };
+        for (bytes, zero) in ranges.iter().zip(zero) {
+            if bytes.is_empty() {
+                continue;
+            }
+            let reference = if zero {
+                None
+            } else {
+                Some(match &mut prepared {
+                    Some(prepared) => store.put_prepared(
+                        prepared
+                            .next()
+                            .ok_or_else(|| corrupt("prepared object missing"))?,
+                    )?,
+                    None => store.put(7, 1, bytes, &[])?,
+                })
+            };
+            self.push(store, bytes.len() as u64, reference)?;
+        }
+        Ok(())
     }
     pub fn push<S: ObjectStore + ?Sized>(
         &mut self,

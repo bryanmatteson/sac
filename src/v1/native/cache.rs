@@ -90,26 +90,219 @@ pub struct NativeReader {
     metadata_charge: usize,
     io: Arc<PhysicalCounters>,
 }
+/// Keyed hash for the native lookup tables. Their keys are object identities
+/// and physical references, which are already uniform unless an archive is
+/// built to collide; the random seed keeps such an archive from choosing slots.
+#[derive(Clone)]
+struct TableHash(u64);
+impl Default for TableHash {
+    fn default() -> Self {
+        use std::hash::BuildHasher;
+        Self(std::hash::RandomState::new().hash_one(0u64))
+    }
+}
+impl std::hash::BuildHasher for TableHash {
+    type Hasher = TableHasher;
+    fn build_hasher(&self) -> TableHasher {
+        TableHasher(self.0)
+    }
+}
+struct TableHasher(u64);
+impl TableHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        let product = u128::from(self.0 ^ word) * 0x2d35_8dcc_aa6c_78a5;
+        self.0 = (product as u64) ^ ((product >> 64) as u64);
+    }
+}
+impl std::hash::Hasher for TableHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut words = bytes.chunks_exact(8);
+        for word in &mut words {
+            self.mix(u64::from_le_bytes(word.try_into().unwrap()));
+        }
+        let rest = words.remainder();
+        if !rest.is_empty() {
+            let mut word = [0; 8];
+            word[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(word) ^ ((rest.len() as u64) << 56));
+        }
+    }
+    #[inline]
+    fn write_u8(&mut self, value: u8) {
+        self.mix(u64::from(value));
+    }
+    #[inline]
+    fn write_u16(&mut self, value: u16) {
+        self.mix(u64::from(value));
+    }
+    #[inline]
+    fn write_u32(&mut self, value: u32) {
+        self.mix(u64::from(value));
+    }
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.mix(value);
+    }
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+}
+
+/// Exact least-recently-used order with constant-time hit, insert and evict.
+/// A hit moves its entry to the newest end, so the list order is the age order
+/// and no ordering index needs repair at eviction.
+struct Lru<V> {
+    slots: std::collections::HashMap<DecodedKey, u32, TableHash>,
+    nodes: Vec<LruNode<V>>,
+    free: Vec<u32>,
+    oldest: u32,
+    newest: u32,
+}
+struct LruNode<V> {
+    key: DecodedKey,
+    value: Option<V>,
+    age: u64,
+    older: u32,
+    newer: u32,
+}
+const NO_NODE: u32 = u32::MAX;
+impl<V> Default for Lru<V> {
+    fn default() -> Self {
+        Self {
+            slots: Default::default(),
+            nodes: Vec::new(),
+            free: Vec::new(),
+            oldest: NO_NODE,
+            newest: NO_NODE,
+        }
+    }
+}
+impl<V> Lru<V> {
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+    fn unlink(&mut self, slot: u32) {
+        let (older, newer) = {
+            let node = &self.nodes[slot as usize];
+            (node.older, node.newer)
+        };
+        match older {
+            NO_NODE => self.oldest = newer,
+            older => self.nodes[older as usize].newer = newer,
+        }
+        match newer {
+            NO_NODE => self.newest = older,
+            newer => self.nodes[newer as usize].older = older,
+        }
+    }
+    fn link_newest(&mut self, slot: u32) {
+        let previous = self.newest;
+        {
+            let node = &mut self.nodes[slot as usize];
+            node.older = previous;
+            node.newer = NO_NODE;
+        }
+        match previous {
+            NO_NODE => self.oldest = slot,
+            previous => self.nodes[previous as usize].newer = slot,
+        }
+        self.newest = slot;
+    }
+    /// A hit: record the age and make the entry the newest.
+    fn touch(&mut self, key: &DecodedKey, age: u64) -> Option<&V> {
+        let slot = *self.slots.get(key)?;
+        if self.newest != slot {
+            self.unlink(slot);
+            self.link_newest(slot);
+        }
+        let node = &mut self.nodes[slot as usize];
+        node.age = age;
+        node.value.as_ref()
+    }
+    /// The caller removes an existing entry for the key first.
+    fn insert(&mut self, key: DecodedKey, value: V, age: u64) {
+        let node = LruNode {
+            key,
+            value: Some(value),
+            age,
+            older: NO_NODE,
+            newer: NO_NODE,
+        };
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.nodes[slot as usize] = node;
+                slot
+            }
+            None => {
+                self.nodes.push(node);
+                (self.nodes.len() - 1) as u32
+            }
+        };
+        self.slots.insert(key, slot);
+        self.link_newest(slot);
+    }
+    fn remove(&mut self, key: &DecodedKey) -> Option<V> {
+        let slot = self.slots.remove(key)?;
+        self.unlink(slot);
+        self.free.push(slot);
+        self.nodes[slot as usize].value.take()
+    }
+    fn oldest_age(&self) -> Option<u64> {
+        (self.oldest != NO_NODE).then(|| self.nodes[self.oldest as usize].age)
+    }
+    fn remove_oldest(&mut self) -> Option<V> {
+        if self.oldest == NO_NODE {
+            return None;
+        }
+        let key = self.nodes[self.oldest as usize].key;
+        self.remove(&key)
+    }
+    /// Entries from the oldest to the newest.
+    fn oldest_first(&self) -> impl Iterator<Item = (&DecodedKey, &V)> {
+        let mut slot = self.oldest;
+        std::iter::from_fn(move || {
+            let node = self.nodes.get(slot as usize)?;
+            slot = node.newer;
+            Some((&node.key, node.value.as_ref()?))
+        })
+    }
+}
+
 #[derive(Default)]
 struct DecodedCache {
     budget: usize,
     bytes: usize,
     pinned_metadata: usize,
     clock: u64,
-    objects: BTreeMap<DecodedKey, (Arc<CanonicalObject>, usize, u64, u64)>,
-    oldest: BTreeSet<(u64, DecodedKey)>,
-    verified: BTreeMap<DecodedKey, (u64, u64, (u16, u16))>,
-    verified_oldest: BTreeSet<(u64, DecodedKey)>,
+    // A decoded object and its charged size.
+    objects: Lru<(Arc<CanonicalObject>, usize)>,
+    // The authenticated kind and version of one physical occurrence.
+    verified: Lru<(u16, u16)>,
     windows: BTreeMap<(u64, u64), (Vec<u8>, u64, u64)>,
     window_oldest: BTreeSet<(u64, (u64, u64))>,
     window_bytes: usize,
     decoder:Option<wire::FrameDecoder>,
 }
 type DecodedKey = (u64, ObjectHash, u64, u32);
-// Charge both the physical-key lookup and exact LRU index, including their
-// ordering/node allowance, to the existing decoded budget. Hits update a scalar
-// timestamp; stale lower-bound ages are repaired only at eviction. No access
-// history queue can grow beyond the live cache.
+// Charge both the physical-key lookup and exact LRU order, including their
+// node allowance, to the existing decoded budget. Object and authentication
+// hits relink one node. Read windows keep an ordered index for their interval
+// lookup; their stale ages are repaired only at eviction. No access history
+// queue can grow beyond the live cache.
 // Successful frame authentication may outlive its decoded payload. Preserve a
 // small metadata working set under payload churn, within the same byte budget.
 const DECODED_ENTRY_METADATA: usize = 384;
@@ -120,9 +313,7 @@ impl DecodedCache {
     fn clear(&mut self) {
         self.decoder=None;
         self.objects.clear();
-        self.oldest.clear();
         self.verified.clear();
-        self.verified_oldest.clear();
         self.windows.clear();
         self.window_oldest.clear();
         self.window_bytes = 0;
@@ -160,29 +351,19 @@ impl DecodedCache {
         self.clock
     }
     fn remove(&mut self, key: &DecodedKey) {
-        if let Some((_, size, _, age)) = self.objects.remove(key) {
-            self.oldest.remove(&(age, *key));
+        if let Some((_, size)) = self.objects.remove(key) {
             self.bytes -= size;
         }
     }
     fn refresh_order(&mut self) {
-        while let Some((indexed,key))=self.oldest.first().copied(){
-            let entry=self.objects.get_mut(&key).expect("decoded cache age index");
-            if indexed==entry.2{break;}self.oldest.pop_first();entry.3=entry.2;self.oldest.insert((entry.2,key));
-        }
-        while let Some((indexed,key))=self.verified_oldest.first().copied(){
-            let entry=self.verified.get_mut(&key).expect("verified cache age index");
-            if indexed==entry.0{break;}self.verified_oldest.pop_first();entry.1=entry.0;self.verified_oldest.insert((entry.0,key));
-        }
         while let Some((indexed,key))=self.window_oldest.first().copied(){
             let entry=self.windows.get_mut(&key).expect("window cache age index");
             if indexed==entry.1{break;}self.window_oldest.pop_first();entry.2=entry.1;self.window_oldest.insert((entry.1,key));
         }
     }
     fn evict_oldest(&mut self) -> bool {
-        if let Some(decoder)=self.decoder.take(){self.bytes-=decoder.retained_bytes();return true;}
         self.refresh_order();
-        let decoded = self.oldest.first().copied();
+        let decoded = self.objects.oldest_age();
         let metadata_allowance = (self.budget.saturating_sub(self.pinned_metadata) / 8)
             .min(4 * 1024 * 1024);
         let protect_verified = self.verified.len().saturating_mul(DECODED_ENTRY_METADATA)
@@ -191,26 +372,33 @@ impl DecodedCache {
         let verified = if protect_verified {
             None
         } else {
-            self.verified_oldest.first().copied()
+            self.verified.oldest_age()
         };
         if let Some((age, _)) = self.window_oldest.first()
-            && decoded.is_none_or(|(other, _)| *age < other)
-            && verified.is_none_or(|(other, _)| *age < other)
+            && decoded.is_none_or(|other| *age < other)
+            && verified.is_none_or(|other| *age < other)
         {
             return self.evict_window();
         }
+        // Every hit and insert takes its own clock value, so two ages differ.
         if verified.is_some() && (decoded.is_none() || verified < decoded) {
-            let (_, key) = self.verified_oldest.pop_first().unwrap();
             self.verified
-                .remove(&key)
-                .expect("verified cache age index");
+                .remove_oldest()
+                .expect("verified cache age order");
             self.bytes -= DECODED_ENTRY_METADATA;
             return true;
         }
-        let Some((_, key)) = self.oldest.pop_first() else {
-            return false;
+        let Some((_, size)) = self.objects.remove_oldest() else {
+            // The idle decoder is the last victim. A new codec context for
+            // each read costs more than the entries that its bytes displace.
+            return match self.decoder.take() {
+                Some(decoder) => {
+                    self.bytes -= decoder.retained_bytes();
+                    true
+                }
+                None => false,
+            };
         };
-        let (_, size, _, _) = self.objects.remove(&key).expect("decoded cache age index");
         self.bytes -= size;
         true
     }
@@ -296,9 +484,7 @@ impl DecodedCache {
             reference.address.offset,
             reference.address.length,
         );
-        let previous = self.verified.get_mut(&key)?;
-        previous.0 = age;
-        Some(previous.2)
+        self.verified.touch(&key, age).copied()
     }
     fn verify(&mut self, file_identity: u64, reference: ObjectRef, object_type: (u16, u16)) {
         let available = self.budget.saturating_sub(self.pinned_metadata);
@@ -312,8 +498,7 @@ impl DecodedCache {
             reference.address.offset,
             reference.address.length,
         );
-        if let Some((_, previous, _)) = self.verified.remove(&key) {
-            self.verified_oldest.remove(&(previous, key));
+        if self.verified.remove(&key).is_some() {
             self.bytes -= DECODED_ENTRY_METADATA;
         }
         while self.bytes + DECODED_ENTRY_METADATA > available {
@@ -321,23 +506,36 @@ impl DecodedCache {
                 break;
             }
         }
-        self.verified.insert(key, (age, age, object_type));
-        self.verified_oldest.insert((age, key));
+        self.verified.insert(key, object_type, age);
         self.bytes += DECODED_ENTRY_METADATA;
     }
     fn take_decoder(&mut self)->wire::FrameDecoder{
         match self.decoder.take(){Some(decoder)=>{self.bytes-=decoder.retained_bytes();decoder},None=>wire::FrameDecoder::default()}
     }
     fn return_decoder(&mut self,decoder:wire::FrameDecoder){
-        let charge=decoder.retained_bytes();
-        if self.decoder.is_none()&&charge>0&&self.bytes.saturating_add(charge)<=self.budget.saturating_sub(self.pinned_metadata){self.bytes+=charge;self.decoder=Some(decoder);}
+        let charge = decoder.retained_bytes();
+        let available = self.budget.saturating_sub(self.pinned_metadata);
+        // Keep the idle decoder within one quarter of the cache, and make
+        // room for it instead of releasing its codec context.
+        if self.decoder.is_some() || charge == 0 || charge > available / 4 {
+            return;
+        }
+        while self.bytes.saturating_add(charge) > available {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+        if self.bytes.saturating_add(charge) <= available {
+            self.bytes += charge;
+            self.decoder = Some(decoder);
+        }
     }
     fn get(&mut self, file_identity: u64, r: ObjectRef) -> Option<Arc<CanonicalObject>> {
         let age = self.tick();
         let key = (file_identity, r.hash, r.address.offset, r.address.length);
-        let entry = self.objects.get_mut(&key)?;
-        entry.2 = age;
-        Some(Arc::clone(&entry.0))
+        self.objects
+            .touch(&key, age)
+            .map(|(object, _)| Arc::clone(object))
     }
     /// Transfer an LRU victim into the one in-flight positional read. Its
     /// allocation leaves the cache charge; it is never retained as a spare.
@@ -353,32 +551,21 @@ impl DecodedCache {
         {
             return None;
         }
-        self.refresh_order();
-        let (_, key) = self
-            .oldest
-            .iter()
+        let key = self
+            .objects
+            .oldest_first()
             .take(8)
-            .find(|(_, key)| {
-                self.objects.get(key).is_some_and(|(object, _, _, _)| {
-                    object.kind == 7
-                        && object.children.is_empty()
-                        && object.bytes.capacity() >= length
-                        && Arc::strong_count(object) == 1
-                })
+            .find(|(_, (object, _))| {
+                object.kind == 7
+                    && object.children.is_empty()
+                    && object.bytes.capacity() >= length
+                    && Arc::strong_count(object) == 1
             })
-            .copied()?;
-        let (object, size, touched, age) = self.objects.remove(&key)?;
-        self.oldest.remove(&(age, key));
+            .map(|(key, _)| *key)?;
+        let (object, size) = self.objects.remove(&key)?;
         self.bytes -= size;
-        match Arc::try_unwrap(object) {
-            Ok(object) => Some(object.bytes),
-            Err(object) => {
-                self.objects.insert(key, (object, size, touched, age));
-                self.oldest.insert((age, key));
-                self.bytes += size;
-                None
-            }
-        }
+        // The cache held the only reference, and it is locked for this call.
+        Arc::try_unwrap(object).ok().map(|object| object.bytes)
     }
     fn insert_shared(&mut self, file_identity: u64, r: ObjectRef, object: &Arc<CanonicalObject>) {
         let size = DECODED_ENTRY_METADATA
@@ -395,8 +582,7 @@ impl DecodedCache {
                 break;
             }
         }
-        self.objects.insert(key, (Arc::clone(object), size, age, age));
-        self.oldest.insert((age, key));
+        self.objects.insert(key, (Arc::clone(object), size), age);
         self.bytes += size;
     }
 }
@@ -445,8 +631,10 @@ mod buffer_tests {
             assert!(cache.get(1, reference(128)).is_some());
             assert!(cache.verified(1, reference(320)));
         }
-        assert_eq!(cache.oldest.len(), 2);
-        assert_eq!(cache.verified_oldest.len(), 1);
+        assert_eq!(cache.objects.len(), 2);
+        assert_eq!(cache.objects.nodes.len(), 2);
+        assert_eq!(cache.verified.len(), 1);
+        assert_eq!(cache.verified.nodes.len(), 1);
         assert!(cache.evict_oldest());
         assert!(cache.get(1, reference(224)).is_none());
         assert!(cache.get(1, reference(128)).is_some());
@@ -536,7 +724,7 @@ mod buffer_tests {
         assert!(buffer.capacity() >= 1024 * 1024 + 64);
         assert_eq!(cache.bytes, 0);
         assert!(cache.objects.is_empty());
-        assert!(cache.oldest.is_empty());
+        assert_eq!(cache.objects.oldest, NO_NODE);
         assert!(cache.take_read_buffer(1024 * 1024 + 64).is_none());
     }
 }

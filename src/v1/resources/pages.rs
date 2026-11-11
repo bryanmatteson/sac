@@ -92,7 +92,7 @@ pub(crate) fn lookup<S: ObjectStore + ?Sized>(
                 let mut selected = None;
                 for row in body.array()? {
                     let row = row?;
-                    let key = row.fields::<4>()?[0].bytes()?;
+                    let key = row.first_field(4)?.bytes()?;
                     first = first.or(Some(key));
                     last = Some(key);
                     if key == name {

@@ -65,6 +65,33 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   name `sac` on crates.io belongs to a different project.
 - Replace the hosted CI workflow with `tools/ci.sh`, which runs the same jobs
   on the local computer, on request.
+- Map the temporary-file slots of the native append-ID, closure-copy and
+  validation tables into memory on macOS and Linux, instead of one positional
+  read or write for each slot. The file blocks are reserved first, so a full
+  disk is an error. A filesystem that cannot reserve blocks keeps positional
+  I/O. A table that passes its resident prefix moves all its entries to the
+  slots. Temporary I/O statistics continue to count each slot read or written.
+- Keep the native decoded and authentication caches in hash maps with a linked
+  least-recently-used order. A hit, an insert and an eviction take constant
+  time; the victims and the byte accounting are the same as before.
+- Add `NativeStore::set_encode_threads`, `ObjectStore::prepare`,
+  `ObjectStore::put_prepared` and `ExtentAccumulator::push_data_batch`.
+  Resource builders hash and compress several file chunks at the same time,
+  and the store appends the frames in the order of the puts: the file has the
+  same bytes as with one thread. The default is one thread. `sac pack` uses
+  the available processors, to a maximum of 16.
+- Buffer the temporary sort files of the bulk builder. Each record took two
+  writes and two reads of the file.
+- Compute the frame header checksum eight bytes at a time from tables. The
+  value is the same CRC32C.
+- Keep the idle native decoder when the decoded cache is full, within one
+  quarter of the cache budget. The cache released it first, so each read of a
+  compressed frame made a new codec context.
+- Read the name of each directory row during a lookup without a second scan
+  of its other fields, and pass over rows without recursion.
+- Keep at most 1 MiB of the parents that a closure copy is inside. A parent
+  whose children are complete is not read and authenticated a second time. A
+  copier with disk-only metadata keeps none.
 
 Earlier prerelease files are unsupported. Re-create them from original inputs;
 there is no compatibility reader or migration command. Application-profile

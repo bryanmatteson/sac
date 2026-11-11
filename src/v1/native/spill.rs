@@ -213,7 +213,9 @@ impl DiskStack {
 /// Reusable closure copier for exports containing several selected roots.
 /// Hash remapping, physical validation and traversal state have fixed resident
 /// prefixes and spill larger graphs to disposable local files.
-/// One decoded object and one frame's child table are live at a time.
+/// One decoded object and one frame's child table are live at a time, with at
+/// most 1 MiB of the parents that the traversal is inside. A copier with
+/// disk-only metadata keeps no parents.
 pub struct ClosureCopy {
     pub(super) copied: DiskRefs,
     pending: DiskStack,
@@ -425,6 +427,19 @@ impl ClosureCopy {
             },
             self.budget.clone(),
         );
+        // The parents that the traversal is inside, newest last. A parent
+        // returns after all its children; keeping it here avoids a second
+        // read and authentication when the source cache has released it.
+        // The retained canonical bytes have a fixed limit, and a copier with
+        // disk-only metadata retains none.
+        const RETAINED_PARENT_BYTES: usize = 1024 * 1024;
+        let retain = if self.spilled {
+            0
+        } else {
+            RETAINED_PARENT_BYTES
+        };
+        let mut parents = std::collections::VecDeque::<(ObjectRef, VerifiedObject)>::new();
+        let mut parent_bytes = 0usize;
         let result = (|| {
             self.pending.push(root, false)?;
             while let Some((reference, expanded)) = self.pending.pop()? {
@@ -451,7 +466,21 @@ impl ClosureCopy {
                         continue;
                     }
                 }
-                let verified = source.verified_object(reference)?;
+                let retained = if expanded
+                    && parents
+                        .back()
+                        .is_some_and(|(parent, _)| *parent == reference)
+                {
+                    let (_, verified) = parents.pop_back().unwrap();
+                    parent_bytes -= verified.object().canonical_len();
+                    Some(verified)
+                } else {
+                    None
+                };
+                let verified = match retained {
+                    Some(verified) => verified,
+                    None => source.verified_object(reference)?,
+                };
                 let object = verified.object();
                 if !expanded {
                     validate_core_edges(object, |child| {
@@ -467,6 +496,17 @@ impl ClosureCopy {
                         self.pending.push(reference, true)?;
                         for child in object.children.iter().rev() {
                             self.pending.push(*child, false)?;
+                        }
+                        let size = object.canonical_len();
+                        if size <= retain {
+                            parent_bytes += size;
+                            parents.push_back((reference, verified));
+                            while parent_bytes > retain {
+                                let Some((_, oldest)) = parents.pop_front() else {
+                                    break;
+                                };
+                                parent_bytes -= oldest.object().canonical_len();
+                            }
                         }
                         continue;
                     }

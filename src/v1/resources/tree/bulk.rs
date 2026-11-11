@@ -41,7 +41,15 @@ struct Spool {
     count: u64,
     quota: Quota,
     max_record: usize,
+    // Records wait here for one write of the file, and one read of the file
+    // supplies many records. The file holds the same bytes as before.
+    pending: Vec<u8>,
+    loaded: Vec<u8>,
+    consumed: usize,
 }
+// One system call moves this many spool bytes. A record that is larger
+// passes through its own call.
+const SPOOL_BUFFER: usize = 64 * 1024;
 impl Drop for Spool {
     fn drop(&mut self) {
         self.quota
@@ -58,7 +66,47 @@ impl Spool {
             count: 0,
             quota,
             max_record,
+            pending: Vec::new(),
+            loaded: Vec::new(),
+            consumed: 0,
         })
+    }
+    fn flush(&mut self) -> Result<()> {
+        if !self.pending.is_empty() {
+            self.file.write_all(&self.pending)?;
+            self.pending.clear();
+        }
+        Ok(())
+    }
+    // Copy the next `output.len()` spool bytes. `Ok(false)` is the end of the
+    // spool before the first byte.
+    fn load(&mut self, output: &mut [u8]) -> Result<bool> {
+        let mut filled = 0;
+        while filled < output.len() {
+            if self.consumed == self.loaded.len() {
+                self.loaded.resize(SPOOL_BUFFER, 0);
+                let n = loop {
+                    match self.file.read(&mut self.loaded) {
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        other => break other?,
+                    }
+                };
+                self.loaded.truncate(n);
+                self.consumed = 0;
+                if n == 0 {
+                    if filled == 0 {
+                        return Ok(false);
+                    }
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+                }
+            }
+            let n = (self.loaded.len() - self.consumed).min(output.len() - filled);
+            output[filled..filled + n]
+                .copy_from_slice(&self.loaded[self.consumed..self.consumed + n]);
+            self.consumed += n;
+            filled += n;
+        }
+        Ok(true)
     }
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > self.max_record {
@@ -67,8 +115,12 @@ impl Spool {
         let span = bytes.len() as u64 + 4;
         self.quota.reserve(span)?;
         self.bytes += span;
-        self.file.write_all(&(bytes.len() as u32).to_le_bytes())?;
-        self.file.write_all(bytes)?;
+        self.pending
+            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        self.pending.extend_from_slice(bytes);
+        if self.pending.len() >= SPOOL_BUFFER {
+            self.flush()?;
+        }
         self.quota
             .counters
             .written
@@ -77,22 +129,25 @@ impl Spool {
         Ok(())
     }
     fn rewind(&mut self) -> Result<()> {
+        self.flush()?;
         self.file.seek(SeekFrom::Start(0))?;
+        self.loaded.clear();
+        self.consumed = 0;
         Ok(())
     }
     fn read(&mut self) -> Result<Option<Vec<u8>>> {
         let mut size = [0; 4];
-        let n = self.file.read(&mut size)?;
-        if n == 0 {
+        if !self.load(&mut size)? {
             return Ok(None);
         }
-        self.file.read_exact(&mut size[n..])?;
         let n = u32::from_le_bytes(size) as usize;
         if n > self.max_record {
             return Err(Error::Limit("bulk record memory"));
         }
         let mut bytes = vec![0; n];
-        self.file.read_exact(&mut bytes)?;
+        if !self.load(&mut bytes)? && n != 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
         self.quota
             .counters
             .read
