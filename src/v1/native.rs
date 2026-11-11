@@ -42,7 +42,7 @@ pub struct NativeStore {
     // data-file lock additionally excludes writers through hard-link aliases.
     fence: Option<File>,
     recent: DiskRefs,
-    cache: Arc<Mutex<DecodedCache>>,
+    cache: Arc<CacheLock>,
     file_identity: u64,
     generation: Arc<FileGeneration>,
     io: Arc<PhysicalCounters>,
@@ -1188,11 +1188,7 @@ impl ObjectStore for NativeStore {
     fn cached_object_type(&self, reference: ObjectRef) -> Result<Option<(u16, u16)>> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
-        Ok(self
-            .cache
-            .lock()
-            .unwrap()
-            .verified_type(self.file_identity, reference))
+        Ok(self.cache.verified_type(self.file_identity, reference))
     }
     fn object_type(&self, reference: ObjectRef) -> Result<(u16, u16)> {
         if let Some(object_type) = self.cached_object_type(reference)? {
@@ -1211,9 +1207,8 @@ impl ObjectStore for NativeStore {
         wire::validate_address(reference.address, scope.first, scope.end)?;
         if self
             .cache
-            .lock()
-            .unwrap()
-            .verified(self.file_identity, reference)
+            .verified_type(self.file_identity, reference)
+            .is_some()
         {
             return Ok(());
         }
@@ -1504,7 +1499,7 @@ impl NativeStore {
     fn shared_keeping(&self, r: ObjectRef, keep: bool) -> Result<ObjectRead> {
         let end = self.physical_read_scope().unwrap().end;
         wire::validate_address(r.address, self.reader.first_record_offset(), end)?;
-        if let Some(object) = self.cache.lock().unwrap().get(self.file_identity, r) {
+        if let Some(object) = self.cache.get(self.file_identity, r) {
             return Ok((object, None));
         }
         let mut disk_end = if self.end == self.reader.committed_end() {
@@ -1639,7 +1634,7 @@ impl NativeReader {
     fn from_pinned(
         file: File,
         reader: Reader,
-        cache: Arc<Mutex<DecodedCache>>,
+        cache: Arc<CacheLock>,
         file_identity: u64,
         generation: Arc<FileGeneration>,
         io: Arc<PhysicalCounters>,
@@ -1771,11 +1766,7 @@ impl ObjectStore for NativeReader {
     fn cached_object_type(&self, reference: ObjectRef) -> Result<Option<(u16, u16)>> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
-        Ok(self
-            .cache
-            .lock()
-            .unwrap()
-            .verified_type(self.file_identity, reference))
+        Ok(self.cache.verified_type(self.file_identity, reference))
     }
     fn object_type(&self, reference: ObjectRef) -> Result<(u16, u16)> {
         if let Some(object_type) = self.cached_object_type(reference)? {
@@ -1797,9 +1788,8 @@ impl ObjectStore for NativeReader {
         )?;
         if self
             .cache
-            .lock()
-            .unwrap()
-            .verified(self.file_identity, reference)
+            .verified_type(self.file_identity, reference)
+            .is_some()
         {
             return Ok(());
         }
@@ -1910,7 +1900,7 @@ fn read_object(
     file: &File,
     first: u64,
     end: u64,
-    cache: &Mutex<DecodedCache>,
+    cache: &CacheLock,
     identity: u64,
     io: &PhysicalCounters,
     r: ObjectRef,
@@ -1924,7 +1914,7 @@ fn read_object_keeping(
     file: &File,
     first: u64,
     end: u64,
-    cache: &Mutex<DecodedCache>,
+    cache: &CacheLock,
     identity: u64,
     io: &PhysicalCounters,
     r: ObjectRef,
@@ -1932,12 +1922,9 @@ fn read_object_keeping(
 ) -> Result<ObjectRead> {
     wire::validate_address(r.address, first, end)?;
     let length = r.address.length as usize;
-    let recycled = {
-        let mut governing = cache.lock().unwrap();
-        if let Some(object) = governing.get(identity, r) {
-            return Ok((object, None));
-        }
-        governing.take_read_buffer(length)
+    let recycled = match cache.get_or(identity, r, |cache| cache.take_read_buffer(length)) {
+        Ok(object) => return Ok((object, None)),
+        Err(recycled) => recycled,
     };
     let mut frame = recycled.unwrap_or_default();
     frame.resize(length, 0);
@@ -1967,28 +1954,32 @@ fn read_object_keeping(
         .unwrap_or(end)
         .min(end);
     let window_length = (window_end - window_start) as usize;
-    let use_window =
-        (recent_metadata || length <= 1024) && cache.lock().unwrap().can_read_window(window_length);
     // A larger cached window may also contain a later request for a larger
     // frame. Cached bytes still confer no authority before frame validation.
-    let hit = cache
-        .lock()
-        .unwrap()
-        .read_window(identity, r.address.offset, &mut frame);
-    if !hit {
-        if use_window {
+    // Each step of a read that needs the cache takes the exclusive lock once.
+    let (use_window, resident) = {
+        let mut governing = cache.lock().unwrap();
+        let use_window =
+            (recent_metadata || length <= 1024) && governing.can_read_window(window_length);
+        let hit = governing.read_window(identity, r.address.offset, &mut frame);
+        (use_window, hit.then(|| governing.take_decoder()))
+    };
+    let mut decoder = match resident {
+        Some(decoder) => decoder,
+        None if use_window => {
             let mut bytes = vec![0; window_length];
             counted_read_at(file, &mut bytes, window_start, io, ReadClass::Object)?;
             let at = (r.address.offset - window_start) as usize;
             frame.copy_from_slice(&bytes[at..at + length]);
-            cache
-                .lock()
-                .unwrap()
-                .insert_window(identity, window_start, bytes);
-        } else {
-            counted_read_at(file, &mut frame, r.address.offset, io, ReadClass::Object)?;
+            let mut governing = cache.lock().unwrap();
+            governing.insert_window(identity, window_start, bytes);
+            governing.take_decoder()
         }
-    }
+        None => {
+            counted_read_at(file, &mut frame, r.address.offset, io, ReadClass::Object)?;
+            cache.lock().unwrap().take_decoder()
+        }
+    };
     // The decoder checks these bytes; they are used only after it succeeds.
     let compressed = (keep && frame.get(4) == Some(&1))
         .then(|| {
@@ -1998,7 +1989,6 @@ fn read_object_keeping(
                 .map(|bytes| Arc::new(bytes.to_vec()))
         })
         .flatten();
-    let mut decoder = cache.lock().unwrap().take_decoder();
     let decoded = decoder.decode_owned(r, frame, first, end);
     let mut cache = cache.lock().unwrap();
     cache.return_decoder(decoder);
@@ -2193,11 +2183,11 @@ fn validate_closure_tracked(
     Ok((report, budget.statistics()))
 }
 struct ValidationCacheGuard {
-    cache: Arc<Mutex<DecodedCache>>,
+    cache: Arc<CacheLock>,
     old: usize,
 }
 impl ValidationCacheGuard {
-    fn new(cache: Arc<Mutex<DecodedCache>>, limits: &resources::Limits) -> Result<Self> {
+    fn new(cache: Arc<CacheLock>, limits: &resources::Limits) -> Result<Self> {
         if limits.max_memory_bytes < 48 * 1024 * 1024 {
             return Err(Error::Limit("native validation memory"));
         }

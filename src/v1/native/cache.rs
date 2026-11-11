@@ -9,8 +9,8 @@ fn next_file_identity() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
-fn new_cache() -> Arc<Mutex<DecodedCache>> {
-    Arc::new(Mutex::new(DecodedCache {
+fn new_cache() -> Arc<CacheLock> {
+    Arc::new(CacheLock::new(DecodedCache {
         budget: 32 * 1024 * 1024,
         ..Default::default()
     }))
@@ -53,11 +53,11 @@ impl Drop for FileGeneration {
     }
 }
 struct MetadataReservation {
-    cache: Arc<Mutex<DecodedCache>>,
+    cache: Arc<CacheLock>,
     bytes: usize,
 }
 impl MetadataReservation {
-    fn new(cache: Arc<Mutex<DecodedCache>>, bytes: usize) -> Result<Self> {
+    fn new(cache: Arc<CacheLock>, bytes: usize) -> Result<Self> {
         {
             let mut governing = cache.lock().unwrap();
             if governing.budget > 0
@@ -84,7 +84,7 @@ pub struct NativeReader {
     lease: Option<leases::Lease>,
     file: File,
     reader: Reader,
-    cache: Arc<Mutex<DecodedCache>>,
+    cache: Arc<CacheLock>,
     file_identity: u64,
     generation: Arc<FileGeneration>,
     metadata_charge: usize,
@@ -169,6 +169,10 @@ struct LruNode<V> {
     key: DecodedKey,
     value: Option<V>,
     age: u64,
+    // Unique to this residency of the entry; a recorded hit names it.
+    serial: u64,
+    // The reader shards hold a copy of this entry.
+    fronted: bool,
     older: u32,
     newer: u32,
 }
@@ -225,20 +229,42 @@ impl<V> Lru<V> {
     /// A hit: record the age and make the entry the newest.
     fn touch(&mut self, key: &DecodedKey, age: u64) -> Option<&V> {
         let slot = *self.slots.get(key)?;
+        self.touch_slot(slot, age);
+        self.nodes[slot as usize].value.as_ref()
+    }
+    /// A hit on the entry that `slot` holds.
+    #[inline]
+    fn touch_slot(&mut self, slot: u32, age: u64) {
         if self.newest != slot {
             self.unlink(slot);
             self.link_newest(slot);
         }
+        self.nodes[slot as usize].age = age;
+    }
+    /// A hit that a reader recorded. False when that residency has ended.
+    fn touch_recorded(&mut self, slot: u32, serial: u64, age: u64) -> bool {
+        match self.nodes.get(slot as usize) {
+            Some(node) if node.serial == serial && node.value.is_some() => {}
+            _ => return false,
+        }
+        self.touch_slot(slot, age);
+        true
+    }
+    /// Note that the reader shards take a copy. Gives the slot and serial
+    /// of an entry that had no copy.
+    fn mark_front(&mut self, key: &DecodedKey) -> Option<(u32, u64)> {
+        let slot = *self.slots.get(key)?;
         let node = &mut self.nodes[slot as usize];
-        node.age = age;
-        node.value.as_ref()
+        (!std::mem::replace(&mut node.fronted, true)).then_some((slot, node.serial))
     }
     /// The caller removes an existing entry for the key first.
-    fn insert(&mut self, key: DecodedKey, value: V, age: u64) {
+    fn insert(&mut self, key: DecodedKey, value: V, age: u64, serial: u64) {
         let node = LruNode {
             key,
             value: Some(value),
             age,
+            serial,
+            fronted: false,
             older: NO_NODE,
             newer: NO_NODE,
         };
@@ -255,21 +281,24 @@ impl<V> Lru<V> {
         self.slots.insert(key, slot);
         self.link_newest(slot);
     }
-    fn remove(&mut self, key: &DecodedKey) -> Option<V> {
+    /// The value, and whether the reader shards hold a copy of it.
+    fn remove(&mut self, key: &DecodedKey) -> Option<(V, bool)> {
         let slot = self.slots.remove(key)?;
         self.unlink(slot);
         self.free.push(slot);
-        self.nodes[slot as usize].value.take()
+        let node = &mut self.nodes[slot as usize];
+        Some((node.value.take()?, node.fronted))
     }
     fn oldest_age(&self) -> Option<u64> {
         (self.oldest != NO_NODE).then(|| self.nodes[self.oldest as usize].age)
     }
-    fn remove_oldest(&mut self) -> Option<V> {
+    fn remove_oldest(&mut self) -> Option<(DecodedKey, V, bool)> {
         if self.oldest == NO_NODE {
             return None;
         }
         let key = self.nodes[self.oldest as usize].key;
-        self.remove(&key)
+        let (value, fronted) = self.remove(&key)?;
+        Some((key, value, fronted))
     }
     /// Entries from the oldest to the newest.
     fn oldest_first(&self) -> impl Iterator<Item = (&DecodedKey, &V)> {
@@ -279,6 +308,242 @@ impl<V> Lru<V> {
             slot = node.newer;
             Some((&node.key, node.value.as_ref()?))
         })
+    }
+}
+
+/// Copies of resident entries that a reader can hit while another thread has
+/// the cache. One thread, or threads that never meet, use the cache alone, as
+/// before. A reader that finds the cache busy changes it to shared hits: a
+/// hit then takes the lock of one shard of the keys and adds its entry to
+/// the record of its thread. [`CacheLock::lock`] gives the recorded hits
+/// their ages before any other change, so an eviction has the same victims.
+/// The hits that several threads make between two exclusive accesses keep
+/// the order of each thread. A thread whose record is full while the cache
+/// is busy does not record its hit. Only the cache changes the shards.
+struct Front {
+    // Readers have met a busy cache. Read by each hit; changed seldom.
+    shared: std::sync::atomic::AtomicBool,
+    hasher: TableHash,
+    tables: std::sync::OnceLock<FrontTables>,
+    counters: FrontCounters,
+}
+#[repr(align(128))]
+#[derive(Default)]
+struct FrontCounters {
+    // The threads whose record of hits is not empty.
+    dirty: std::sync::atomic::AtomicU32,
+    // Full records in sequence that found the cache free.
+    calm: std::sync::atomic::AtomicU32,
+}
+struct FrontTables {
+    shards: Box<[FrontShard]>,
+    records: Box<[FrontRecord]>,
+}
+// Readers of one shard do not wait for each other.
+#[repr(align(128))]
+#[derive(Default)]
+struct FrontShard(std::sync::RwLock<FrontMaps>);
+// The slot and serial of each entry in the cache, and its value.
+#[derive(Default)]
+struct FrontMaps {
+    objects: std::collections::HashMap<DecodedKey, (u32, u64, Arc<CanonicalObject>), TableHash>,
+    verified: std::collections::HashMap<DecodedKey, (u32, u64, (u16, u16)), TableHash>,
+}
+#[repr(align(128))]
+#[derive(Default)]
+struct FrontRecord(Mutex<FrontHits>);
+#[derive(Default)]
+struct FrontHits {
+    // The slot and serial of each hit of one thread, in the order of the hits.
+    hits: Vec<(u32, u64)>,
+    // Hits that found the record full.
+    lost: u32,
+}
+const FRONT_SHARDS: usize = 256;
+const FRONT_RECORDS: usize = 32;
+const FRONT_HITS: usize = 256;
+// A thread with a full record asks for the cache again after this number
+// of lost hits.
+const FRONT_LOST: u32 = 64;
+// This number of full records with a free cache ends shared hits.
+const FRONT_CALM: u32 = 64;
+// A byte leaf of this capacity stays with the cache alone, which can then
+// give its allocation to a read (`take_read_buffer`).
+const FRONT_PAYLOAD_LIMIT: usize = 256 * 1024;
+/// Marks a recorded slot of the authentication entries.
+const VERIFIED_HIT: u32 = 1 << 31;
+impl Front {
+    fn new() -> Self {
+        Self {
+            shared: Default::default(),
+            hasher: TableHash::default(),
+            tables: Default::default(),
+            counters: Default::default(),
+        }
+    }
+    fn tables(&self) -> &FrontTables {
+        self.tables.get_or_init(|| FrontTables {
+            shards: (0..FRONT_SHARDS).map(|_| Default::default()).collect(),
+            records: (0..FRONT_RECORDS).map(|_| Default::default()).collect(),
+        })
+    }
+    fn shard<'a>(&self, tables: &'a FrontTables, key: &DecodedKey) -> &'a FrontShard {
+        let hash = std::hash::BuildHasher::hash_one(&self.hasher, key);
+        &tables.shards[(hash >> (64 - FRONT_SHARDS.trailing_zeros())) as usize]
+    }
+    /// The record of the calling thread. More threads than records share.
+    fn record_index() -> usize {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        thread_local! {
+            static RECORD: usize = NEXT.fetch_add(1, Relaxed) % FRONT_RECORDS;
+        }
+        RECORD.try_with(|record| *record).unwrap_or(0)
+    }
+    fn object(&self, key: &DecodedKey) -> Option<(Arc<CanonicalObject>, u32, u64)> {
+        let tables = self.tables.get()?;
+        let maps = self.shard(tables, key).0.read().unwrap();
+        let (slot, serial, object) = maps.objects.get(key)?;
+        Some((Arc::clone(object), *slot, *serial))
+    }
+    fn verified(&self, key: &DecodedKey) -> Option<((u16, u16), u32, u64)> {
+        let tables = self.tables.get()?;
+        let maps = self.shard(tables, key).0.read().unwrap();
+        let (slot, serial, value) = maps.verified.get(key)?;
+        Some((*value, *slot, *serial))
+    }
+    /// Add a hit to the record of this thread. False when the caller must
+    /// apply the records: this hit filled the record, or the record was
+    /// full, the hit is lost and enough hits were lost since the last time.
+    fn record(&self, slot: u32, serial: u64) -> bool {
+        let index = Self::record_index();
+        let mut record = self.tables().records[index].0.lock().unwrap();
+        if record.hits.len() >= FRONT_HITS {
+            record.lost = record.lost.wrapping_add(1);
+            return !record.lost.is_multiple_of(FRONT_LOST);
+        }
+        if record.hits.is_empty() {
+            // In one order with the exclusive access that reads the mask.
+            self.counters
+                .dirty
+                .fetch_or(1 << index, std::sync::atomic::Ordering::SeqCst);
+        }
+        record.hits.push((slot, serial));
+        record.hits.len() < FRONT_HITS
+    }
+}
+/// The decoded cache of one store and its readers.
+struct CacheLock {
+    cache: Mutex<DecodedCache>,
+    front: Arc<Front>,
+}
+impl CacheLock {
+    fn new(mut cache: DecodedCache) -> Self {
+        let front = Arc::new(Front::new());
+        cache.front = Some(Arc::clone(&front));
+        Self {
+            cache: Mutex::new(cache),
+            front,
+        }
+    }
+    /// Exclusive access, after the recorded hits have taken effect.
+    #[inline]
+    fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, DecodedCache>> {
+        let mut cache = self.cache.lock()?;
+        self.apply_hits(&mut cache);
+        Ok(cache)
+    }
+    #[inline]
+    fn apply_hits(&self, cache: &mut DecodedCache) {
+        // In one order with the reader that sets the mask for its record.
+        if self.front.counters.dirty.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            cache.apply_hits();
+        }
+    }
+    /// Exclusive access when no other thread has the cache.
+    #[inline]
+    fn free(&self) -> Option<std::sync::MutexGuard<'_, DecodedCache>> {
+        match self.cache.try_lock() {
+            Ok(mut cache) => {
+                self.apply_hits(&mut cache);
+                Some(cache)
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(error)) => panic!("decoded cache: {error}"),
+        }
+    }
+    /// Exclusive access for a hit while hits are not shared. A busy cache
+    /// starts shared hits.
+    #[inline]
+    fn alone(&self) -> Option<std::sync::MutexGuard<'_, DecodedCache>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.front.shared.load(Relaxed) {
+            return None;
+        }
+        let cache = self.free();
+        if cache.is_none() {
+            self.front.counters.calm.store(0, Relaxed);
+            self.front.shared.store(true, Relaxed);
+        }
+        cache
+    }
+    /// Record a shared hit. A thread with a full record applies the records
+    /// when the cache is free; enough of these in sequence end shared hits.
+    fn note(&self, slot: u32, serial: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.front.record(slot, serial) {
+            return;
+        }
+        let counters = &self.front.counters;
+        if self.free().is_none() {
+            counters.calm.store(0, Relaxed);
+        } else if counters.calm.fetch_add(1, Relaxed) >= FRONT_CALM {
+            counters.calm.store(0, Relaxed);
+            self.front.shared.store(false, Relaxed);
+        }
+    }
+    /// A resident object. For an object that is not resident, the result of
+    /// `miss` within the same exclusive access.
+    fn get_or<T>(
+        &self,
+        file_identity: u64,
+        r: ObjectRef,
+        miss: impl FnOnce(&mut DecodedCache) -> T,
+    ) -> std::result::Result<Arc<CanonicalObject>, T> {
+        if let Some(mut cache) = self.alone() {
+            return cache.get(file_identity, r).ok_or_else(|| miss(&mut cache));
+        }
+        let key = (file_identity, r.hash, r.address.offset, r.address.length);
+        if let Some((object, slot, serial)) = self.front.object(&key) {
+            self.note(slot, serial);
+            return Ok(object);
+        }
+        let mut cache = self.lock().unwrap();
+        cache
+            .get_fronted(file_identity, r)
+            .ok_or_else(|| miss(&mut cache))
+    }
+    fn get(&self, file_identity: u64, r: ObjectRef) -> Option<Arc<CanonicalObject>> {
+        self.get_or(file_identity, r, |_| ()).ok()
+    }
+    /// The authenticated type of one physical occurrence, as [`Self::get`].
+    fn verified_type(&self, file_identity: u64, reference: ObjectRef) -> Option<(u16, u16)> {
+        if let Some(mut cache) = self.alone() {
+            return cache.verified_type(file_identity, reference);
+        }
+        let key = (
+            file_identity,
+            reference.hash,
+            reference.address.offset,
+            reference.address.length,
+        );
+        if let Some((value, slot, serial)) = self.front.verified(&key) {
+            self.note(slot | VERIFIED_HIT, serial);
+            return Some(value);
+        }
+        self.lock()
+            .unwrap()
+            .verified_type_fronted(file_identity, reference)
     }
 }
 
@@ -296,10 +561,16 @@ struct DecodedCache {
     window_oldest: BTreeSet<(u64, (u64, u64))>,
     window_bytes: usize,
     decoder:Option<wire::FrameDecoder>,
+    // The next entry serial. A clear does not start it again.
+    serial: u64,
+    // The reader shards of a shared cache, and a spare record of hits.
+    front: Option<Arc<Front>>,
+    hits: Vec<(u32, u64)>,
 }
 type DecodedKey = (u64, ObjectHash, u64, u32);
 // Charge both the physical-key lookup and exact LRU order, including their
-// node allowance, to the existing decoded budget. Object and authentication
+// node allowance and the copy that the reader shards may hold, to the
+// existing decoded budget. Object and authentication
 // hits relink one node. Read windows keep an ordered index for their interval
 // lookup; their stale ages are repaired only at eviction. No access history
 // queue can grow beyond the live cache.
@@ -311,6 +582,11 @@ const DECODED_ENTRY_METADATA: usize = 384;
 const MAX_READ_WINDOW_BYTES: usize = 32 * 1024;
 impl DecodedCache {
     fn clear(&mut self) {
+        if let Some(tables) = self.front.as_ref().and_then(|front| front.tables.get()) {
+            for shard in &tables.shards {
+                *shard.0.write().unwrap() = FrontMaps::default();
+            }
+        }
         self.decoder=None;
         self.objects.clear();
         self.verified.clear();
@@ -350,8 +626,90 @@ impl DecodedCache {
         self.clock += 1;
         self.clock
     }
+    /// Give each recorded hit the next age, in the order of its thread. A
+    /// record whose entry has left the cache since is no access.
+    #[cold]
+    fn apply_hits(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Self { front: Some(front), objects, verified, clock, hits, .. } = self else {
+            return;
+        };
+        let Some(tables) = front.tables.get() else {
+            return;
+        };
+        let mut dirty = front.counters.dirty.swap(0, SeqCst);
+        while dirty != 0 {
+            let index = dirty.trailing_zeros() as usize;
+            dirty &= dirty - 1;
+            hits.reserve_exact(FRONT_HITS);
+            std::mem::swap(&mut tables.records[index].0.lock().unwrap().hits, hits);
+            for (slot, serial) in hits.drain(..) {
+                // The ages do not wrap: `tick` clears the cache first.
+                let age = clock.saturating_add(1);
+                let touched = if slot & VERIFIED_HIT == 0 {
+                    objects.touch_recorded(slot, serial, age)
+                } else {
+                    verified.touch_recorded(slot & !VERIFIED_HIT, serial, age)
+                };
+                if touched {
+                    *clock = age;
+                }
+            }
+        }
+    }
+    /// Remove the copy of an entry that has left the cache.
+    fn unfront(&self, key: &DecodedKey, verified: bool) {
+        let Some(front) = &self.front else {
+            return;
+        };
+        let Some(tables) = front.tables.get() else {
+            return;
+        };
+        let mut maps = front.shard(tables, key).0.write().unwrap();
+        if verified {
+            maps.verified.remove(key);
+        } else {
+            maps.objects.remove(key);
+        }
+    }
+    /// A hit, which also gives the reader shards a copy of the entry.
+    fn get_fronted(&mut self, file_identity: u64, r: ObjectRef) -> Option<Arc<CanonicalObject>> {
+        let object = self.get(file_identity, r)?;
+        let key = (file_identity, r.hash, r.address.offset, r.address.length);
+        if object.bytes.capacity() < FRONT_PAYLOAD_LIMIT
+            && let Some(front) = &self.front
+            && let Some((slot, serial)) = self.objects.mark_front(&key)
+        {
+            let mut maps = front.shard(front.tables(), &key).0.write().unwrap();
+            maps.objects.insert(key, (slot, serial, Arc::clone(&object)));
+        }
+        Some(object)
+    }
+    fn verified_type_fronted(
+        &mut self,
+        file_identity: u64,
+        reference: ObjectRef,
+    ) -> Option<(u16, u16)> {
+        let value = self.verified_type(file_identity, reference)?;
+        let key = (
+            file_identity,
+            reference.hash,
+            reference.address.offset,
+            reference.address.length,
+        );
+        if let Some(front) = &self.front
+            && let Some((slot, serial)) = self.verified.mark_front(&key)
+        {
+            let mut maps = front.shard(front.tables(), &key).0.write().unwrap();
+            maps.verified.insert(key, (slot, serial, value));
+        }
+        Some(value)
+    }
     fn remove(&mut self, key: &DecodedKey) {
-        if let Some((_, size)) = self.objects.remove(key) {
+        if let Some(((_, size), fronted)) = self.objects.remove(key) {
+            if fronted {
+                self.unfront(key, false);
+            }
             self.bytes -= size;
         }
     }
@@ -382,13 +740,17 @@ impl DecodedCache {
         }
         // Every hit and insert takes its own clock value, so two ages differ.
         if verified.is_some() && (decoded.is_none() || verified < decoded) {
-            self.verified
+            let (key, _, fronted) = self
+                .verified
                 .remove_oldest()
                 .expect("verified cache age order");
+            if fronted {
+                self.unfront(&key, true);
+            }
             self.bytes -= DECODED_ENTRY_METADATA;
             return true;
         }
-        let Some((_, size)) = self.objects.remove_oldest() else {
+        let Some((key, (_, size), fronted)) = self.objects.remove_oldest() else {
             // The idle decoder is the last victim. A new codec context for
             // each read costs more than the entries that its bytes displace.
             return match self.decoder.take() {
@@ -399,6 +761,9 @@ impl DecodedCache {
                 None => false,
             };
         };
+        if fronted {
+            self.unfront(&key, false);
+        }
         self.bytes -= size;
         true
     }
@@ -498,7 +863,10 @@ impl DecodedCache {
             reference.address.offset,
             reference.address.length,
         );
-        if self.verified.remove(&key).is_some() {
+        if let Some((_, fronted)) = self.verified.remove(&key) {
+            if fronted {
+                self.unfront(&key, true);
+            }
             self.bytes -= DECODED_ENTRY_METADATA;
         }
         while self.bytes + DECODED_ENTRY_METADATA > available {
@@ -506,7 +874,8 @@ impl DecodedCache {
                 break;
             }
         }
-        self.verified.insert(key, object_type, age);
+        self.serial += 1;
+        self.verified.insert(key, object_type, age, self.serial);
         self.bytes += DECODED_ENTRY_METADATA;
     }
     fn take_decoder(&mut self)->wire::FrameDecoder{
@@ -562,7 +931,8 @@ impl DecodedCache {
                     && Arc::strong_count(object) == 1
             })
             .map(|(key, _)| *key)?;
-        let (object, size) = self.objects.remove(&key)?;
+        // An object of this capacity has no copy in the reader shards.
+        let ((object, size), _) = self.objects.remove(&key)?;
         self.bytes -= size;
         // The cache held the only reference, and it is locked for this call.
         Arc::try_unwrap(object).ok().map(|object| object.bytes)
@@ -582,7 +952,9 @@ impl DecodedCache {
                 break;
             }
         }
-        self.objects.insert(key, (Arc::clone(object), size), age);
+        self.serial += 1;
+        self.objects
+            .insert(key, (Arc::clone(object), size), age, self.serial);
         self.bytes += size;
     }
 }
@@ -642,6 +1014,155 @@ mod buffer_tests {
         cache.set_budget(0);
         assert_eq!(cache.bytes, 0);
         assert!(cache.objects.is_empty() && cache.verified.is_empty());
+    }
+
+    fn occurrence(ordinal: u64) -> ObjectRef {
+        ObjectRef {
+            hash: ObjectHash::digest(&ordinal.to_le_bytes()),
+            address: ChunkAddress { offset: 128 + ordinal * 128, length: 128 },
+        }
+    }
+    fn ages<V>(lru: &Lru<V>) -> Vec<(DecodedKey, u64)> {
+        lru.oldest_first()
+            .map(|(key, _)| (*key, lru.nodes[lru.slots[key] as usize].age))
+            .collect()
+    }
+    fn order(cache: &DecodedCache) -> (u64, usize, [Vec<(DecodedKey, u64)>; 2]) {
+        (cache.clock, cache.bytes, [ages(&cache.objects), ages(&cache.verified)])
+    }
+
+    #[test]
+    fn shared_hits_give_the_ages_and_victims_of_exclusive_hits() {
+        use std::sync::atomic::Ordering::Relaxed;
+        // Room for 24 of the 64 objects, so the inserts evict; runs of hits
+        // pass the length of a record between two inserts.
+        let budget = 24 * (DECODED_ENTRY_METADATA + 64);
+        let shared = CacheLock::new(DecodedCache { budget, ..Default::default() });
+        let exclusive = CacheLock::new(DecodedCache { budget, ..Default::default() });
+        let object = Arc::new(CanonicalObject { kind: 7, version: 1, bytes: vec![1; 64], children: vec![] });
+        let mut state = 7u64;
+        let mut next = |bound: u64| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        let mut front_hits = 0;
+        for step in 0..40_000u64 {
+            // As a reader that found the cache busy.
+            shared.front.shared.store(true, Relaxed);
+            let r = occurrence(next(64));
+            let key = (1, r.hash, r.address.offset, r.address.length);
+            match next(if step % 5000 < 2500 { 400 } else { 8 }) {
+                0 => {
+                    shared.lock().unwrap().insert_shared(1, r, &object);
+                    exclusive.lock().unwrap().insert_shared(1, r, &object);
+                }
+                1 => {
+                    shared.lock().unwrap().verify(1, r, (7, 1));
+                    exclusive.lock().unwrap().verify(1, r, (7, 1));
+                }
+                choice if choice % 2 == 0 => {
+                    front_hits += usize::from(shared.front.object(&key).is_some());
+                    assert_eq!(
+                        shared.get(1, r).is_some(),
+                        exclusive.lock().unwrap().get(1, r).is_some()
+                    );
+                }
+                _ => assert_eq!(
+                    shared.verified_type(1, r),
+                    exclusive.lock().unwrap().verified_type(1, r)
+                ),
+            }
+        }
+        assert!(front_hits > 1000);
+        assert!(!exclusive.front.shared.load(Relaxed) && exclusive.front.tables.get().is_none());
+        assert_eq!(order(&shared.lock().unwrap()), order(&exclusive.lock().unwrap()));
+        assert!(shared.get(2, occurrence(1)).is_none());
+        // Enough full records with a free cache end the shared hits.
+        let resident = *shared.lock().unwrap().objects.oldest_first().next().unwrap().0;
+        let r = ObjectRef {
+            hash: resident.1,
+            address: ChunkAddress { offset: resident.2, length: resident.3 },
+        };
+        for _ in 0..(FRONT_CALM as usize + 2) * FRONT_HITS {
+            assert!(shared.get(1, r).is_some());
+        }
+        assert!(!shared.front.shared.load(Relaxed));
+        shared.lock().unwrap().clear();
+        assert!(shared.front.object(&resident).is_none());
+    }
+
+    #[test]
+    fn readers_hit_while_another_thread_replaces_entries() {
+        let budget = 48 * (DECODED_ENTRY_METADATA + 64);
+        let cache = CacheLock::new(DecodedCache { budget, ..Default::default() });
+        let object = |ordinal: u64| {
+            Arc::new(CanonicalObject {
+                kind: 7,
+                version: 1,
+                bytes: ordinal.to_le_bytes().repeat(8),
+                children: vec![],
+            })
+        };
+        for ordinal in 0..32 {
+            cache.lock().unwrap().insert_shared(1, occurrence(ordinal), &object(ordinal));
+            cache.lock().unwrap().verify(1, occurrence(ordinal), (7, 1));
+        }
+        cache.front.shared.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::scope(|scope| {
+            for thread in 0..8u64 {
+                let (cache, object) = (&cache, &object);
+                scope.spawn(move || {
+                    let mut state = thread | 1;
+                    for _ in 0..50_000 {
+                        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let ordinal = (state >> 33) % 96;
+                        if thread == 0 && state >> 60 == 0 {
+                            let mut cache = cache.lock().unwrap();
+                            cache.insert_shared(1, occurrence(ordinal), &object(ordinal));
+                            cache.verify(1, occurrence(ordinal), (7, 1));
+                        } else if let Some(found) = cache.get(1, occurrence(ordinal)) {
+                            assert_eq!(found.bytes[..8], ordinal.to_le_bytes());
+                        } else if let Some(found) = cache.verified_type(1, occurrence(ordinal)) {
+                            assert_eq!(found, (7, 1));
+                        }
+                    }
+                });
+            }
+        });
+        let tables = cache.front.tables.get().unwrap();
+        let cache = cache.lock().unwrap();
+        assert!(cache.bytes <= cache.budget);
+        let charged: usize = cache.objects.oldest_first().map(|(_, (_, size))| size).sum();
+        assert_eq!(
+            cache.bytes,
+            charged + cache.verified.len() * DECODED_ENTRY_METADATA
+        );
+        // Each copy in the shards is an entry of the cache, and each entry
+        // that the cache marks has its copy.
+        let (mut objects, mut verified) = (0, 0);
+        for shard in &tables.shards {
+            let maps = shard.0.read().unwrap();
+            for (key, (slot, serial, _)) in &maps.objects {
+                assert_eq!(cache.objects.slots[key], *slot);
+                assert_eq!(cache.objects.nodes[*slot as usize].serial, *serial);
+            }
+            for (key, (slot, serial, _)) in &maps.verified {
+                assert_eq!(cache.verified.slots[key], *slot);
+                assert_eq!(cache.verified.nodes[*slot as usize].serial, *serial);
+            }
+            objects += maps.objects.len();
+            verified += maps.verified.len();
+        }
+        let marked = |fronted: &mut dyn Iterator<Item = bool>| fronted.filter(|fronted| *fronted).count();
+        assert!(objects > 0);
+        assert_eq!(
+            objects,
+            marked(&mut cache.objects.slots.values().map(|slot| cache.objects.nodes[*slot as usize].fronted))
+        );
+        assert_eq!(
+            verified,
+            marked(&mut cache.verified.slots.values().map(|slot| cache.verified.nodes[*slot as usize].fronted))
+        );
     }
 
     #[test]

@@ -109,6 +109,17 @@ wire version remains 1 and the Rust package version remains 0.2.0.
 - Keep at most 1 MiB of the parents that a closure copy is inside. A parent
   whose children are complete is not read and authenticated a second time. A
   copier with disk-only metadata keeps none.
+- Let the threads that read one native store hit its decoded cache at the
+  same time. Each hit took the one cache lock, so 18 reader threads gave fewer
+  hits in total than one thread. A reader that finds the lock held changes the
+  cache to shared hits: a shared lock on one of 256 groups of keys, and a
+  record of the hits of each thread that the next exclusive access applies in
+  order. One thread, or threads that never meet, use the cache as before, with
+  the same victims and byte accounting. Hits that several threads make between
+  two exclusive accesses keep the order of each thread, and a thread whose
+  record is full while the cache is in use does not record its hit.
+- Take the cache lock four times for a read of an object that is not
+  resident, instead of six.
 
 Earlier prerelease files are unsupported. Re-create them from original inputs;
 there is no compatibility reader or migration command. Application-profile

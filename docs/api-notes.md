@@ -71,6 +71,19 @@ authenticated kind and version after payload eviction. Entries bind the file
 identity, expected hash, offset and span; every lookup checks the active
 reader's extent before using a cached result.
 
+A store and its pinned readers share one cache. While one thread uses it, or
+threads never find it in use, each hit takes the cache lock, as before. A
+reader that finds the lock held changes the cache to shared hits: a hit then
+takes a shared lock on one of 256 groups of keys, which hold copies of the
+entries that readers have hit, and adds itself to a record of 256 hits for its
+thread. The next exclusive access gives the recorded hits their ages, in
+order, before any other change. One thread has the same eviction victims as
+before. Hits that several threads make between two exclusive accesses keep
+the order of each thread. A thread whose record is full while another thread
+holds the cache does not record its hit. The copies add no charge: they are
+within the fixed allowance of each entry. The cache goes back to exclusive
+hits after 64 full records in sequence found it free.
+
 Raw metadata windows share the existing decoded budget, using at most one eighth
 of it and no more than 1 MiB, so a cold publication can reuse its complete small
 metadata working set without rereading evicted windows. Interval lookup finds
