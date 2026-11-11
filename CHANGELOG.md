@@ -120,6 +120,14 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   record is full while the cache is in use does not record its hit.
 - Take the cache lock four times for a read of an object that is not
   resident, instead of six.
+- Admit a child of a native put without a read when the writer's append index
+  has the complete reference: the writer appended that frame under the hash
+  that authenticated it. Before, the writer read and decoded such a child
+  again after its entry left the cache. A reference with another offset,
+  length or hash is read as before, and so is every child after
+  `discard_disposable_caches`, maintenance or a reopen.
+- Keep the device and inode of the writer's open file for the check before
+  each write, instead of one `fstat` for each put.
 
 Earlier prerelease files are unsupported. Re-create them from original inputs;
 there is no compatibility reader or migration command. Application-profile

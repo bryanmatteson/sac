@@ -58,7 +58,7 @@ fn batch(
     builder.directory_root().unwrap()
 }
 #[test]
-fn repeated_native_staged_batches_reduce_reads_with_identical_archive_bytes() {
+fn repeated_native_staged_batches_bound_reads_with_identical_archive_bytes() {
     let temporary = tempfile::tempdir().unwrap();
     let mut outputs = Vec::new();
     for checked in [false, true] {
@@ -115,11 +115,14 @@ fn repeated_native_staged_batches_reduce_reads_with_identical_archive_bytes() {
         outputs[0].1, outputs[1].1,
         "capability optimization preserves every canonical ID, physical locator and archive byte"
     );
-    // The first batch has committed ancestors. The later batches exercise the
-    // formerly strict fallback on the same writer's uncommitted ancestors.
+    // The first batch has committed ancestors, which both writers read. The
+    // ancestors of the later batches are frames that the same writer
+    // appended: an ordinary put admits them from the append index, and the
+    // capability adds only the exact authentication of each rewritten parent.
     for n in 1..4 {
+        let (strict, checked) = (outputs[0].0[n], outputs[1].0[n]);
         assert!(
-            outputs[1].0[n] < outputs[0].0[n],
+            strict <= checked && checked - strict <= strict / 16,
             "batch {n}: strict {:?}, checked {:?}",
             outputs[0].0,
             outputs[1].0
@@ -188,10 +191,14 @@ fn generic_staged_fanout_reuses_only_exact_edges_with_identical_bytes() {
     }
     assert_eq!(outputs[0].1, outputs[1].1);
     assert_eq!(outputs[0].2, outputs[1].2);
+    assert_eq!(
+        outputs[0].0, 0,
+        "an ordinary put admits the children that its writer appended"
+    );
+    // The capability reads the parent, and the body of the one rejected edge.
     assert!(
-        outputs[1].0 < outputs[0].0 / 4,
-        "strict/checked reads: {} / {}",
-        outputs[0].0,
+        outputs[1].0 < 32 * 32768 / 4,
+        "checked reads: {}",
         outputs[1].0
     );
 }

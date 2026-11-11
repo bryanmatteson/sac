@@ -64,6 +64,10 @@ pub struct NativeStore {
     // write. None for a read-only store and on a host without `fstatat`.
     #[cfg_attr(not(unix), allow(dead_code))]
     directory: Option<File>,
+    // The device and inode of `file`, which do not change while it is open.
+    // Empty until the first check and after `file` is replaced.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    node: std::sync::OnceLock<(u64, u64)>,
 }
 // Coalesce small immutable frames before positional I/O. Reads that miss the
 // authenticated object cache drain this buffer only when they need buffered
@@ -245,6 +249,7 @@ impl NativeStore {
             control_roots: Vec::new(),
             encode_threads: 1,
             directory,
+            node: std::sync::OnceLock::new(),
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
@@ -330,6 +335,7 @@ impl NativeStore {
             control_roots: Vec::new(),
             encode_threads: 1,
             directory,
+            node: std::sync::OnceLock::new(),
             compaction_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         #[cfg(unix)]
@@ -413,10 +419,15 @@ impl NativeStore {
                 };
             }
             let named = named.map_err(std::io::Error::from)?;
-            let retained = self.file.lock().unwrap().metadata()?;
+            let retained = match self.node.get() {
+                Some(node) => *node,
+                None => {
+                    let metadata = self.file.lock().unwrap().metadata()?;
+                    *self.node.get_or_init(|| (metadata.dev(), metadata.ino()))
+                }
+            };
             // The same integer conversions as `MetadataExt`.
-            return if (named.st_dev as u64, named.st_ino as u64) == (retained.dev(), retained.ino())
-            {
+            return if (named.st_dev as u64, named.st_ino as u64) == retained {
                 Ok(())
             } else {
                 Err(corrupt(
@@ -914,6 +925,7 @@ impl NativeStore {
         file.try_lock().map_err(lock_error)?;
         _source_extent = self.temporary_extent.replace(replacement_extent);
         self.file = Mutex::new(file);
+        self.node = std::sync::OnceLock::new();
         self.pending = Some(pending);
         self.end = 128;
         let index_budget = self.recent.0.budget.clone();
@@ -1579,19 +1591,28 @@ impl NativeStore {
             {
                 continue;
             }
-            if !self
+            if self
                 .cache
                 .lock()
                 .unwrap()
                 .verified(self.file_identity, *child)
             {
-                let object = self.get_shared(*child)?;
-                self.cache.lock().unwrap().verify(
-                    self.file_identity,
-                    *child,
-                    (object.kind, object.version),
-                );
+                continue;
             }
+            // The append index has only the frames that this writer wrote
+            // since it last discarded the index, each under the hash that
+            // authenticated its object. An entry equal to the complete
+            // reference is that authentication without its cache entry: a
+            // different offset or length is not equal and is read.
+            if self.recent.get(child.hash)? == Some(*child) {
+                continue;
+            }
+            let object = self.get_shared(*child)?;
+            self.cache.lock().unwrap().verify(
+                self.file_identity,
+                *child,
+                (object.kind, object.version),
+            );
         }
         // The prior occurrence is a bounded exact no-op candidate even when
         // disposable ID lookup was discarded. Compare full physical edges:

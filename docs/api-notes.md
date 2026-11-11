@@ -104,6 +104,16 @@ also take the destination's encoder. A copy from a file that this library
 wrote has the same bytes with and without this path; a copy from a file with
 frames from a different encoder keeps those frames.
 
+A native writer checks each child of a put. A child with an authenticated
+occurrence in the cache needs no read. A child that the same writer appended
+needs none either: the writer's append index has the complete reference, and
+a reference with a different offset, length or hash is not equal to it. The
+writer reads and authenticates every other child. The index is empty after
+`discard_disposable_caches`, after maintenance and in a writer that opens an
+existing file. The writer does not read an appended frame again for this
+check, so the check does not find bytes that changed in the file after the
+append; `validate` reads every frame of the published graph.
+
 `VerifiedObject` carries immutable bytes and their authenticated identity from a
 store read into a closure copy. Native and private staging writers reuse that
 identity while still checking destination child occurrences; relocation must

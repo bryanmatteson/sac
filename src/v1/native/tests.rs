@@ -758,7 +758,16 @@ fn staged_rewrite_carries_exact_edges_without_promoting_child_authentication() {
         parent
     );
     let strict = store.physical_statistics().read_bytes - before.read_bytes;
-    assert!(strict > checked * 4, "strict {strict}, checked {checked}");
+    assert_eq!(
+        strict, 0,
+        "the append index admits each child of an ordinary put"
+    );
+    {
+        let mut cache = store.cache.lock().unwrap();
+        for child in &children {
+            assert!(!cache.verified(store.file_identity, *child));
+        }
+    }
     // A new physical edge never inherits the old edge's authentication.
     let mut wrong = children.clone();
     wrong[0].hash = children[1].hash;
@@ -781,6 +790,61 @@ fn staged_rewrite_carries_exact_edges_without_promoting_child_authentication() {
         store.rewrite_source(parent).unwrap().is_none(),
         "lost provenance uses strict fallback"
     );
+}
+
+#[test]
+fn put_admits_appended_children_without_a_read_until_the_index_is_gone() {
+    let (dir, mut store) = store();
+    let base = snapshot(&mut store, b"base");
+    store.publish(base).unwrap();
+    let children: Vec<_> = (0..64u8)
+        .map(|n| store.put(7, 1, &[n; 4096], &[]).unwrap())
+        .collect();
+    store.cache.lock().unwrap().clear();
+    let before = store.physical_statistics();
+    store.put(4096, 1, b"parent", &children).unwrap();
+    assert_eq!(
+        store.physical_statistics().read_operations,
+        before.read_operations,
+        "each child is a frame that this writer appended"
+    );
+    // Only the complete reference is in the index. The same hash at another
+    // frame, a shorter frame and another hash at the same frame are read,
+    // and the read rejects them.
+    let end = store.end;
+    let mut moved = children.clone();
+    moved[0].address = children[1].address;
+    assert!(store.put(4096, 1, b"moved", &moved).is_err());
+    let mut shorter = children.clone();
+    shorter[0].address.length -= 1;
+    assert!(store.put(4096, 1, b"shorter", &shorter).is_err());
+    let mut renamed = children.clone();
+    renamed[0].hash = children[1].hash;
+    assert!(store.put(4096, 1, b"renamed", &renamed).is_err());
+    assert_eq!(store.end, end, "a rejected put appends nothing");
+    assert!(
+        store.physical_statistics().read_operations > before.read_operations,
+        "a reference that the index does not have is read"
+    );
+    // Without the index, the writer reads each child and records it.
+    store.discard_disposable_caches();
+    let before = store.physical_statistics();
+    store.put(4096, 1, b"after discard", &children).unwrap();
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    {
+        let mut cache = store.cache.lock().unwrap();
+        for child in &children {
+            assert!(cache.verified(store.file_identity, *child));
+        }
+    }
+    // A writer that opens the file did not append these frames.
+    let next = snapshot(&mut store, b"next");
+    store.publish(next).unwrap();
+    drop(store);
+    let mut reopened = NativeStore::open(dir.path().join("db.sac"), true).unwrap();
+    let before = reopened.physical_statistics();
+    reopened.put(4096, 1, b"reopened", &children).unwrap();
+    assert!(reopened.physical_statistics().read_bytes > before.read_bytes);
 }
 
 #[test]
