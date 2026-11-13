@@ -625,6 +625,12 @@ impl<S: sac::v1::ObjectStore> sac::v1::ObjectStore for BoundedStore<S> {
     ) -> sac::v1::Result<std::sync::Arc<sac::v1::CanonicalObject>> {
         self.inner.get_shared(reference)
     }
+    fn get_verified_shared(
+        &self,
+        reference: sac::v1::ObjectRef,
+    ) -> sac::v1::Result<std::sync::Arc<sac::v1::CanonicalObject>> {
+        self.inner.get_verified_shared(reference)
+    }
     fn physical_identity(&self) -> Option<u64> {
         self.inner.physical_identity()
     }
@@ -949,7 +955,7 @@ fn write_archive(
             .saturating_sub(occupied_temp)
             .saturating_sub(copy_limits(args).max_temp_bytes);
         let mut writer = LimitedWriter {
-            inner: file,
+            inner: io::BufWriter::with_capacity(64 * 1024, file),
             written: 0,
             limit: args.max_output.min(available),
         };
@@ -1272,7 +1278,10 @@ fn execute(args: Args) -> Result<()> {
         "read" => read_resource(&reader, &args)?,
         "compact" | "recover-live" => {
             source.validate_with_limits(reader.limits())?;
-            reader.verify()?;
+            let staged_compact = args.command == "compact" && args.paths[1] != "-";
+            if !staged_compact {
+                reader.verify()?;
+            }
             let commit = source
                 .root()
                 .ok_or_else(|| failure("MissingDependency", "no selected commit"))?
@@ -1363,7 +1372,20 @@ fn execute(args: Args) -> Result<()> {
                 )?;
             } else {
                 write_archive(&args, spool, |writer| {
-                    sac::v1::pack_commit_with_limits(&source, commit, writer, copy_limits(&args))?;
+                    if staged_compact {
+                        reader.pack_verified_commit(
+                            commit,
+                            writer,
+                            copy_limits(&args).max_temp_bytes,
+                        )?;
+                    } else {
+                        sac::v1::pack_commit_with_limits(
+                            &source,
+                            commit,
+                            writer,
+                            copy_limits(&args),
+                        )?;
+                    }
                     Ok(())
                 })?;
             }

@@ -108,25 +108,43 @@ impl CanonicalObject {
         out
     }
     pub(crate) fn write_canonical(&self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.kind.to_le_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.extend_from_slice(&(self.children.len() as u32).to_le_bytes());
-        for child in &self.children {
+        Self::write_parts(self.kind, self.version, &self.bytes, &self.children, out);
+    }
+    pub(crate) fn write_parts(
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+        out: &mut Vec<u8>,
+    ) {
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&(children.len() as u32).to_le_bytes());
+        for child in children {
             out.extend_from_slice(&child.hash.0);
         }
-        out.extend_from_slice(&self.bytes);
+        out.extend_from_slice(bytes);
     }
 
     pub fn hash(&self) -> ObjectHash {
+        Self::hash_parts(self.kind, self.version, &self.bytes, &self.children)
+    }
+
+    pub(crate) fn hash_parts(
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+    ) -> ObjectHash {
         let mut hash = blake3::Hasher::new();
         hash.update(b"SAC1/object\0");
-        hash.update(&self.kind.to_le_bytes());
-        hash.update(&self.version.to_le_bytes());
-        hash.update(&(self.children.len() as u32).to_le_bytes());
-        for child in &self.children {
+        hash.update(&kind.to_le_bytes());
+        hash.update(&version.to_le_bytes());
+        hash.update(&(children.len() as u32).to_le_bytes());
+        for child in children {
             hash.update(&child.hash.0);
         }
-        hash.update(&self.bytes);
+        hash.update(bytes);
         ObjectHash(*hash.finalize().as_bytes())
     }
 }
@@ -335,8 +353,9 @@ pub trait ObjectStore {
         source: &VerifiedObject,
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
-        let object = source.relocated(children)?;
-        self.put(object.kind, object.version, &object.bytes, &object.children)
+        source.validate_children(children)?;
+        let object = source.object();
+        self.put(object.kind, object.version, &object.bytes, children)
     }
     /// Obtain a bounded, source-bound prior parent for a checked tree update.
     /// None means use ordinary put. Native stores may also bind pages appended
@@ -1205,31 +1224,25 @@ impl<W: Write> SealedWriter<W> {
         self.output.flush()?;
         Ok(self.output)
     }
-}
-impl<W: Write> ObjectStore for SealedWriter<W> {
-    fn get(&self, _: ObjectRef) -> Result<CanonicalObject> {
-        Err(Error::Unsupported("forward writer has no readback".into()))
-    }
-    fn put(
+    fn write_object(
         &mut self,
         kind: u16,
         version: u16,
         bytes: &[u8],
         children: &[ObjectRef],
+        hash: ObjectHash,
     ) -> Result<ObjectRef> {
         for child in children {
             validate_address(child.address, 128, self.end)?;
         }
-        let object = CanonicalObject {
+        let frame = self.encoder.encode_parts(
             kind,
             version,
-            bytes: bytes.to_vec(),
-            children: children.to_vec(),
-        };
-        let hash = object.hash();
-        let frame = self
-            .encoder
-            .encode_hashed(&object, self.compression_level, hash)?;
+            bytes,
+            children,
+            self.compression_level,
+            hash,
+        )?;
         let reference = ObjectRef {
             hash,
             address: ChunkAddress {
@@ -1242,8 +1255,41 @@ impl<W: Write> ObjectStore for SealedWriter<W> {
             .checked_add(frame.len() as u64)
             .ok_or(Error::Limit("file size"))?;
         self.output.write_all(frame)?;
-        self.last = Some((reference, kind, object.canonical_len()));
+        self.last = Some((reference, kind, 8 + 32 * children.len() + bytes.len()));
         Ok(reference)
+    }
+}
+impl<W: Write> ObjectStore for SealedWriter<W> {
+    fn get(&self, _: ObjectRef) -> Result<CanonicalObject> {
+        Err(Error::Unsupported("forward writer has no readback".into()))
+    }
+    fn put(
+        &mut self,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        check_input(bytes, children)?;
+        let hash = CanonicalObject::hash_parts(kind, version, bytes, children);
+        self.write_object(kind, version, bytes, children, hash)
+    }
+    fn put_verified(
+        &mut self,
+        source: &VerifiedObject,
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        source.validate_children(children)?;
+        let object = source.object();
+        // Keep the configured sealed codec and level. The source encoding may
+        // have used another level even though its canonical bytes match.
+        self.write_object(
+            object.kind,
+            object.version,
+            &object.bytes,
+            children,
+            source.hash,
+        )
     }
 }
 /// Copy the complete snapshot closure into a sealed forward-only representation.
@@ -1291,6 +1337,16 @@ fn pack_commit_at_level<S: ObjectStore + ?Sized, W: Write>(
     limits: resources::Limits,
     level: i32,
 ) -> Result<W> {
+    pack_commit_impl(source, commit, output, limits, level, None)
+}
+fn pack_commit_impl<S: ObjectStore + ?Sized, W: Write>(
+    source: &S,
+    commit: ObjectRef,
+    output: W,
+    limits: resources::Limits,
+    level: i32,
+    verification: Option<(ObjectRef, resources::Budget)>,
+) -> Result<W> {
     let object = source.get(commit)?;
     validate_core_object(&object)?;
     if object.kind != 1 || object.version != 1 {
@@ -1299,6 +1355,14 @@ fn pack_commit_at_level<S: ObjectStore + ?Sized, W: Write>(
     let body = cbor::decode(&object.bytes)?;
     let fields = schema::array(&body, 3)?;
     let snapshot = object.children[schema::uint(&fields[0])? as usize];
+    let verification = verification
+        .map(|(expected, budget)| {
+            if expected != snapshot {
+                return Err(corrupt("Commit does not select this snapshot"));
+            }
+            Ok(budget)
+        })
+        .transpose()?;
     let mut writer = SealedWriter::new(output)?;
     writer.set_compression_level(level);
     let att = if fields[1] == cbor::Value::Null {
@@ -1311,7 +1375,13 @@ fn pack_commit_at_level<S: ObjectStore + ?Sized, W: Write>(
         }
         Some(writer.put(att.kind, att.version, &att.bytes, &att.children)?)
     };
-    let copied = resources::copy_snapshot(source, &mut writer, snapshot, limits)?;
+    let copied = resources::copy_snapshot_with_verification(
+        source,
+        &mut writer,
+        snapshot,
+        limits,
+        verification,
+    )?;
     writer.finish_attested(copied, att)
 }
 

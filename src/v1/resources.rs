@@ -171,47 +171,83 @@ pub fn copy_snapshot<S: ObjectStore + ?Sized, D: ObjectStore + ?Sized>(
     root: ObjectRef,
     limits: Limits,
 ) -> Result<ObjectRef> {
+    copy_snapshot_with_verification(source, destination, root, limits, None)
+}
+
+pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: ObjectStore + ?Sized>(
+    source: &S,
+    destination: &mut D,
+    root: ObjectRef,
+    limits: Limits,
+    mut verification: Option<Budget>,
+) -> Result<ObjectRef> {
     let mut budget = Budget::new(limits);
     let mut graph = graph::Workspace::new(&mut budget)?;
+    #[cfg(feature = "native")]
+    if let Some(verification) = &mut verification {
+        verification.reserve_memory(budget.resident_overhead)?;
+    }
+    // Charge the shared verification reads and edges to both workloads.
+    // Reloads and elapsed work in this walk belong to the copy budget.
     // Retain references and traversal state, never ancestor payloads. Reload a
     // parent after its children; immutable stores can serve that from cache.
     graph.push(root, false, &budget)?;
     while let Some((r, expanded)) = graph.pop()? {
         budget.time()?;
-        if expanded {
-            graph.complete(r, &budget)?;
+        let object = if expanded {
             if graph.mapped(r.hash)?.is_some() {
+                graph.complete(r, &budget)?;
                 continue;
             }
-            let object = budget.get(source, r)?;
-            let children = object
-                .children
-                .iter()
-                .map(|child| graph.mapped(child.hash)?.ok_or(Error::Missing))
-                .collect::<Result<Vec<_>>>()?;
-            let result = destination.put(object.kind, object.version, &object.bytes, &children)?;
-            if result.hash != r.hash {
-                return Err(corrupt("copy changed canonical identity"));
-            }
-            graph.map(result, &budget)?;
+            budget.get(source, r)?
         } else {
             if graph.completed(r)? {
                 continue;
             }
             graph.enter(r, &budget)?;
-            let object = budget.get(source, r)?;
-            crate::v1::validate_core_edges(&object, |child| budget.get(source, child))?;
+            let object = budget.get_for_copy(source, r, verification.as_mut())?;
+            crate::v1::validate_core_edges(&object, |child| {
+                budget.get_for_copy(source, child, verification.as_mut())
+            })?;
             for child in &object.children {
                 budget.edge()?;
+                if let Some(verification) = &mut verification {
+                    verification.charge_edge()?;
+                }
                 budget.check_reference(r, *child)?;
             }
             // Deduplicate only completed identical physical occurrences. A
             // different offset/span with the same ID can carry other locators.
-            graph.push(r, true, &budget)?;
-            for child in object.children.iter().rev() {
-                graph.push(*child, false, &budget)?;
+            if !object.children.is_empty() {
+                graph.push(r, true, &budget)?;
+                for child in object.children.iter().rev() {
+                    graph.push(*child, false, &budget)?;
+                }
+                continue;
             }
+            // Leaves need no postorder reload. The authenticated bytes are
+            // still in hand and there are no destination locators to resolve.
+            object
+        };
+        graph.complete(r, &budget)?;
+        if !expanded && graph.mapped(r.hash)?.is_some() {
+            continue;
         }
+        let children = object
+            .children
+            .iter()
+            .map(|child| graph.mapped(child.hash)?.ok_or(Error::Missing))
+            .collect::<Result<Vec<_>>>()?;
+        let verified = super::VerifiedObject {
+            hash: r.hash,
+            object,
+            compressed: None,
+        };
+        let result = destination.put_verified(&verified, &children)?;
+        if result.hash != r.hash {
+            return Err(corrupt("copy changed canonical identity"));
+        }
+        graph.map(result, &budget)?;
     }
     graph.mapped(root.hash)?.ok_or(Error::Missing)
 }
@@ -363,8 +399,11 @@ impl Budget {
         Ok(())
     }
     pub fn edge(&mut self) -> Result<()> {
-        charge(&mut self.edges, 1, self.limits.max_edges, "logical edges")?;
+        self.charge_edge()?;
         self.time()
+    }
+    fn charge_edge(&mut self) -> Result<()> {
+        charge(&mut self.edges, 1, self.limits.max_edges, "logical edges")
     }
     pub fn entry(&mut self, length: u64) -> Result<()> {
         charge(
@@ -389,27 +428,51 @@ impl Budget {
         store: &S,
         r: ObjectRef,
     ) -> Result<std::sync::Arc<CanonicalObject>> {
+        self.get_for_copy(store, r, None)
+    }
+    fn get_for_copy<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &S,
+        r: ObjectRef,
+        verification: Option<&mut Self>,
+    ) -> Result<std::sync::Arc<CanonicalObject>> {
+        self.charge_reference(r)?;
+        self.time()?;
+        let object = if let Some(verification) = verification {
+            verification.charge_reference(r)?;
+            let object = store.get_verified_shared(r)?;
+            verification.charge_object(&object)?;
+            object
+        } else {
+            store.get_verified_shared(r)?
+        };
+        self.charge_object(&object)?;
+        Ok(object)
+    }
+    fn charge_reference(&mut self, r: ObjectRef) -> Result<()> {
         charge(&mut self.frames, 1, self.limits.max_frames, "frame visits")?;
         charge(
             &mut self.source,
             u64::from(r.address.length),
             self.limits.max_source_bytes,
             "source bytes",
-        )?;
-        self.time()?;
-        let object = store.get_verified_shared(r)?;
+        )
+    }
+    fn charge_object(&mut self, object: &CanonicalObject) -> Result<()> {
         let len = 8usize
             .checked_add(object.children.len() * 32)
             .and_then(|n| n.checked_add(object.bytes.len()))
             .ok_or(Error::Limit("decoded bytes"))?;
+        self.charge_decoded(len)
+    }
+    fn charge_decoded(&mut self, len: usize) -> Result<()> {
         self.memory(len.saturating_mul(3))?;
         charge(
             &mut self.decoded,
             len as u64,
             self.limits.max_decoded_bytes,
             "decoded bytes",
-        )?;
-        Ok(object)
+        )
     }
     pub fn check_reference(&self, parent: ObjectRef, child: ObjectRef) -> Result<()> {
         let end = child

@@ -52,6 +52,148 @@ fn tiny_sealed_archive_and_verified_absence() {
 }
 
 #[test]
+fn sealed_export_does_not_reload_childless_objects_for_postorder() {
+    struct Counted<'a> {
+        source: PositionalStore<&'a [u8]>,
+        payload_reads: std::cell::Cell<usize>,
+    }
+    impl ObjectStore for Counted<'_> {
+        fn get(&self, reference: sac::ObjectRef) -> sac::Result<sac::CanonicalObject> {
+            let object = self.source.get(reference)?;
+            if object.kind == 7 {
+                self.payload_reads.set(self.payload_reads.get() + 1);
+            }
+            Ok(object)
+        }
+        fn put(
+            &mut self,
+            _: u16,
+            _: u16,
+            _: &[u8],
+            _: &[sac::ObjectRef],
+        ) -> sac::Result<sac::ObjectRef> {
+            unreachable!("read-only source");
+        }
+    }
+    let payload = vec![5; 128 << 10];
+    let bytes = packed(&[("one-chunk", &payload)]);
+    let source = Counted {
+        source: PositionalStore::open(bytes.as_slice()).unwrap(),
+        payload_reads: std::cell::Cell::new(0),
+    };
+    let snapshot = source.source.reader().snapshot().unwrap();
+    let exported = sac::pack_snapshot(&source, snapshot, Vec::new()).unwrap();
+    // One read checks the extent edge. A second authenticated read supplies
+    // the bytes to the destination without a third read in postorder.
+    assert_eq!(source.payload_reads.get(), 2);
+    let store = PositionalStore::open(exported).unwrap();
+    let root = store.reader().snapshot().unwrap();
+    assert_eq!(root.hash, snapshot.hash);
+    let archive = ArchiveReader::open(&store, root, Limits::default()).unwrap();
+    assert_eq!(
+        archive
+            .read_range(&path("one-chunk"), 0, payload.len())
+            .unwrap(),
+        payload
+    );
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn combined_export_enforces_namespace_and_graph_frame_budget() {
+    let data = vec![11; 384 << 10];
+    let bytes = packed(&[("chunked", &data)]);
+    let source = PositionalStore::open(bytes.as_slice()).unwrap();
+    let publication = source.reader().publication.unwrap();
+    let snapshot = source.reader().snapshot().unwrap();
+    let mut rejected_by_verification_only = false;
+    let mut accepted = false;
+    for max_frames in 8..40 {
+        let limits = Limits {
+            max_frames,
+            ..Limits::default()
+        };
+        let reader = ArchiveReader::open(&source, snapshot, limits.clone()).unwrap();
+        let copy =
+            sac::pack_commit_with_limits(&source, publication.root, Vec::new(), limits.clone());
+        let combined =
+            reader.pack_verified_commit(publication.root, Vec::new(), limits.max_temp_bytes);
+        match (reader.verify(), copy, combined) {
+            (Ok(_), Ok(expected), Ok(actual)) => {
+                assert_eq!(expected, actual);
+                accepted = true;
+            }
+            (
+                Err(sac::Error::Limit("frame visits")),
+                Ok(_),
+                Err(sac::Error::Limit("frame visits")),
+            ) => {
+                rejected_by_verification_only = true;
+            }
+            (_, Err(sac::Error::Limit("frame visits")), Err(sac::Error::Limit("frame visits"))) => {
+            }
+            result => panic!("inconsistent frame budget at {max_frames}: {result:?}"),
+        }
+    }
+    assert!(rejected_by_verification_only);
+    assert!(accepted);
+}
+
+#[cfg(feature = "native")]
+#[test]
+fn combined_export_checks_extent_geometry_and_deferred_byte_roles() {
+    use sac::cbor::{Value::*, encode};
+
+    for (file_length, extent_length, leaf_kind, expected_error) in [
+        (5, 4, 7, "extent root length mismatch"),
+        (5, 5, 7, "extent byte length"),
+        (4, 4, 10, "core child role kind or schema"),
+    ] {
+        let mut source = MemoryStore::sealed();
+        let leaf = source.put(leaf_kind, 1, b"data", &[]).unwrap();
+        let extent = source
+            .put(
+                5,
+                1,
+                &encode(&Array(vec![Array(vec![Uint(extent_length), Uint(0)])])),
+                &[leaf],
+            )
+            .unwrap();
+        let directory = source
+            .put(
+                3,
+                1,
+                &encode(&Array(vec![Array(vec![
+                    Bytes(b"file".to_vec()),
+                    Uint(0),
+                    Map(vec![]),
+                    Array(vec![Uint(file_length), Uint(1), Uint(0)]),
+                ])])),
+                &[extent],
+            )
+            .unwrap();
+        let snapshot =
+            sac::v1::resources::snapshot(&mut source, directory, vec![], vec![]).unwrap();
+        let commit = source
+            .put(
+                1,
+                1,
+                &encode(&Array(vec![Uint(0), Null, Null])),
+                &[snapshot],
+            )
+            .unwrap();
+        let limits = Limits::default();
+        let reader = ArchiveReader::open(&source, snapshot, limits.clone()).unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            reader.pack_verified_commit(commit, &mut output, limits.max_temp_bytes),
+            Err(sac::Error::Corrupt(message)) if message == expected_error
+        ));
+        assert!(PositionalStore::open(output).is_err());
+    }
+}
+
+#[test]
 fn split_pages_nested_raw_names_cross_chunk_and_sparse_ranges() {
     let mut store = MemoryStore::sealed();
     let mut builder = ArchiveBuilder::new(&mut store);

@@ -88,7 +88,10 @@ files, symlinks and directories are never overwritten. Live output additionally
 uses the backend's publication fence, ordered data/extent and slot barriers,
 and a fresh nonzero incarnation. Live output requires a named seekable path.
 `compact` copies only the selected strong closure, preserving the snapshot ID
-and its attestation catalogue. A commit with a local authority attachment
+and its attestation catalogue. For named output, the copy walk verifies the
+portable graph while writing to private staging. Source and staged output both
+receive physical validation, and resource namespace validation still runs.
+A commit with a local authority attachment
 requires explicit `--strip-local` for sealed compaction or fresh live recovery.
 That operation removes the local attachment and can change commit identity;
 it retains snapshot identity and the snapshot's profile/optional closures.

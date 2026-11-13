@@ -415,6 +415,103 @@ fn strict_physical_validation_enforces_operation_limits() {
         Err(Error::Limit(_))
     ));
 }
+
+#[test]
+fn physical_validation_reuses_byte_leaf_authentication_and_keeps_logical_charges() {
+    let dir = tempfile::tempdir().unwrap();
+    for embedded in [false, true] {
+        let payload = CanonicalObject {
+            kind: 7,
+            version: 1,
+            bytes: vec![42; 4096],
+            children: Vec::new(),
+        };
+        let mut writer = SealedWriter::new(Vec::new()).unwrap();
+        writer.set_compression_level(0);
+        let chunk = if embedded {
+            let bytes = wire::encode_frame(&payload, 0).unwrap();
+            let outer = writer.put(7, 1, &bytes, &[]).unwrap();
+            ObjectRef {
+                hash: payload.hash(),
+                address: ChunkAddress {
+                    offset: outer.address.offset + wire::FRAME as u64 + 8,
+                    length: bytes.len() as u32,
+                },
+            }
+        } else {
+            writer.put(7, 1, &payload.bytes, &[]).unwrap()
+        };
+        use cbor::Value::{Array, Bytes, Map, Uint};
+        let extent = writer
+            .put(
+                5,
+                1,
+                &cbor::encode(&Array(vec![Array(vec![
+                    Uint(payload.bytes.len() as u64),
+                    Uint(0),
+                ])])),
+                &[chunk],
+            )
+            .unwrap();
+        let directory = writer
+            .put(
+                3,
+                1,
+                &cbor::encode(&Array(vec![Array(vec![
+                    Bytes(b"file".to_vec()),
+                    Uint(0),
+                    Map(vec![]),
+                    Array(vec![Uint(payload.bytes.len() as u64), Uint(1), Uint(0)]),
+                ])])),
+                &[extent],
+            )
+            .unwrap();
+        let snapshot = resources::snapshot(&mut writer, directory, vec![], vec![]).unwrap();
+        let path = dir.path().join(format!("sealed-{embedded}.sac"));
+        std::fs::write(&path, writer.finish(snapshot).unwrap()).unwrap();
+        let reader = NativeReader::open(&path).unwrap();
+        if embedded {
+            assert!(matches!(
+                reader.validate(),
+                Err(Error::Corrupt(message)) if message == "reachable locator is not a top-level frame"
+            ));
+            continue;
+        }
+        let commit = reader.root().unwrap().root;
+        let mut decoded = reader.get(commit).unwrap().canonical_len() as u64;
+        for reference in [snapshot, directory, extent, chunk] {
+            decoded += 2 * reader.get(reference).unwrap().canonical_len() as u64;
+        }
+        let before = reader.physical_statistics().object_bytes;
+        let report = reader.validate().unwrap();
+        let physical_bytes = reader.physical_statistics().object_bytes - before;
+        assert_eq!(
+            report,
+            ValidationReport {
+                objects: 5,
+                decoded_bytes: decoded,
+            }
+        );
+        assert_eq!(
+            physical_bytes,
+            u64::from(commit.address.length)
+                + 2 * [snapshot, directory, extent]
+                    .into_iter()
+                    .map(|reference| u64::from(reference.address.length))
+                    .sum::<u64>()
+                + u64::from(chunk.address.length)
+        );
+        let limits = resources::Limits {
+            max_decoded_bytes: decoded - 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            reader.validate_with_limits(&limits),
+            Err(Error::Limit("validation decoded bytes"))
+        ));
+    }
+}
+
 #[test]
 fn publication_relocates_requested_control_roots_without_changing_ids() {
     let (_dir, mut store) = store();

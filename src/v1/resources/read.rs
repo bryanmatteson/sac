@@ -225,7 +225,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                 None,
                 offset,
                 end,
-                output,
+                Some(output),
                 budget,
                 0,
             )?;
@@ -442,9 +442,16 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         }
         match data {
             FileData::Inline(b) => output.write_all(&b[offset as usize..end as usize])?,
-            FileData::Extents(root) => {
-                self.extents(*root, *file_length, None, offset, end, output, budget, 0)?
-            }
+            FileData::Extents(root) => self.extents(
+                *root,
+                *file_length,
+                None,
+                offset,
+                end,
+                Some(output),
+                budget,
+                0,
+            )?,
         }
         Ok(())
     }
@@ -459,7 +466,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         expected_height: Option<u64>,
         start: u64,
         end: u64,
-        output: &mut W,
+        mut output: Option<&mut W>,
         budget: &mut Budget,
         depth: usize,
     ) -> Result<()> {
@@ -492,24 +499,36 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                     if start < next && end > prior {
                         let a = start.saturating_sub(prior);
                         let b = end.min(next) - prior;
-                        if row[1].is_null() {
-                            write_zeros(output, b - a, budget)?;
-                        } else {
+                        if !row[1].is_null() {
                             let r = *object
                                 .children
                                 .get(row[1].uint()? as usize)
                                 .ok_or_else(|| corrupt("child index"))?;
                             budget.check_reference(root, r)?;
                             budget.edge()?;
-                            let data = budget.get(self.store, r)?;
-                            if data.kind != 7
-                                || data.version != 1
-                                || !data.children.is_empty()
-                                || data.bytes.len() as u64 != length
-                            {
-                                return Err(corrupt("extent byte object length or type"));
+                            if let Some(output) = output.as_deref_mut() {
+                                let data = budget.get(self.store, r)?;
+                                if data.kind != 7
+                                    || data.version != 1
+                                    || !data.children.is_empty()
+                                    || data.bytes.len() as u64 != length
+                                {
+                                    return Err(corrupt("extent byte object length or type"));
+                                }
+                                output.write_all(&data.bytes[a as usize..b as usize])?;
+                            } else {
+                                // A successful graph copy checks this exact edge's
+                                // kind and length. Charge the namespace visit now.
+                                let decoded = length
+                                    .checked_add(8)
+                                    .and_then(|len| usize::try_from(len).ok())
+                                    .filter(|len| *len <= super::super::MAX_CHUNK_SIZE)
+                                    .ok_or_else(|| corrupt("extent byte object length or type"))?;
+                                budget.charge_reference(r)?;
+                                budget.charge_decoded(decoded)?;
                             }
-                            output.write_all(&data.bytes[a as usize..b as usize])?;
+                        } else if let Some(output) = output.as_deref_mut() {
+                            write_zeros(output, b - a, budget)?;
                         }
                     }
                     prior = next;
@@ -547,7 +566,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                             Some(height - 1),
                             start.saturating_sub(prior),
                             end.min(next) - prior,
-                            output,
+                            output.as_deref_mut(),
                             budget,
                             depth + 1,
                         )?;
@@ -581,20 +600,40 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         self.verify_from(commit, budget)
     }
     fn verify_from(&self, root: ObjectRef, mut budget: Budget) -> Result<VerificationReport> {
+        let mut report = self.verify_namespace(&mut budget, false)?;
+        // Repeated immutable occurrences share graph validation. Namespace
+        // expansion and file lengths are charged by verify_namespace.
+        self.verify_graph(root, &mut budget)?;
+        report.content_verified = true;
+        report.core_checked = true;
+        report.profile_checked = !self.has_profiles;
+        Ok(report)
+    }
+    fn verify_namespace(
+        &self,
+        budget: &mut Budget,
+        defer_byte_leaves_to_copy: bool,
+    ) -> Result<VerificationReport> {
         let mut report = VerificationReport {
             snapshot_id: self.snapshot.hash.0,
             root_admitted: true,
             ..Default::default()
         };
-        self.visit_raw_with_budget(&mut budget, true, &mut |_, entry, budget| {
+        self.visit_raw_with_budget(budget, true, &mut |_, entry, budget| {
             report.entries += 1;
-            if let EntryData::File { length, .. } = &entry.data {
+            if let EntryData::File { length, data } = &entry.data {
                 report.files += 1;
                 report.logical_bytes = report
                     .logical_bytes
                     .checked_add(*length)
                     .ok_or(Error::Limit("logical bytes"))?;
-                self.read_entry(&entry, 0, *length, &mut std::io::sink(), budget)?;
+                if !defer_byte_leaves_to_copy {
+                    self.read_entry(&entry, 0, *length, &mut std::io::sink(), budget)?;
+                } else if let FileData::Extents(root) = data {
+                    self.extents::<std::io::Sink>(
+                        *root, *length, None, 0, *length, None, budget, 0,
+                    )?;
+                }
             }
             Ok(())
         })?;
@@ -617,13 +656,32 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                 return Err(corrupt("profile declaration root binding mismatch"));
             }
         }
-        // Every distinct physical occurrence is checked. Repeated immutable
-        // occurrences share that validation; namespace expansion is charged above.
-        self.verify_graph(root, &mut budget)?;
-        report.content_verified = true;
-        report.core_checked = true;
-        report.profile_checked = !self.has_profiles;
         Ok(report)
+    }
+    /// Verify the portable snapshot and export its commit in one graph walk.
+    /// The caller is responsible for physical file validation and for staging
+    /// the output. An error can leave an incomplete prefix in the writer.
+    #[cfg(feature = "native")]
+    pub fn pack_verified_commit<W: Write>(
+        &self,
+        commit: ObjectRef,
+        output: W,
+        max_copy_temp_bytes: u64,
+    ) -> Result<W> {
+        let mut verification = Budget::new(self.limits.clone());
+        // The copy's direct role checks authenticate every extent byte leaf
+        // before it is exported, including its declared length.
+        self.verify_namespace(&mut verification, true)?;
+        let mut copy_limits = self.limits.clone();
+        copy_limits.max_temp_bytes = copy_limits.max_temp_bytes.min(max_copy_temp_bytes);
+        super::super::pack_commit_impl(
+            self.store,
+            commit,
+            output,
+            copy_limits,
+            1,
+            Some((self.snapshot, verification)),
+        )
     }
     fn verify_graph(&self, root: ObjectRef, budget: &mut Budget) -> Result<()> {
         let mut graph = super::graph::Workspace::new(budget)?;

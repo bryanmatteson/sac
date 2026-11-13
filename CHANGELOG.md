@@ -27,6 +27,14 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   views and opened-file/caller-buffer reads, and calculate encoded sizes directly.
 - Account for extent-frontier sizes incrementally, retaining bounded child
   indexes and avoiding candidate CBOR trees on every appended range.
+- Export childless objects without a second traversal read and carry native
+  read authentication through the CLI's scratch-budget wrapper.
+- Verify the portable graph during named sealed compaction, reuse authenticated
+  object IDs in the sealed encoder, and buffer staged archive writes.
+- Reuse the physical validation decoder and count extent payloads without
+  rereading the exact leaf authenticated by the extent role check.
+- Validate extent geometry before sealed export and authenticate the byte
+  leaves during the verified copy.
 - Hash newly inserted objects once, reuse writer frame/compression workspaces,
   expose borrowed frame decoding and reuse native decompression contexts.
 - Remove ordered-index updates from warm cache hits while retaining exact,

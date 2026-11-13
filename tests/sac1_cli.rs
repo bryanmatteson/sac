@@ -327,6 +327,8 @@ fn sealed_cli_pack_list_verify_ranges_and_identity_preserving_compaction() {
     assert_eq!(range.stdout, bytes[262130..262130 + 65536]);
     let compact = tmp.path().join("compact.sac");
     run(&["compact".as_ref(), arg(&archive), arg(&compact)]);
+    let streamed = run(&["compact".as_ref(), arg(&archive), "-".as_ref()]);
+    assert_eq!(fs::read(&compact).unwrap(), streamed.stdout);
     assert_eq!(snapshot(&archive), snapshot(&compact));
     let destination = tmp.path().join("extracted");
     run(&["unpack".as_ref(), arg(&compact), arg(&destination)]);
@@ -608,6 +610,13 @@ fn compact_preserves_attestations_and_requires_explicit_local_attachment_removal
         arg(&output),
         "--strip-local".as_ref(),
     ]);
+    let streamed = run(&[
+        "compact".as_ref(),
+        arg(&archive),
+        "-".as_ref(),
+        "--strip-local".as_ref(),
+    ]);
+    assert_eq!(fs::read(&output).unwrap(), streamed.stdout);
     let reader = sac::v1::NativeReader::open(&output).unwrap();
     let commit = reader.get(reader.root().unwrap().root).unwrap();
     let Value::Array(fields) = sac::v1::cbor::decode(&commit.bytes).unwrap() else {
@@ -621,6 +630,62 @@ fn compact_preserves_attestations_and_requires_explicit_local_attachment_removal
         reader.get(commit.children[index as usize]).unwrap().hash(),
         attestation.hash
     );
+}
+
+#[test]
+fn compact_validates_resource_geometry_before_installing() {
+    use sac::v1::{
+        Header, MemoryStore, NativeReader, ObjectStore,
+        cbor::{Value, encode},
+        resources,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let mut store = MemoryStore::new(Header::new([0; 16], [7; 16]));
+    let chunk = store.put(7, 1, &[42; 16], &[]).unwrap();
+    let extents = store
+        .put(
+            5,
+            1,
+            &encode(&Value::Array(vec![Value::Array(vec![
+                Value::Uint(16),
+                Value::Uint(0),
+            ])])),
+            &[chunk],
+        )
+        .unwrap();
+    let directory = store
+        .put(
+            3,
+            1,
+            &encode(&Value::Array(vec![Value::Array(vec![
+                Value::Bytes(b"short".to_vec()),
+                Value::Uint(0),
+                Value::Map(vec![]),
+                Value::Array(vec![Value::Uint(17), Value::Uint(1), Value::Uint(0)]),
+            ])])),
+            &[extents],
+        )
+        .unwrap();
+    let snapshot = resources::snapshot(&mut store, directory, vec![], vec![]).unwrap();
+    store.publish(snapshot).unwrap();
+    let archive = tmp.path().join("short.sac");
+    fs::write(&archive, store.as_bytes()).unwrap();
+    NativeReader::open(&archive).unwrap().validate().unwrap();
+
+    let destination = tmp.path().join("sealed.sac");
+    let result = command()
+        .arg("compact")
+        .arg(&archive)
+        .arg(&destination)
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("extent root length mismatch"),
+        "{:?}",
+        result
+    );
+    assert!(!destination.exists());
 }
 
 #[test]

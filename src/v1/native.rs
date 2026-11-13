@@ -582,7 +582,7 @@ impl NativeStore {
         };
         let _cache = ValidationCacheGuard::new(self.cache.clone(), limits)?;
         let file = self.file.lock().unwrap().try_clone()?;
-        validate_physical_closure(&file, &self.reader, &self.io, self, limits)
+        validate_physical_closure(&file, &self.reader, &self.io, limits)
     }
     pub fn pin(&self) -> Result<NativeReader> {
         flush_append(&self.file, &self.append_buffer)?;
@@ -1771,7 +1771,7 @@ impl NativeReader {
             None
         };
         let _cache = ValidationCacheGuard::new(self.cache.clone(), limits)?;
-        validate_physical_closure(&self.file, &self.reader, &self.io, self, limits)
+        validate_physical_closure(&self.file, &self.reader, &self.io, limits)
     }
 }
 impl Drop for NativeReader {
@@ -2222,11 +2222,36 @@ impl Drop for ValidationCacheGuard {
         self.cache.lock().unwrap().set_budget(self.old);
     }
 }
+struct ValidationFrames<'a> {
+    file: &'a File,
+    io: &'a PhysicalCounters,
+    first: u64,
+    end: u64,
+    bytes: Vec<u8>,
+    decoder: wire::FrameDecoder,
+}
+impl ValidationFrames<'_> {
+    fn get(&mut self, reference: ObjectRef) -> Result<wire::FrameView<'_>> {
+        wire::validate_address(reference.address, self.first, self.end)?;
+        let length = reference.address.length as usize;
+        if self.bytes.len() < length {
+            self.bytes.resize(length, 0);
+        }
+        let bytes = &mut self.bytes[..length];
+        counted_read_at(
+            self.file,
+            bytes,
+            reference.address.offset,
+            self.io,
+            ReadClass::Object,
+        )?;
+        self.decoder.decode(reference, bytes, self.first, self.end)
+    }
+}
 fn validate_physical_closure(
     file: &File,
     reader: &Reader,
     io: &PhysicalCounters,
-    store: &impl ObjectStore,
     limits: &resources::Limits,
 ) -> Result<ValidationReport> {
     let started = Instant::now();
@@ -2270,8 +2295,9 @@ fn validate_physical_closure(
                 return Err(corrupt("frame crosses selected extent"));
             }
             let decoded = u32::from_le_bytes(header[12..16].try_into().unwrap());
-            let mut value = (span as u32).to_le_bytes().to_vec();
-            value.extend(decoded.to_le_bytes());
+            let mut value = [0; 8];
+            value[..4].copy_from_slice(&(span as u32).to_le_bytes());
+            value[4..].copy_from_slice(&decoded.to_le_bytes());
             inventory.insert_cancellable(&offset.to_le_bytes(), &value, &|| false)?;
             let children = u16::from_le_bytes(header[6..8].try_into().unwrap()) as u64;
             let stored = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
@@ -2311,10 +2337,18 @@ fn validate_physical_closure(
     }
     let mut report = ValidationReport::default();
     let mut edges = 0u64;
-    while let Some((r, expanded)) = stack.pop()? {
-        if expanded {
-            continue;
-        }
+    let mut frames = ValidationFrames {
+        file,
+        io,
+        first: reader.first_record_offset(),
+        end: reader.trailer_offset(),
+        bytes: Vec::new(),
+        decoder: wire::FrameDecoder::default(),
+    };
+    // In this traversal the stack flag carries authentication of a byte
+    // leaf from its extent role check. Inventory and visit charges still
+    // apply to every distinct physical occurrence.
+    while let Some((r, checked_leaf)) = stack.pop()? {
         if started.elapsed() > limits.max_elapsed {
             return Err(Error::Limit("validation elapsed work"));
         }
@@ -2344,38 +2378,57 @@ fn validate_physical_closure(
             return Err(Error::Limit("validation decoded bytes"));
         }
         seen.insert_cancellable(&key, &[], &|| false)?;
-        let object = store.get_verified_shared(r)?;
         report.decoded_bytes = next;
-        validate_core_edges(&object, |child| {
-            if started.elapsed() > limits.max_elapsed {
-                return Err(Error::Limit("validation elapsed work"));
-            }
-            records = records
-                .checked_add(1)
-                .ok_or(Error::Limit("validation frame visits"))?;
-            if records > limits.max_frames {
-                return Err(Error::Limit("validation frame visits"));
-            }
-            charge(&mut source_bytes, u64::from(child.address.length))?;
-            let fetched = store.get_verified_shared(child)?;
-            report.decoded_bytes = report
-                .decoded_bytes
-                .checked_add(fetched.canonical_len() as u64)
-                .ok_or(Error::Limit("validation decoded bytes"))?;
-            if report.decoded_bytes > limits.max_decoded_bytes {
-                return Err(Error::Limit("validation decoded bytes"));
-            }
-            Ok(fetched)
-        })?;
         report.objects += 1;
-        for child in object.children.iter().rev() {
+        if checked_leaf {
+            continue;
+        }
+        let frame = frames.get(r)?;
+        let mut push = |child, checked_leaf| {
             edges = edges
                 .checked_add(1)
                 .ok_or(Error::Limit("validation graph edges"))?;
             if edges > limits.max_edges {
                 return Err(Error::Limit("validation graph edges"));
             }
-            stack.push(*child, false)?;
+            stack.push(child, checked_leaf)
+        };
+        if matches!(frame.kind, 1..=6) {
+            // Only core parents with role checks need to retain their body
+            // while the same decoder authenticates a child.
+            let object = frame.to_owned();
+            validate_core_edges(&object, |child| {
+                if started.elapsed() > limits.max_elapsed {
+                    return Err(Error::Limit("validation elapsed work"));
+                }
+                records = records
+                    .checked_add(1)
+                    .ok_or(Error::Limit("validation frame visits"))?;
+                if records > limits.max_frames {
+                    return Err(Error::Limit("validation frame visits"));
+                }
+                charge(&mut source_bytes, u64::from(child.address.length))?;
+                let fetched = frames.get(child)?;
+                let canonical_len = 8 + 32 * fetched.child_count() + fetched.body.len();
+                report.decoded_bytes = report
+                    .decoded_bytes
+                    .checked_add(canonical_len as u64)
+                    .ok_or(Error::Limit("validation decoded bytes"))?;
+                if report.decoded_bytes > limits.max_decoded_bytes {
+                    return Err(Error::Limit("validation decoded bytes"));
+                }
+                Ok(Arc::new(fetched.to_owned()))
+            })?;
+            // Every index in an admitted extent leaf is used. Its role
+            // checks authenticate each referenced byte leaf, including length.
+            let checked_children = object.kind == 5;
+            for child in object.children.into_iter().rev() {
+                push(child, checked_children)?;
+            }
+        } else {
+            for index in (0..frame.child_count()).rev() {
+                push(frame.child(index).unwrap(), false)?;
+            }
         }
     }
     Ok(report)

@@ -351,8 +351,25 @@ impl FrameEncoder {
         level: i32,
         hash: ObjectHash,
     ) -> Result<&[u8]> {
-        check_input(&object.bytes, &object.children)?;
-        validate_core_object(object)?;
+        self.encode_parts(
+            object.kind,
+            object.version,
+            &object.bytes,
+            &object.children,
+            level,
+            hash,
+        )
+    }
+    pub(crate) fn encode_parts(
+        &mut self,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+        level: i32,
+        hash: ObjectHash,
+    ) -> Result<&[u8]> {
+        super::schema::validate_core_shape(kind, version, bytes, children.len())?;
         self.frame.clear();
         self.frame.resize(FRAME, 0);
         #[cfg(feature = "compression")]
@@ -360,9 +377,9 @@ impl FrameEncoder {
         #[cfg(not(feature = "compression"))]
         let codec = 0u8;
         #[cfg(feature = "compression")]
-        if !matches!(object.kind, 1 | 2) && level != 0 {
+        if !matches!(kind, 1 | 2) && level != 0 {
             self.canonical.clear();
-            object.write_canonical(&mut self.canonical);
+            CanonicalObject::write_parts(kind, version, bytes, children, &mut self.canonical);
             if self
                 .compressor
                 .as_ref()
@@ -386,14 +403,20 @@ impl FrameEncoder {
                 self.frame.extend_from_slice(&self.canonical);
             }
         } else {
-            object.write_canonical(&mut self.frame);
+            CanonicalObject::write_parts(kind, version, bytes, children, &mut self.frame);
         }
         #[cfg(not(feature = "compression"))]
         {
             let _ = level;
-            object.write_canonical(&mut self.frame);
+            CanonicalObject::write_parts(kind, version, bytes, children, &mut self.frame);
         }
-        self.finish(object, hash, codec)
+        self.finish(
+            kind,
+            8 + children.len() * 32 + bytes.len(),
+            children,
+            hash,
+            codec,
+        )
     }
     /// A frame for `object` from the Zstandard bytes of another frame. A
     /// decoder authenticated those bytes as the canonical bytes of this
@@ -410,20 +433,33 @@ impl FrameEncoder {
         self.frame.clear();
         self.frame.resize(FRAME, 0);
         self.frame.extend_from_slice(compressed);
-        self.finish(object, hash, 1)
+        self.finish(
+            object.kind,
+            object.canonical_len(),
+            &object.children,
+            hash,
+            1,
+        )
     }
     // The stored bytes are in the frame. Add the child locators, the padding
     // and the header.
-    fn finish(&mut self, object: &CanonicalObject, hash: ObjectHash, codec: u8) -> Result<&[u8]> {
+    fn finish(
+        &mut self,
+        kind: u16,
+        canonical_len: usize,
+        children: &[ObjectRef],
+        hash: ObjectHash,
+        codec: u8,
+    ) -> Result<&[u8]> {
         let stored = self.frame.len() - FRAME;
-        for child in &object.children {
+        for child in children {
             self.frame
                 .extend_from_slice(&child.address.offset.to_le_bytes());
             self.frame
                 .extend_from_slice(&child.address.length.to_le_bytes());
         }
         let span = (self.frame.len() + 7) & !7;
-        let maximum = match object.kind {
+        let maximum = match kind {
             3 => Some(144 * 1024),
             4..=6 | 9 => Some(80 * 1024),
             _ => None,
@@ -435,9 +471,9 @@ impl FrameEncoder {
         self.frame[..4].copy_from_slice(b"SO1\0");
         self.frame[4] = codec;
         self.frame[5] = 1;
-        self.frame[6..8].copy_from_slice(&(object.children.len() as u16).to_le_bytes());
+        self.frame[6..8].copy_from_slice(&(children.len() as u16).to_le_bytes());
         self.frame[8..12].copy_from_slice(&(stored as u32).to_le_bytes());
-        self.frame[12..16].copy_from_slice(&(object.canonical_len() as u32).to_le_bytes());
+        self.frame[12..16].copy_from_slice(&(canonical_len as u32).to_le_bytes());
         self.frame[16..48].copy_from_slice(&hash.0);
         let crc = crc32c(&self.frame[..FRAME]);
         self.frame[48..52].copy_from_slice(&crc.to_le_bytes());
