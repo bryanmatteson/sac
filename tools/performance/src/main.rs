@@ -1,5 +1,5 @@
 use sac::{
-    CanonicalObject, NativeStore, ObjectRef, ObjectStore,
+    CanonicalObject, MemoryStore, NativeStore, ObjectRef, ObjectStore, PositionalStore,
     resources::{ArchiveBuilder, ArchiveReader, ExtentAccumulator, Limits, path_from_str},
 };
 use serde_json::{Value, json};
@@ -161,6 +161,142 @@ fn main() {
                 64,
             )
         }
+        "duplicate-write" => {
+            let existing = store.put(7, 1, &object.bytes, &[]).unwrap();
+            let end = store.file_len();
+            let result = sample(
+                || {
+                    assert_eq!(
+                        store.put(7, 1, black_box(&object.bytes), &[]).unwrap(),
+                        existing
+                    )
+                },
+                1024,
+            );
+            assert_eq!(store.file_len(), end);
+            operation_hash = Some(existing.hash);
+            result
+        }
+        "append-steady"
+        | "append-cached-steady"
+        | "authenticate-steady"
+        | "rewrite-layout-steady" => {
+            // Start past the resident prefix with room for both measurement
+            // loops before the next resize. The fixture's old reference
+            // remains readable even when the optional cache is disabled.
+            store
+                .set_append_index_memory_budget(512 + 256 * 2048)
+                .unwrap();
+            let child = store.put(7, 1, &[9; 16 * 1024], &[]).unwrap();
+            let mut body = [0; 16 * 1024];
+            let use_cache = case == "append-cached-steady";
+            let warm_entries = if use_cache { 8500u64 } else { 3200u64 };
+            for i in 0..warm_entries {
+                store.put(7, 1, &i.to_le_bytes(), &[]).unwrap();
+            }
+            let published = store.publish(snapshot).unwrap();
+            assert!(store.temporary_bytes().unwrap() > 0);
+            if !use_cache {
+                store.set_decoded_cache_budget(0);
+            }
+            let rewrite = case == "rewrite-layout-steady";
+            let authenticate = case == "authenticate-steady" || rewrite;
+            if authenticate {
+                store.discard_disposable_caches();
+                for i in 0..3200u64 {
+                    store.put(7, 1, &i.to_le_bytes(), &[]).unwrap();
+                }
+            }
+            let scratch = store.temporary_bytes().unwrap();
+            let links = [child; 8];
+            let iterations = if rewrite { 128 } else { 1024 };
+            let mut ordinal = 0u64;
+            let result = sample(
+                || {
+                    body[..8].copy_from_slice(&ordinal.to_le_bytes());
+                    ordinal += 1;
+                    let reference = if authenticate {
+                        store
+                            .put(
+                                4096,
+                                1,
+                                black_box(&body),
+                                if rewrite { &links } else { &links[..1] },
+                            )
+                            .unwrap()
+                    } else {
+                        store.put(7, 1, black_box(&body), &[]).unwrap()
+                    };
+                    operation_hash = Some(reference.hash);
+                    black_box(reference);
+                },
+                iterations,
+            );
+            assert_eq!(store.root(), Some(published));
+            if rewrite {
+                // Only the fixed-width provenance records may grow; a table
+                // resize would exceed this bound and invalidate steady reuse.
+                let current = store.temporary_bytes().unwrap();
+                assert!(current > scratch);
+                assert!(current - scratch <= (8 + 2 * iterations) as u64 * 40);
+            } else {
+                assert_eq!(store.temporary_bytes().unwrap(), scratch);
+            }
+            result
+        }
+        "append-cache-churn" => {
+            store
+                .set_append_index_memory_budget(512 + 256 * 2048)
+                .unwrap();
+            store.set_decoded_cache_budget(4096);
+            let mut body = [0x73; 32];
+            for i in 0..3200u64 {
+                body[..8].copy_from_slice(&i.to_le_bytes());
+                store.put(7, 1, &body, &[]).unwrap();
+            }
+            let scratch = store.temporary_bytes().unwrap();
+            let mut ordinal = 3200u64;
+            let mut last = None;
+            let result = sample(
+                || {
+                    body[..8].copy_from_slice(&ordinal.to_le_bytes());
+                    ordinal += 1;
+                    let reference = store.put(7, 1, black_box(&body), &[]).unwrap();
+                    last = Some(reference);
+                    black_box(reference);
+                },
+                1024,
+            );
+            assert_eq!(store.temporary_bytes().unwrap(), scratch);
+            let last = last.unwrap();
+            assert_eq!(store.get(last).unwrap().bytes, body);
+            operation_hash = Some(last.hash);
+            result
+        }
+        "positional-read" => {
+            let mut sealed = MemoryStore::sealed();
+            sealed.set_compression_level(0);
+            let mut builder = ArchiveBuilder::new(&mut sealed);
+            builder.set_chunk_size(object.bytes.len()).unwrap();
+            builder.add_file(&path, &object.bytes).unwrap();
+            let snapshot = builder.finish().unwrap();
+            sealed.publish(snapshot).unwrap();
+            let source = PositionalStore::open(sealed.as_bytes()).unwrap();
+            let root = source.reader().snapshot().unwrap();
+            assert_eq!(root.hash, snapshot.hash);
+            let archive = ArchiveReader::open(&source, root, Limits::default()).unwrap();
+            let file = archive.open_file(&path).unwrap().unwrap();
+            let mut range = [0; 4096];
+            let result = sample(
+                || {
+                    file.read_into(black_box(4057), &mut range).unwrap();
+                    assert_eq!(range, [53; 4096]);
+                },
+                1024,
+            );
+            operation_hash = Some(root.hash);
+            result
+        }
         #[cfg(feature = "optimized-api")]
         "extent-opened" => {
             let file = archive.open_file(&extent_path).unwrap().unwrap();
@@ -254,6 +390,11 @@ fn main() {
             | "encode-reuse"
             | "decode-view"
             | "compressed-decode-view"
+            | "append-steady"
+            | "append-cached-steady"
+            | "append-cache-churn"
+            | "authenticate-steady"
+            | "rewrite-layout-steady"
     ) {
         assert_eq!(
             result["allocations"]["count"], 0,

@@ -720,10 +720,16 @@ impl DecodedCache {
         }
     }
     fn evict_oldest(&mut self) -> bool {
+        self.evict_oldest_for_append(None)
+    }
+    fn evict_oldest_for_append(
+        &mut self,
+        recycle: Option<(&mut Option<Arc<CanonicalObject>>, usize, usize)>,
+    ) -> bool {
         self.refresh_order();
         let decoded = self.objects.oldest_age();
-        let metadata_allowance = (self.budget.saturating_sub(self.pinned_metadata) / 8)
-            .min(4 * 1024 * 1024);
+        let metadata_allowance =
+            (self.budget.saturating_sub(self.pinned_metadata) / 8).min(4 * 1024 * 1024);
         let protect_verified = self.verified.len().saturating_mul(DECODED_ENTRY_METADATA)
             <= metadata_allowance
             && (decoded.is_some() || !self.windows.is_empty());
@@ -750,7 +756,7 @@ impl DecodedCache {
             self.bytes -= DECODED_ENTRY_METADATA;
             return true;
         }
-        let Some((key, (_, size), fronted)) = self.objects.remove_oldest() else {
+        let Some((key, (mut object, size), fronted)) = self.objects.remove_oldest() else {
             // The idle decoder is the last victim. A new codec context for
             // each read costs more than the entries that its bytes displace.
             return match self.decoder.take() {
@@ -765,6 +771,14 @@ impl DecodedCache {
             self.unfront(&key, false);
         }
         self.bytes -= size;
+        if let Some((slot, bytes, children)) = recycle
+            && slot.is_none()
+            && object.bytes.capacity() == bytes
+            && object.children.capacity() == children
+            && Arc::get_mut(&mut object).is_some()
+        {
+            *slot = Some(object);
+        }
         true
     }
     fn evict_window(&mut self) -> bool {
@@ -840,6 +854,17 @@ impl DecodedCache {
     }
     fn verified(&mut self, file_identity: u64, reference: ObjectRef) -> bool {
         self.verified_type(file_identity, reference).is_some()
+    }
+    fn admits_child(&mut self, identity: u64, reference: ObjectRef) -> bool {
+        let key = (
+            identity,
+            reference.hash,
+            reference.address.offset,
+            reference.address.length,
+        );
+        // A decoded entry already authenticates the complete physical
+        // occurrence, even if its separate type entry has been evicted.
+        self.objects.slots.contains_key(&key) || self.verified(identity, reference)
     }
     fn verified_type(&mut self, file_identity: u64, reference: ObjectRef) -> Option<(u16, u16)> {
         let age = self.tick();
@@ -957,11 +982,94 @@ impl DecodedCache {
             .insert(key, (Arc::clone(object), size), age, self.serial);
         self.bytes += size;
     }
+    fn admit_append(&mut self, identity: u64, reference: ObjectRef, append: AppendObject<'_>) {
+        let available = self.budget.saturating_sub(self.pinned_metadata);
+        let (bytes, children) = (append.bytes.len(), append.children.len());
+        // Reserve space for the exact authentication entry that immediately
+        // follows this admission. Its eviction can also supply the victim.
+        let target =
+            2 * DECODED_ENTRY_METADATA + bytes + children * std::mem::size_of::<ObjectRef>();
+        if target > available {
+            return;
+        }
+        let mut recycled = None;
+        while self.bytes + target > available {
+            let victim = if recycled.is_none() {
+                Some((&mut recycled, bytes, children))
+            } else {
+                None
+            };
+            if !self.evict_oldest_for_append(victim) {
+                break;
+            }
+        }
+        let object = match recycled {
+            Some(mut recycled) => {
+                // Removed from both lookup tables. Any outstanding reader pin
+                // made this victim ineligible for reuse.
+                let object = Arc::get_mut(&mut recycled).unwrap();
+                object.kind = append.kind;
+                object.version = append.version;
+                object.bytes.clear();
+                object.bytes.extend_from_slice(&append.bytes);
+                object.children.clear();
+                object.children.extend_from_slice(&append.children);
+                recycled
+            }
+            None => Arc::new(CanonicalObject {
+                kind: append.kind,
+                version: append.version,
+                bytes: append.bytes.into_owned(),
+                children: append.children.into_owned(),
+            }),
+        };
+        self.insert_shared(identity, reference, &object);
+    }
 }
 
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn append_reuses_an_unpinned_victim_and_preserves_a_pinned_one() {
+        let mut cache = DecodedCache {
+            budget: 2 * DECODED_ENTRY_METADATA + 32,
+            ..Default::default()
+        };
+        let put = |cache: &mut DecodedCache, byte| {
+            let bytes = [byte; 32];
+            let reference = ObjectRef {
+                hash: ObjectHash::digest(&bytes),
+                address: ChunkAddress {
+                    offset: 128 + u64::from(byte) * 128,
+                    length: 128,
+                },
+            };
+            cache.admit_append(
+                1,
+                reference,
+                AppendObject {
+                    kind: 7,
+                    version: 1,
+                    bytes: Cow::Borrowed(&bytes),
+                    children: Cow::Borrowed(&[]),
+                },
+            );
+            cache.verify(1, reference, (7, 1));
+            reference
+        };
+        let first = put(&mut cache, 1);
+        let first_ptr = Arc::as_ptr(&cache.get(1, first).unwrap());
+        let second = put(&mut cache, 2);
+        let pinned = cache.get(1, second).unwrap();
+        assert_eq!(Arc::as_ptr(&pinned), first_ptr);
+        assert!(cache.get(1, first).is_none());
+        let third = put(&mut cache, 3);
+        assert!(!Arc::ptr_eq(&pinned, &cache.get(1, third).unwrap()));
+        assert_eq!(pinned.bytes, [2; 32]);
+        assert_eq!(cache.bytes, cache.budget);
+    }
 
     #[test]
     fn payload_churn_preserves_bounded_exact_occurrence_authentication() {

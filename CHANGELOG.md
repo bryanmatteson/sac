@@ -6,6 +6,11 @@ Replace the earlier prerelease section format with the current SAC1 immutable
 object graph. This is the first format being prepared for stabilization; the
 wire version remains 1 and the Rust package version remains 0.2.0.
 
+- Pack native append writes across frame boundaries in the existing 64 KiB
+  buffer, writing large prefixes directly and preserving exact frame bytes.
+- Check destination identity at staging and publication boundaries rather than
+  per object; keep append-ID tables resident within a configurable memory
+  budget and preserve exact deduplication when pressure spills them.
 - Share canonical object identity and public resource/profile schemas between
   sealed archives and live stores, using distinct locator/publication policies.
 - Use exactly four ASCII magic bytes `SAC1`, followed by four reserved zero bytes
@@ -27,6 +32,13 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   views and opened-file/caller-buffer reads, and calculate encoded sizes directly.
 - Account for extent-frontier sizes incrementally, retaining bounded child
   indexes and avoiding candidate CBOR trees on every appended range.
+- Finish in-memory bulk sorts and single-leaf directories without temporary
+  files. Size directory branches incrementally and decode only the path during
+  external merges.
+- Read in-memory positional frames directly from their backing slice, and avoid
+  copying native and memory-store writes that already have a stored occurrence.
+- Reuse inline probes, skip whole-file hashing when the metadata has no
+  `byte_digest`, and skip parallel frame encoding for known native duplicates.
 - Export childless objects without a second traversal read and carry native
   read authentication through the CLI's scratch-budget wrapper.
 - Verify the portable graph during named sealed compaction, reuse authenticated
@@ -37,6 +49,32 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   leaves during the verified copy.
 - Hash newly inserted objects once, reuse writer frame/compression workspaces,
   expose borrowed frame decoding and reuse native decompression contexts.
+- Assemble compressed objects once in the encoder's existing canonical buffer
+  for both BLAKE3 identity and compression. Hash complete contiguous input and
+  reuse it only under its authenticated canonical ID; keep raw/control hashing
+  on bounded stack scratch and encode current child locators independently.
+- Decode compressed frames after the identity domain in the reusable output
+  buffer, then authenticate its complete contiguous input without a prefix copy.
+- Admit newly appended opaque payloads above 2 KiB on their first read instead
+  of eagerly copying them into the decoded cache; retain exact append/type
+  authentication and immediate caching for structural pages and smaller data.
+- Amortize macOS append extent changes over bounded 1 MiB sparse ranges instead
+  of extending writes that may speculatively allocate excess blocks. Clamp
+  headroom to file limits, disable it for unreserved staging bytes, and remove
+  it before publication returns or a new file limit takes effect.
+- Compress complete objects through the direct Zstandard context API, avoiding
+  streaming setup while retaining codec allocations across level changes.
+  Reuse parsed headers to check single-block compressed frame extents; preserve
+  general multi-block parsing and full decompression and identity checks.
+- Admit large opaque payloads and child vectors to the decoded cache on read,
+  retaining append authentication without eagerly copying data over hot pages.
+- Batch canonical headers and child IDs into a fixed stack buffer for BLAKE3
+  SIMD, then stream large bodies without allocating or changing cache residency.
+  Fuse short hash domains with the first input batch using the same bounded
+  stack strategy; decoded buffers and stored bytes retain their existing layout.
+- Store append-index hashes once, with compact address values and 60-byte disk
+  slots. Keep full rewrite provenance in bounded, buffered side records sharing
+  the index's scratch budget; general temporary-table slots omit unused padding.
 - Remove ordered-index updates from warm cache hits while retaining exact,
   bounded eviction and physical identity checks. Charge idle decoder state to
   the decoded-cache budget.

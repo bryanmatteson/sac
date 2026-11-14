@@ -327,7 +327,9 @@ pub struct FrameEncoder {
     #[cfg(feature = "compression")]
     canonical: Vec<u8>,
     #[cfg(feature = "compression")]
-    compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
+    canonical_hash: Option<ObjectHash>,
+    #[cfg(feature = "compression")]
+    compressor: Option<zstd::zstd_safe::CCtx<'static>>,
 }
 // Cloning a store clones content, never codec state or scratch reservations.
 impl Clone for FrameEncoder {
@@ -337,7 +339,45 @@ impl Clone for FrameEncoder {
 }
 impl FrameEncoder {
     pub fn encode(&mut self, object: &CanonicalObject, level: i32) -> Result<&[u8]> {
-        self.encode_hashed(object, level, object.hash())
+        let hash = self.prepare_hash(
+            object.kind,
+            object.version,
+            &object.bytes,
+            &object.children,
+            level,
+        );
+        self.encode_hashed(object, level, hash)
+    }
+    /// Assemble canonical bytes once for both identity and compression. Raw
+    /// frames retain bounded stack hashing without allocating codec scratch.
+    pub(crate) fn prepare_hash(
+        &mut self,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+        level: i32,
+    ) -> ObjectHash {
+        #[cfg(feature = "compression")]
+        {
+            self.canonical_hash = None;
+            if !matches!(kind, 1 | 2) && level != 0 {
+                self.prepare_canonical(kind, version, bytes, children);
+                let hash = ObjectHash::digest(&self.canonical);
+                self.canonical_hash = Some(hash);
+                return hash;
+            }
+        }
+        let _ = level;
+        CanonicalObject::hash_parts(kind, version, bytes, children)
+    }
+    #[cfg(feature = "compression")]
+    fn prepare_canonical(&mut self, kind: u16, version: u16, bytes: &[u8], children: &[ObjectRef]) {
+        self.canonical.clear();
+        self.canonical
+            .reserve(super::OBJECT_HASH_DOMAIN.len() + 8 + 32 * children.len() + bytes.len());
+        self.canonical.extend_from_slice(super::OBJECT_HASH_DOMAIN);
+        CanonicalObject::write_parts(kind, version, bytes, children, &mut self.canonical);
     }
     pub fn buffer_capacity(&self) -> usize {
         let bytes = self.frame.capacity();
@@ -378,29 +418,32 @@ impl FrameEncoder {
         let codec = 0u8;
         #[cfg(feature = "compression")]
         if !matches!(kind, 1 | 2) && level != 0 {
-            self.canonical.clear();
-            CanonicalObject::write_parts(kind, version, bytes, children, &mut self.canonical);
-            if self
-                .compressor
-                .as_ref()
-                .is_none_or(|(old, _)| *old != level)
-            {
-                self.compressor = Some((level, zstd::bulk::Compressor::new(level)?));
+            // A known hash authenticates canonical bytes, independently of
+            // child locators. Consume only a matching prepared representation;
+            // authenticated copies and other callers can still encode normally.
+            if self.canonical_hash.take() != Some(hash) {
+                self.prepare_canonical(kind, version, bytes, children);
             }
-            let bound = zstd::zstd_safe::compress_bound(self.canonical.len());
-            self.frame.resize(FRAME + bound, 0);
+            let canonical = &self.canonical[super::OBJECT_HASH_DOMAIN.len()..];
+            let bound = zstd::zstd_safe::compress_bound(canonical.len());
+            // Zstandard initializes the part of the spare capacity it writes.
+            // The cursor starts after the already initialized frame header.
+            self.frame.reserve(bound);
+            let mut output = std::io::Cursor::new(&mut self.frame);
+            output.set_position(FRAME as u64);
+            // This complete object needs no streaming session or input buffer.
+            // The simple API resets parameters from the level on every call,
+            // while retaining the context's working allocations.
             let written = self
                 .compressor
-                .as_mut()
-                .unwrap()
-                .1
-                .compress_to_buffer(&self.canonical, &mut self.frame[FRAME..])?;
-            if written < self.canonical.len() {
-                self.frame.truncate(FRAME + written);
+                .get_or_insert_with(zstd::zstd_safe::CCtx::create)
+                .compress(&mut output, canonical, level)
+                .map_err(|code| std::io::Error::other(zstd::zstd_safe::get_error_name(code)))?;
+            if written < canonical.len() {
                 codec = 1;
             } else {
                 self.frame.truncate(FRAME);
-                self.frame.extend_from_slice(&self.canonical);
+                self.frame.extend_from_slice(canonical);
             }
         } else {
             CanonicalObject::write_parts(kind, version, bytes, children, &mut self.frame);
@@ -418,25 +461,27 @@ impl FrameEncoder {
             codec,
         )
     }
-    /// A frame for `object` from the Zstandard bytes of another frame. A
+    /// A frame from the Zstandard bytes of another frame. A
     /// decoder authenticated those bytes as the canonical bytes of this
     /// object; only the child locators differ.
     #[cfg(feature = "compression")]
     pub(crate) fn encode_stored(
         &mut self,
-        object: &CanonicalObject,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
         hash: ObjectHash,
         compressed: &[u8],
     ) -> Result<&[u8]> {
-        check_input(&object.bytes, &object.children)?;
-        validate_core_object(object)?;
+        super::schema::validate_core_shape(kind, version, bytes, children.len())?;
         self.frame.clear();
         self.frame.resize(FRAME, 0);
         self.frame.extend_from_slice(compressed);
         self.finish(
-            object.kind,
-            object.canonical_len(),
-            &object.children,
+            kind,
+            8 + children.len() * 32 + bytes.len(),
+            children,
             hash,
             1,
         )
@@ -529,6 +574,37 @@ fn zstd_bounds(payload: &[u8], decoded: usize) -> Result<()> {
     if size != decoded as u64 {
         return Err(corrupt("zstd content size mismatch"));
     }
+    #[cfg(feature = "compression")]
+    {
+        // Most object frames have one block. We already parsed its frame
+        // header, so validate the stored extent here instead of asking Zstd
+        // to parse that header again before the actual decompression.
+        let block_at = at + count;
+        let header = payload
+            .get(block_at..block_at + 3)
+            .ok_or_else(|| corrupt("zstd block header"))?;
+        let block = u32::from_le_bytes([header[0], header[1], header[2], 0]);
+        if block & 1 != 0 {
+            if block >> 3 > 128 * 1024 {
+                return Err(corrupt("zstd block size"));
+            }
+            let stored = match (block >> 1) & 3 {
+                0 | 2 => (block >> 3) as usize,
+                1 => 1, // RLE stores one byte, regardless of decoded size.
+                _ => return Err(corrupt("zstd block type")),
+            };
+            let checksum = if descriptor & 4 != 0 { 4 } else { 0 };
+            if block_at + 3 + stored + checksum != payload.len() {
+                return Err(corrupt("zstd frame extent"));
+            }
+        } else {
+            let size = zstd::zstd_safe::find_frame_compressed_size(payload)
+                .map_err(|_| corrupt("zstd frame"))?;
+            if size != payload.len() {
+                return Err(corrupt("zstd trailing bytes"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -584,14 +660,8 @@ fn decode_frame_inner(
     } else {
         zstd_bounds(payload, decoded)?;
         #[cfg(feature = "compression")]
-        let out = {
-            let frame_size = zstd::zstd_safe::find_frame_compressed_size(payload)
-                .map_err(|_| corrupt("zstd frame"))?;
-            if frame_size != payload.len() {
-                return Err(corrupt("zstd trailing bytes"));
-            }
-            zstd::bulk::decompress(payload, decoded).map_err(|_| corrupt("zstd payload"))?
-        };
+        let out =
+            { zstd::bulk::decompress(payload, decoded).map_err(|_| corrupt("zstd payload"))? };
         #[cfg(not(feature = "compression"))]
         let out = {
             let mut decoder = ruzstd::decoding::StreamingDecoder::new(payload)
@@ -716,6 +786,13 @@ pub struct FrameDecoder {
     decompressor: Option<zstd::zstd_safe::DCtx<'static>>,
 }
 impl FrameDecoder {
+    #[cfg(feature = "native")]
+    pub(crate) fn trim_buffer(&mut self, max_capacity: usize) {
+        if self.decoded.capacity() > max_capacity {
+            self.decoded = Vec::new();
+        }
+    }
+
     pub fn retained_bytes(&self) -> usize {
         let bytes = self.decoded.capacity();
         #[cfg(feature = "compression")]
@@ -741,7 +818,12 @@ impl FrameDecoder {
         } else {
             std::mem::take(&mut self.decoded)
         };
-        let start = body_offset + if stored { FRAME } else { 0 };
+        let start = body_offset
+            + if stored {
+                FRAME
+            } else {
+                super::OBJECT_HASH_DOMAIN.len()
+            };
         bytes.copy_within(start..start + length, 0);
         bytes.truncate(length);
         Ok(CanonicalObject {
@@ -781,22 +863,24 @@ impl FrameDecoder {
             payload
         } else {
             zstd_bounds(payload, decoded)?;
+            self.decoded.clear();
+            self.decoded
+                .reserve(super::OBJECT_HASH_DOMAIN.len() + decoded);
+            self.decoded.extend_from_slice(super::OBJECT_HASH_DOMAIN);
             #[cfg(feature = "compression")]
             {
-                let size = zstd::zstd_safe::find_frame_compressed_size(payload)
-                    .map_err(|_| corrupt("zstd frame"))?;
-                if size != payload.len() {
-                    return Err(corrupt("zstd trailing bytes"));
-                }
                 if self.decompressor.is_none() {
                     self.decompressor = Some(zstd::zstd_safe::DCtx::create());
                 }
-                self.decoded.resize(decoded, 0);
+                // Decode after the identity domain so authentication can hash
+                // one contiguous input without a second prefix copy.
+                let mut output = std::io::Cursor::new(&mut self.decoded);
+                output.set_position(super::OBJECT_HASH_DOMAIN.len() as u64);
                 let n = self
                     .decompressor
                     .as_mut()
                     .unwrap()
-                    .decompress(&mut self.decoded[..], payload)
+                    .decompress(&mut output, payload)
                     .map_err(|_| corrupt("zstd payload"))?;
                 if n != decoded {
                     return Err(corrupt("object decoded length"));
@@ -806,19 +890,24 @@ impl FrameDecoder {
             {
                 let mut decoder = ruzstd::decoding::StreamingDecoder::new(payload)
                     .map_err(|_| corrupt("zstd header"))?;
-                self.decoded.clear();
-                self.decoded.reserve(decoded);
                 (&mut decoder)
                     .take(decoded as u64 + 1)
                     .read_to_end(&mut self.decoded)
                     .map_err(|_| corrupt("zstd payload"))?;
-                if <[u8]>::len(decoder.get_ref()) != 0 || self.decoded.len() != decoded {
+                if <[u8]>::len(decoder.get_ref()) != 0
+                    || self.decoded.len() != super::OBJECT_HASH_DOMAIN.len() + decoded
+                {
                     return Err(corrupt("zstd trailing bytes or decoded length"));
                 }
             }
-            &self.decoded
+            &self.decoded[super::OBJECT_HASH_DOMAIN.len()..]
         };
-        if domain_hash(b"SAC1/object\0", canonical) != reference.hash {
+        let hash = if frame[4] == 0 {
+            domain_hash(super::OBJECT_HASH_DOMAIN, canonical)
+        } else {
+            ObjectHash::digest(&self.decoded)
+        };
+        if hash != reference.hash {
             return Err(corrupt("object identity or decoded length"));
         }
         if le32(canonical, 4) as usize != count || 8 + 32 * count > canonical.len() {
@@ -859,5 +948,158 @@ impl FrameDecoder {
             )?;
         }
         Ok(view)
+    }
+}
+
+#[cfg(all(test, feature = "compression"))]
+mod codec_tests {
+    use super::*;
+
+    #[test]
+    fn prepared_canonical_hash_handles_relocation_and_unprepared_interleaving() {
+        let mut encoder = FrameEncoder::default();
+        for length in [0, 63, 1005, 2029, 4076, 4077, 4096, 65536, 131072] {
+            for count in [0, 1, 127, 128, 255] {
+                let mut object = CanonicalObject {
+                    kind: 42000,
+                    version: 9,
+                    bytes: (0..length).map(|i| (i % 251) as u8).collect(),
+                    children: (0..count)
+                        .map(|i| ObjectRef {
+                            hash: ObjectHash::digest(&(i as u64).to_le_bytes()),
+                            address: ChunkAddress {
+                                offset: 128 + i as u64 * 64,
+                                length: 64,
+                            },
+                        })
+                        .collect(),
+                };
+                for level in [1, 0, 3, -3, 1] {
+                    let hash = encoder.prepare_hash(
+                        object.kind,
+                        object.version,
+                        &object.bytes,
+                        &object.children,
+                        level,
+                    );
+                    assert_eq!(hash, object.hash());
+                    assert_eq!(encoder.canonical_hash, (level != 0).then_some(hash));
+                    // Physical hints are outside canonical identity. Reusing
+                    // canonical bytes must still encode the current locators.
+                    for child in &mut object.children {
+                        child.address.offset += 64;
+                    }
+                    let frame = encoder.encode_hashed(&object, level, hash).unwrap();
+                    let reference = ObjectRef {
+                        hash,
+                        address: ChunkAddress {
+                            offset: 65536,
+                            length: frame.len() as u32,
+                        },
+                    };
+                    assert_eq!(
+                        decode_frame(reference, frame, 128, 65536 + frame.len() as u64).unwrap(),
+                        object
+                    );
+                }
+                // A duplicate put may leave preparation unused. An unrelated
+                // authenticated write must rebuild rather than use those bytes.
+                encoder.prepare_hash(
+                    object.kind,
+                    object.version,
+                    &object.bytes,
+                    &object.children,
+                    1,
+                );
+                object.version += 1;
+                object.bytes.push(19);
+                let hash = object.hash();
+                let frame = encoder.encode_hashed(&object, 1, hash).unwrap();
+                let reference = ObjectRef {
+                    hash,
+                    address: ChunkAddress {
+                        offset: 65536,
+                        length: frame.len() as u32,
+                    },
+                };
+                assert_eq!(
+                    decode_frame(reference, frame, 128, 65536 + frame.len() as u64).unwrap(),
+                    object
+                );
+                assert_eq!(encoder.canonical_hash, None);
+            }
+        }
+    }
+
+    #[test]
+    fn zstd_extent_checks_cover_block_types_checksums_and_trailing_frames() {
+        let mut frames = Vec::new();
+        for block_type in [0, 1] {
+            let mut frame = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 32];
+            let block = 1u32 | (block_type << 1) | (32 << 3);
+            frame.extend_from_slice(&block.to_le_bytes()[..3]);
+            frame.resize(frame.len() + if block_type == 1 { 1 } else { 32 }, 71);
+            frames.push((frame, 32));
+        }
+        let mut multiple = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 32];
+        for last in [0u32, 1] {
+            multiple.extend_from_slice(&(last | (16 << 3)).to_le_bytes()[..3]);
+            multiple.extend_from_slice(&[71; 16]);
+        }
+        frames.push((multiple, 32));
+        for length in [8, 255, 256, 65536, 131072, 131073, 262144] {
+            for checksum in [false, true] {
+                let bytes: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+                let mut compressor = zstd::bulk::Compressor::new(1).unwrap();
+                compressor
+                    .set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(checksum))
+                    .unwrap();
+                frames.push((compressor.compress(&bytes).unwrap(), length));
+            }
+        }
+        for (frame, decoded) in frames {
+            zstd_bounds(&frame, decoded).unwrap();
+            assert_eq!(
+                zstd::zstd_safe::find_frame_compressed_size(&frame).unwrap(),
+                frame.len()
+            );
+            assert_eq!(
+                zstd::bulk::decompress(&frame, decoded).unwrap().len(),
+                decoded
+            );
+            assert!(zstd_bounds(&frame, decoded + 1).is_err());
+            for missing in 1..=frame.len().min(12) {
+                assert!(zstd_bounds(&frame[..frame.len() - missing], decoded).is_err());
+            }
+            for trailing in [
+                vec![0],
+                zstd::bulk::compress(&[], 1).unwrap(),
+                frame.clone(),
+            ] {
+                let mut bad = frame.clone();
+                bad.extend_from_slice(&trailing);
+                assert!(zstd_bounds(&bad, decoded).is_err());
+            }
+            // Structural mutations accepted by our fast extent check must
+            // agree with Zstd's general frame-size parser. Payload integrity
+            // remains the decompressor's and canonical hash's responsibility.
+            for index in 0..frame.len().min(64) {
+                for bit in 0..8 {
+                    let mut bad = frame.clone();
+                    bad[index] ^= 1 << bit;
+                    if zstd_bounds(&bad, decoded).is_ok() {
+                        assert_eq!(
+                            zstd::zstd_safe::find_frame_compressed_size(&bad).unwrap(),
+                            bad.len()
+                        );
+                    }
+                }
+            }
+        }
+        let mut reserved = vec![0x28, 0xb5, 0x2f, 0xfd, 0x20, 32, 7, 0, 0];
+        assert!(zstd_bounds(&reserved, 32).is_err());
+        reserved[6..9].copy_from_slice(&(3u32 | (131073 << 3)).to_le_bytes()[..3]);
+        reserved.push(71);
+        assert!(zstd_bounds(&reserved, 32).is_err());
     }
 }

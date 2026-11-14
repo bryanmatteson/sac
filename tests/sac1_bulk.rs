@@ -287,17 +287,56 @@ fn bulk_namespace_conflicts_fail_before_publication() {
     );
 }
 #[test]
-fn bulk_temporary_and_frontier_limits_are_real() {
+fn resident_pack_uses_no_scratch_and_matches_a_spilled_pack() {
+    fn pack(memory: usize, temporary: u64) -> Result<(ObjectRef, Vec<u8>, u64)> {
+        let mut store = MemoryStore::sealed();
+        let limits = Limits {
+            max_memory_bytes: memory,
+            max_temp_bytes: temporary,
+            ..Default::default()
+        };
+        let mut builder = ArchiveBuilder::bulk(&mut store, limits)?;
+        for i in (0..192).rev() {
+            let path = path_from_str(&format!("nested/d{:02}/f{i:03}", i % 8))?;
+            builder.add_file(&path, &vec![i as u8; 512])?;
+        }
+        let (snapshot, stats) = builder.finish_with_statistics()?;
+        store.publish(snapshot)?;
+        Ok((
+            snapshot,
+            store.as_bytes().to_vec(),
+            stats.temporary_peak_bytes,
+        ))
+    }
+    let (resident, resident_bytes, resident_scratch) = pack(8 << 20, 0).unwrap();
+    let (spilled, spilled_bytes, spilled_scratch) = pack(1 << 20, 16 << 20).unwrap();
+    assert_eq!(resident, spilled);
+    assert_eq!(resident_bytes, spilled_bytes);
+    assert_eq!(resident_scratch, 0);
+    assert!(spilled_scratch > 0);
+    assert!(matches!(
+        pack(1 << 20, 0),
+        Err(sac::v1::Error::Limit("bulk temporary bytes"))
+    ));
+}
+
+#[test]
+fn failed_spill_cannot_publish_an_incomplete_tree() {
     let mut store = MemoryStore::sealed();
-    let limits = Limits {
-        max_temp_bytes: 0,
-        ..Default::default()
-    };
-    let mut builder = ArchiveBuilder::bulk(&mut store, limits).unwrap();
-    builder
-        .add_file(&path_from_str("a").unwrap(), b"content")
-        .unwrap();
-    assert!(matches!(builder.finish(), Err(sac::v1::Error::Limit(_))));
+    let mut builder = ArchiveBuilder::bulk(
+        &mut store,
+        Limits {
+            max_memory_bytes: 1 << 20,
+            max_temp_bytes: 0,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let error = (0..192)
+        .try_for_each(|i| builder.add_file(&path_from_str(&format!("f{i:03}"))?, &[1; 512]))
+        .unwrap_err();
+    assert!(matches!(error, sac::Error::Limit("bulk temporary bytes")));
+    assert!(matches!(builder.finish(), Err(sac::Error::Poisoned)));
     assert!(store.root().is_none());
 }
 #[test]
@@ -480,8 +519,26 @@ fn parallel_encoding_writes_the_same_file_bytes_as_one_thread() {
             builder
                 .add_file(&path_from_str("large").unwrap(), &large)
                 .unwrap();
+            let digest = |bytes: &[u8]| {
+                sac::cbor::text_map(vec![(
+                    "byte_digest",
+                    Value::bytes(blake3::hash(bytes).as_bytes().to_vec()),
+                )])
+            };
+            assert!(matches!(
+                builder.add_reader_with_metadata(
+                    &path_from_str("small").unwrap(),
+                    &small[..],
+                    digest(b"different data"),
+                ),
+                Err(sac::Error::Corrupt(message)) if message == "whole-resource digest mismatch"
+            ));
             builder
-                .add_reader(&path_from_str("small").unwrap(), &small[..])
+                .add_reader_with_metadata(
+                    &path_from_str("small").unwrap(),
+                    &small[..],
+                    digest(&small),
+                )
                 .unwrap();
             builder.finish().unwrap()
         };

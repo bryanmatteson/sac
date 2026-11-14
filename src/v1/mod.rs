@@ -53,10 +53,29 @@ pub(crate) fn corrupt(message: &str) -> Error {
     Error::Corrupt(message.into())
 }
 pub fn domain_hash(domain: &[u8], bytes: &[u8]) -> ObjectHash {
+    if domain.len() < OBJECT_HASH_BATCH_BYTES {
+        return hash_domain_parts(domain, bytes);
+    }
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(bytes);
     ObjectHash(*hasher.finalize().as_bytes())
+}
+
+#[inline(never)]
+fn hash_domain_parts(domain: &[u8], bytes: &[u8]) -> ObjectHash {
+    let mut prefix = [0u8; OBJECT_HASH_BATCH_BYTES];
+    prefix[..domain.len()].copy_from_slice(domain);
+    let copied = bytes.len().min(prefix.len() - domain.len());
+    prefix[domain.len()..domain.len() + copied].copy_from_slice(&bytes[..copied]);
+    let prefix = &prefix[..domain.len() + copied];
+    if copied == bytes.len() {
+        return ObjectHash::digest(prefix);
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(prefix);
+    hash.update(&bytes[copied..]);
+    ObjectHash(*hash.finalize().as_bytes())
 }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -136,18 +155,51 @@ impl CanonicalObject {
         bytes: &[u8],
         children: &[ObjectRef],
     ) -> ObjectHash {
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"SAC1/object\0");
-        hash.update(&kind.to_le_bytes());
-        hash.update(&version.to_le_bytes());
-        hash.update(&(children.len() as u32).to_le_bytes());
-        for child in children {
-            hash.update(&child.hash.0);
-        }
-        hash.update(bytes);
-        ObjectHash(*hash.finalize().as_bytes())
+        hash_object_parts(kind, version, bytes, children)
     }
 }
+
+const OBJECT_HASH_DOMAIN: &[u8] = b"SAC1/object\0";
+const OBJECT_HASH_HEADER: usize = OBJECT_HASH_DOMAIN.len() + 8;
+const OBJECT_HASH_BATCH_BYTES: usize = 4096;
+
+// Batch short child IDs into full BLAKE3 chunks without retaining heap scratch.
+// Large bodies stream directly after filling the last partially occupied batch.
+#[inline(never)]
+fn hash_object_parts(kind: u16, version: u16, bytes: &[u8], children: &[ObjectRef]) -> ObjectHash {
+    let mut canonical = [0u8; OBJECT_HASH_BATCH_BYTES];
+    canonical[..OBJECT_HASH_DOMAIN.len()].copy_from_slice(OBJECT_HASH_DOMAIN);
+    let header = &mut canonical[OBJECT_HASH_DOMAIN.len()..OBJECT_HASH_HEADER];
+    header[..2].copy_from_slice(&kind.to_le_bytes());
+    header[2..4].copy_from_slice(&version.to_le_bytes());
+    header[4..8].copy_from_slice(&(children.len() as u32).to_le_bytes());
+    let mut end = OBJECT_HASH_HEADER;
+    let mut hash = None;
+    for child in children {
+        let available = canonical.len() - end;
+        if available < 32 {
+            canonical[end..].copy_from_slice(&child.hash.0[..available]);
+            hash.get_or_insert_with(blake3::Hasher::new)
+                .update(&canonical);
+            end = 32 - available;
+            canonical[..end].copy_from_slice(&child.hash.0[available..]);
+        } else {
+            canonical[end..end + 32].copy_from_slice(&child.hash.0);
+            end += 32;
+        }
+    }
+    let copied = bytes.len().min(canonical.len() - end);
+    canonical[end..end + copied].copy_from_slice(&bytes[..copied]);
+    let prefix = &canonical[..end + copied];
+    if hash.is_none() && copied == bytes.len() {
+        return ObjectHash::digest(prefix);
+    }
+    let mut hash = hash.unwrap_or_else(blake3::Hasher::new);
+    hash.update(prefix);
+    hash.update(&bytes[copied..]);
+    ObjectHash(*hash.finalize().as_bytes())
+}
+
 pub(crate) fn check_input(bytes: &[u8], children: &[ObjectRef]) -> Result<()> {
     if children.len() > MAX_CHILDREN
         || children
@@ -208,7 +260,7 @@ pub struct PreparedObject {
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     hash: ObjectHash,
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
-    frame: Vec<u8>,
+    frame: Option<Vec<u8>>,
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     level: i32,
 }
@@ -442,6 +494,11 @@ struct Counters {
 pub trait ReadAt {
     fn len(&self) -> Result<u64>;
     fn read_exact_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()>;
+    /// Optionally borrow the exact bytes that a positional read would return.
+    /// Returning `None` falls back to `read_exact_at`.
+    fn slice_at(&self, _offset: u64, _length: usize) -> Option<&[u8]> {
+        None
+    }
     fn is_empty(&self) -> Result<bool> {
         self.len().map(|n| n == 0)
     }
@@ -461,6 +518,10 @@ impl ReadAt for [u8] {
         );
         Ok(())
     }
+    fn slice_at(&self, offset: u64, length: usize) -> Option<&[u8]> {
+        let start = usize::try_from(offset).ok()?;
+        self.get(start..start.checked_add(length)?)
+    }
 }
 impl ReadAt for Vec<u8> {
     fn len(&self) -> Result<u64> {
@@ -469,6 +530,9 @@ impl ReadAt for Vec<u8> {
     fn read_exact_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
         self.as_slice().read_exact_at(offset, bytes)
     }
+    fn slice_at(&self, offset: u64, length: usize) -> Option<&[u8]> {
+        self.as_slice().slice_at(offset, length)
+    }
 }
 impl<T: ReadAt + ?Sized> ReadAt for &T {
     fn len(&self) -> Result<u64> {
@@ -476,6 +540,9 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
     }
     fn read_exact_at(&self, offset: u64, bytes: &mut [u8]) -> Result<()> {
         (**self).read_exact_at(offset, bytes)
+    }
+    fn slice_at(&self, offset: u64, length: usize) -> Option<&[u8]> {
+        (**self).slice_at(offset, length)
     }
 }
 impl ReadAt for std::fs::File {
@@ -632,6 +699,9 @@ impl Reader {
                     .ok_or_else(|| corrupt("control read outside bound"))?;
                 self.bytes.read_exact_at(relative, bytes)
             }
+            fn slice_at(&self, offset: u64, length: usize) -> Option<&[u8]> {
+                self.bytes.slice_at(offset.checked_sub(self.start)?, length)
+            }
         }
         reader.admit_control(&Control {
             start,
@@ -708,7 +778,11 @@ impl Reader {
         reference: ObjectRef,
     ) -> Result<CanonicalObject> {
         let request = self.request(reference)?;
-        let mut bytes = vec![0; request.length as usize];
+        let length = request.length as usize;
+        if let Some(bytes) = source.slice_at(request.offset, length) {
+            return self.decode(reference, bytes);
+        }
+        let mut bytes = vec![0; length];
         source.read_exact_at(request.offset, &mut bytes)?;
         let object = wire::decode_frame_owned(
             reference,
@@ -970,21 +1044,20 @@ impl ObjectStore for MemoryStore {
         bytes: &[u8],
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
+        schema::validate_core_shape(kind, version, bytes, children.len())?;
+        for child in children {
+            self.get(*child)?;
+        }
+        let hash = CanonicalObject::hash_parts(kind, version, bytes, children);
+        if let Some(r) = self.recent.get(&hash) {
+            return Ok(*r);
+        }
         let object = CanonicalObject {
             kind,
             version,
             bytes: bytes.to_vec(),
             children: children.to_vec(),
         };
-        check_input(bytes, children)?;
-        validate_core_object(&object)?;
-        for child in children {
-            self.get(*child)?;
-        }
-        let hash = object.hash();
-        if let Some(r) = self.recent.get(&hash) {
-            return Ok(*r);
-        }
         let r = self.append_hashed(&object, hash)?;
         if self.recent.len() >= 4096 {
             self.recent.clear();

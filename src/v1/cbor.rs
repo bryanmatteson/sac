@@ -83,7 +83,7 @@ pub fn encode_into(value: &Value, out: &mut Vec<u8>) {
     }
 }
 
-fn write_head(major: u8, value: u64, out: &mut Vec<u8>) {
+pub(crate) fn write_head(major: u8, value: u64, out: &mut Vec<u8>) {
     let major_bits = (major & 0x07) << 5;
     if value < 24 {
         out.push(major_bits | (value as u8));
@@ -301,26 +301,27 @@ impl<'a> Parser<'a> {
 
 /// Exact encoded size without allocating or serializing.
 pub fn encoded_len(value: &Value) -> usize {
-    fn head(n: u64) -> usize {
-        match n {
-            0..=23 => 1,
-            24..=255 => 2,
-            256..=65535 => 3,
-            65536..=4294967295 => 5,
-            _ => 9,
-        }
-    }
     match value {
-        Value::Uint(n) | Value::NInt(n) => head(*n),
-        Value::Bytes(b) => head(b.len() as u64) + b.len(),
-        Value::Text(s) => head(s.len() as u64) + s.len(),
-        Value::Array(a) => head(a.len() as u64) + a.iter().map(encoded_len).sum::<usize>(),
+        Value::Uint(n) | Value::NInt(n) => head_len(*n),
+        Value::Bytes(b) => head_len(b.len() as u64) + b.len(),
+        Value::Text(s) => head_len(s.len() as u64) + s.len(),
+        Value::Array(a) => head_len(a.len() as u64) + a.iter().map(encoded_len).sum::<usize>(),
         Value::Map(a) => {
-            head(a.len() as u64)
+            head_len(a.len() as u64)
                 + a.iter()
                     .map(|e| encoded_len(&e.key) + encoded_len(&e.value))
                     .sum::<usize>()
         }
         _ => 1,
+    }
+}
+
+pub(crate) fn head_len(n: u64) -> usize {
+    match n {
+        0..=23 => 1,
+        24..=255 => 2,
+        256..=65535 => 3,
+        65536..=4294967295 => 5,
+        _ => 9,
     }
 }

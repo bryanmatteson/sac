@@ -60,6 +60,32 @@ fn save_has_two_barriers_and_durable_noop_has_none() {
     assert_eq!(store.publication_statistics(), before);
     store.validate().unwrap();
 }
+
+#[test]
+fn prepared_duplicates_reuse_the_destination_or_encode_on_an_index_miss() {
+    let (_source_dir, mut source) = store();
+    let (_destination_dir, mut destination) = store();
+    source.set_encode_threads(2);
+    let bytes = vec![b'a'; 128 << 10];
+    let other = vec![b'b'; 128 << 10];
+    let original = source.put(7, 1, &bytes, &[]).unwrap();
+    let prepared = source.prepare(7, 1, &[&bytes, &other]).unwrap().unwrap();
+    assert!(prepared[0].frame.is_none());
+    assert!(prepared[1].frame.is_some());
+    let mut prepared = prepared.into_iter();
+    let duplicate = prepared.next().unwrap();
+    assert_eq!(duplicate.body(), bytes);
+    assert_eq!(source.put_prepared(duplicate).unwrap(), original);
+
+    let duplicate = source
+        .prepare(7, 1, &[&bytes, &other])
+        .unwrap()
+        .unwrap()
+        .remove(0);
+    let transferred = destination.put_prepared(duplicate).unwrap();
+    assert_eq!(transferred.hash, original.hash);
+    assert_eq!(destination.get(transferred).unwrap().bytes, bytes);
+}
 #[test]
 fn verified_copy_preserves_identity_and_checks_relocated_physical_children() {
     let mut source = MemoryStore::sealed();
@@ -104,6 +130,155 @@ fn verified_copy_preserves_identity_and_checks_relocated_physical_children() {
         parent.hash
     );
 }
+#[test]
+fn packed_appends_preserve_bytes_across_frame_boundaries_and_failed_flushes() {
+    let file = Mutex::new(tempfile::tempfile().unwrap());
+    let pending = Mutex::new(AppendBuffer::default());
+    let mut expected = Vec::new();
+    for (ordinal, length) in [
+        1,
+        APPEND_BUFFER_BYTES - 3,
+        13,
+        APPEND_BUFFER_BYTES * 3 + 17,
+        11,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let bytes = vec![ordinal as u8; length];
+        append_frame(&file, &pending, expected.len() as u64, &bytes, 0).unwrap();
+        expected.extend_from_slice(&bytes);
+        let stored = file.lock().unwrap().metadata().unwrap().len() as usize;
+        assert_eq!(stored % APPEND_BUFFER_BYTES, 0);
+        let pending = pending.lock().unwrap();
+        assert!(pending.bytes.len() < APPEND_BUFFER_BYTES);
+        assert_eq!(pending.bytes, expected[stored..]);
+        let mut actual = vec![0; stored];
+        read_at(&file.lock().unwrap(), &mut actual, 0).unwrap();
+        assert_eq!(actual, expected[..stored]);
+    }
+    let before = file.lock().unwrap().metadata().unwrap().len();
+    assert!(append_frame(&file, &pending, expected.len() as u64 + 8, b"gap", 0).is_err());
+    assert_eq!(file.lock().unwrap().metadata().unwrap().len(), before);
+    flush_append(&file, &pending).unwrap();
+    assert!(pending.lock().unwrap().bytes.is_empty());
+    let mut actual = vec![0; expected.len()];
+    read_at(&file.lock().unwrap(), &mut actual, 0).unwrap();
+    assert_eq!(actual, expected);
+    #[cfg(target_os = "macos")]
+    {
+        assert!(matches!(
+            append_at(
+                &mut file.lock().unwrap(),
+                b"overflow",
+                u64::MAX,
+                &mut AppendExtent::default(),
+            ),
+            Err(Error::Limit("append extent"))
+        ));
+        assert_eq!(
+            file.lock().unwrap().metadata().unwrap().len(),
+            expected.len() as u64
+        );
+    }
+
+    let path = tempfile::NamedTempFile::new().unwrap();
+    let readonly = Mutex::new(File::open(path.path()).unwrap());
+    let pending = Mutex::new(AppendBuffer::default());
+    append_frame(&readonly, &pending, 0, b"prefix", 0).unwrap();
+    assert!(append_frame(&readonly, &pending, 6, &vec![1; APPEND_BUFFER_BYTES], 0).is_err());
+    assert!(pending.lock().unwrap().failed);
+    assert!(matches!(
+        append_frame(&readonly, &pending, 6, b"later", 0),
+        Err(Error::Poisoned)
+    ));
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn sparse_append_headroom_is_bounded_and_trimmed_without_changing_bytes() {
+    let mut file = tempfile::tempfile().unwrap();
+    let mut buffer = AppendBuffer::default();
+    let maximum = APPEND_BUFFER_BYTES as u64 * 2 + 7;
+    buffer.extent.maximum = maximum;
+    let bytes = vec![71; APPEND_BUFFER_BYTES];
+    append_at(&mut file, &bytes, 0, &mut buffer.extent).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), maximum);
+    assert_eq!(buffer.extent.end, maximum);
+    append_at(&mut file, b"tail", bytes.len() as u64, &mut buffer.extent).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), maximum);
+    // Slot overwrites do not shorten an extent that contains appended bytes.
+    write_at(&mut file, b"slot", 0).unwrap();
+    let end = bytes.len() as u64 + 4;
+    trim_append_extent(&mut file, &mut buffer, end).unwrap();
+    assert_eq!(file.metadata().unwrap().len(), end);
+    assert_eq!(buffer.extent.end, end);
+    let mut actual = vec![0; end as usize];
+    read_at(&file, &mut actual, 0).unwrap();
+    assert_eq!(&actual[..4], b"slot");
+    assert!(actual[4..bytes.len()].iter().all(|&byte| byte == 71));
+    assert_eq!(&actual[bytes.len()..], b"tail");
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn published_writer_caps_sparse_headroom_and_removes_it_at_publication() {
+    let (_dir, mut store) = store();
+    let root = snapshot(&mut store, b"initial");
+    store.publish(root).unwrap();
+    store.compression_level = 0;
+    let maximum = store.file_len() + APPEND_BUFFER_BYTES as u64 * 2 + 7;
+    store.set_file_byte_limit(maximum).unwrap();
+    store
+        .put(42000, 1, &vec![71; APPEND_BUFFER_BYTES], &[])
+        .unwrap();
+    assert_eq!(
+        store.file.lock().unwrap().metadata().unwrap().len(),
+        maximum
+    );
+    // An old publication remains readable while its writer has sparse tail.
+    store.pin().unwrap().validate().unwrap();
+    let publication = store.root();
+    store.publish(root).unwrap();
+    assert_eq!(store.root(), publication);
+    assert_eq!(
+        store.file.lock().unwrap().metadata().unwrap().len(),
+        store.file_len()
+    );
+    store.set_file_byte_limit(u64::MAX).unwrap();
+    let maximum = store.file_len() + APPEND_BUFFER_BYTES as u64 * 2 + 7;
+    store.set_file_byte_limit(maximum).unwrap();
+    store
+        .put(42000, 1, &vec![72; APPEND_BUFFER_BYTES], &[])
+        .unwrap();
+    assert_eq!(
+        store.file.lock().unwrap().metadata().unwrap().len(),
+        maximum
+    );
+    let logical = store.file_len();
+    assert!(logical < maximum);
+    store.set_file_byte_limit(logical).unwrap();
+    // Draining a pending short tail must also obey the lowered limit.
+    store.pin().unwrap().validate().unwrap();
+    assert_eq!(
+        store.file.lock().unwrap().metadata().unwrap().len(),
+        logical
+    );
+    assert!(matches!(
+        store.put(42000, 1, b"over limit", &[]),
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(store.file_len(), logical);
+    store.set_file_byte_limit(u64::MAX).unwrap();
+    let next = snapshot(&mut store, b"next");
+    store.publish(next).unwrap();
+    assert_eq!(
+        store.file.lock().unwrap().metadata().unwrap().len(),
+        store.file_len()
+    );
+    store.validate().unwrap();
+}
+
 #[test]
 fn small_frame_appends_coalesce_and_cache_misses_drain_before_reading() {
     let (dir, mut store) = store();
@@ -242,6 +417,44 @@ fn stale_descriptor_is_rejected_before_append() {
     std::fs::write(&path, b"replacement").unwrap();
     assert!(store.put(7, 1, b"must not append", &[]).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+}
+
+#[test]
+fn staging_checks_once_and_a_replaced_destination_cannot_receive_the_commit() {
+    let (dir, mut store) = store();
+    let first = snapshot(&mut store, b"old");
+    store.publish(first).unwrap();
+    let old = store.pin().unwrap();
+    let next = snapshot(&mut store, b"staged batch");
+    let path = dir.path().join("db.sac");
+    std::fs::rename(&path, dir.path().join("retired.sac")).unwrap();
+    std::fs::write(&path, b"replacement").unwrap();
+    // Staged immutable appends confer no durable authority and no longer
+    // repeat a path lookup for each object in the batch.
+    store.put(7, 1, b"another staged object", &[]).unwrap();
+    assert!(store.publish(next).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+    assert_eq!(old.reader().snapshot().unwrap().hash, first.hash);
+    old.validate().unwrap();
+}
+
+#[test]
+fn staging_cannot_publish_after_its_destination_is_removed_or_appears() {
+    let (dir, mut store) = store();
+    let first = snapshot(&mut store, b"old");
+    store.publish(first).unwrap();
+    let next = snapshot(&mut store, b"uncommitted");
+    std::fs::remove_file(dir.path().join("db.sac")).unwrap();
+    store.put(7, 1, b"private bytes", &[]).unwrap();
+    assert!(store.publish(next).is_err());
+
+    let (dir, mut store) = self::store();
+    let first = snapshot(&mut store, b"private creation");
+    let path = dir.path().join("db.sac");
+    std::fs::write(&path, b"another creator").unwrap();
+    store.put(7, 1, b"more private bytes", &[]).unwrap();
+    assert!(store.publish(first).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"another creator");
 }
 #[cfg(unix)]
 #[test]
@@ -589,6 +802,125 @@ fn disposable_cache_loss_preserves_pins_and_does_not_scan_or_publish() {
 }
 
 #[test]
+fn append_ids_stay_resident_and_pressure_spills_without_changing_deduplication() {
+    let (_directory, mut store) = store();
+    let mut objects = Vec::new();
+    for ordinal in 0..5000_u64 {
+        objects.push(store.put(7, 1, &ordinal.to_le_bytes(), &[]).unwrap());
+    }
+    assert!(store.append_index_memory_bytes() <= DEFAULT_APPEND_INDEX_MEMORY_BYTES);
+    assert_eq!(store.temporary_statistics().write_bytes, 0);
+    assert_eq!(store.temporary_statistics().read_bytes, 0);
+    store.set_append_index_memory_budget(0).unwrap();
+    assert_eq!(store.append_index_memory_bytes(), 0);
+    assert!(store.temporary_statistics().write_bytes > 0);
+    let before = store.file_len();
+    for (ordinal, expected) in objects.iter().enumerate() {
+        assert_eq!(
+            store
+                .put(7, 1, &(ordinal as u64).to_le_bytes(), &[])
+                .unwrap(),
+            *expected
+        );
+    }
+    assert_eq!(store.file_len(), before);
+    store.discard_disposable_caches();
+    assert_eq!(store.recent.0.resident_limit(), 0);
+    store.put(7, 1, b"still under pressure", &[]).unwrap();
+    assert_eq!(store.append_index_memory_bytes(), 0);
+}
+
+#[test]
+fn closure_indexes_stay_resident_within_budget_and_survive_pressure() {
+    let mut source = MemoryStore::sealed();
+    let mut destination = MemoryStore::sealed();
+    let mut copy = ClosureCopy::new().unwrap();
+    let mut roots = Vec::new();
+    for ordinal in 0..5000_u64 {
+        let root = source.put(7, 1, &ordinal.to_le_bytes(), &[]).unwrap();
+        let copied = copy.copy_root(&source, &mut destination, root).unwrap();
+        assert_eq!(copied.hash, root.hash);
+        roots.push((root, copied));
+    }
+    assert!(copy.index_memory_bytes() <= 16 * 1024 * 1024);
+    assert_eq!(copy.temporary_statistics().write_bytes, 0);
+    copy.set_index_memory_budget(0).unwrap();
+    assert_eq!(copy.index_memory_bytes(), 0);
+    assert!(copy.temporary_statistics().write_bytes > 0);
+    let length = destination.as_bytes().len();
+    for (root, copied) in roots {
+        assert_eq!(
+            copy.copy_root(&source, &mut destination, root).unwrap(),
+            copied
+        );
+    }
+    assert_eq!(destination.as_bytes().len(), length);
+}
+
+#[test]
+fn failed_append_index_spill_preserves_the_resident_table() {
+    let (_directory, mut store) = store();
+    let reference = store.put(7, 1, b"retained", &[]).unwrap();
+    store.set_temporary_disk_budget(0).unwrap();
+    let limit = store.recent.0.resident_limit();
+    assert!(matches!(
+        store.set_append_index_memory_budget(0),
+        Err(Error::Limit(_))
+    ));
+    assert_eq!(store.recent.0.resident_limit(), limit);
+    assert_eq!(
+        store.appended_reference(reference.hash).unwrap(),
+        Some(reference)
+    );
+    assert_eq!(store.temporary_statistics().reserved_bytes, 0);
+    assert_eq!(store.put(7, 1, b"retained", &[]).unwrap(), reference);
+}
+
+#[test]
+fn data_appends_preserve_hot_metadata_and_admit_large_payloads_on_read() {
+    let (_directory, mut store) = store();
+    let root = snapshot(&mut store, b"hot structural metadata");
+    store.publish(root).unwrap();
+    store.set_decoded_cache_budget(64 * 1024);
+    store.discard_disposable_caches();
+    let hot = store.get_shared(root).unwrap();
+    // Medium opaque payloads must not evict structural pages just because
+    // they were written. Their exact append provenance is sufficient here.
+    let mut body = vec![71; 3 * 1024];
+    let children = [root; 96];
+    let mut references = Vec::new();
+    for ordinal in 0..32u64 {
+        body[..8].copy_from_slice(&ordinal.to_le_bytes());
+        references.push(store.put(4096, 1, &body, &[root]).unwrap());
+        // A tiny body with a large child vector needs the same admission rule.
+        references.push(store.put(4097, 1, &[ordinal as u8], &children).unwrap());
+    }
+    let before = store.physical_statistics();
+    assert!(Arc::ptr_eq(&hot, &store.get_shared(root).unwrap()));
+    for (index, &reference) in references.iter().enumerate() {
+        assert_eq!(
+            store.object_type(reference).unwrap(),
+            (4096 + index as u16 % 2, 1)
+        );
+    }
+    assert_eq!(store.physical_statistics(), before);
+    let small = store.put(4096, 1, b"small opaque data", &[]).unwrap();
+    assert_eq!(store.get(small).unwrap().bytes, b"small opaque data");
+    assert_eq!(store.physical_statistics(), before);
+
+    let large = *references.last().unwrap();
+    let object = store.get_shared(large).unwrap();
+    assert_eq!(object.bytes, [31]);
+    assert_eq!(object.children, children);
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    let read = store.physical_statistics();
+    assert!(Arc::ptr_eq(&object, &store.get_shared(large).unwrap()));
+    assert_eq!(store.physical_statistics(), read);
+    let usage = store.cache_usage();
+    assert!(usage.decoded_bytes + usage.pinned_metadata_bytes <= usage.budget);
+}
+
+#[test]
 fn authenticated_types_survive_payload_eviction_but_keep_exact_pin_fences() {
     let (_directory, mut store) = store();
     let payload = store.put(7, 1, &vec![23; 128 * 1024], &[]).unwrap();
@@ -890,6 +1222,121 @@ fn staged_rewrite_carries_exact_edges_without_promoting_child_authentication() {
 }
 
 #[test]
+fn byte_appends_preserve_decoded_pages_until_payloads_are_read() {
+    let (_dir, mut store) = store();
+    let page = snapshot(&mut store, b"decoded directory");
+    store.publish(page).unwrap();
+    store.set_decoded_cache_budget(64 * 1024);
+    store.cache.lock().unwrap().clear();
+    store.get_verified_shared(page).unwrap();
+
+    let mut last = None;
+    for index in 0..24u8 {
+        last = Some(store.put(7, 1, &[index; 8192], &[]).unwrap());
+    }
+    let payload = last.unwrap();
+    assert!(store.cache.get(store.file_identity, page).is_some());
+    assert!(store.cache.get(store.file_identity, payload).is_none());
+    assert_eq!(store.cached_object_type(payload).unwrap(), Some((7, 1)));
+
+    let before = store.physical_statistics().read_operations;
+    store.put(4096, 1, b"parent", &[payload]).unwrap();
+    assert_eq!(store.physical_statistics().read_operations, before);
+    assert_eq!(store.get(payload).unwrap().bytes, [23; 8192]);
+    assert!(store.cache.get(store.file_identity, payload).is_some());
+}
+
+#[test]
+fn borrowed_child_authentication_survives_spill_cache_pressure_and_publication() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let (dir, mut store) = store();
+    // Exercise overflow deliberately; the default resident budget fits this
+    // small database and must not spill merely because it has 2,048 IDs.
+    store
+        .set_append_index_memory_budget(512 + 256 * 2048)
+        .unwrap();
+    let references: Vec<_> = (9..25u8)
+        .map(|i| store.put(7, 1, &[i; 16 * 1024], &[]).unwrap())
+        .collect();
+    let root = snapshot(&mut store, b"base with inherited child");
+    let initial = store.publish(root).unwrap();
+    let old = store.pin().unwrap();
+    store.discard_disposable_caches();
+    store.set_decoded_cache_budget(4 * 1024);
+
+    let stop = AtomicBool::new(false);
+    let started = std::sync::Barrier::new(5);
+    let reads = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    started.wait();
+                    let archive =
+                        resources::ArchiveReader::open(&old, root, resources::Limits::default())
+                            .unwrap();
+                    let entry = archive.open_file(&[b"file".to_vec()]).unwrap().unwrap();
+                    let mut bytes = [0; 25];
+                    let mut count = 0;
+                    while count < 8 || (count < 4096 && !stop.load(Ordering::Acquire)) {
+                        entry.read_into(0, &mut bytes).unwrap();
+                        assert_eq!(&bytes, b"base with inherited child");
+                        count += 1;
+                    }
+                    count
+                })
+            })
+            .collect();
+        started.wait();
+        let result = (|| -> Result<()> {
+            for i in 0..10_000u64 {
+                let child = references[i as usize % references.len()];
+                let put = store.put(4096, 1, &i.to_le_bytes(), &[child])?;
+                if i % 1000 == 999 {
+                    let head = snapshot(&mut store, &i.to_le_bytes());
+                    store.publish(head)?;
+                    let pin = store.pin()?;
+                    assert_eq!(pin.get(put)?.children, [child]);
+                    assert!(old.get(put).is_err());
+                }
+            }
+            Ok(())
+        })();
+        stop.store(true, Ordering::Release);
+        let reads: usize = readers
+            .into_iter()
+            .map(|reader| reader.join().unwrap())
+            .sum();
+        result.unwrap();
+        reads
+    });
+    assert!(reads >= 32);
+    let spilled = store.recent.0.disk_bytes().unwrap();
+    assert!(spilled > 0);
+    assert!(store.temporary_bytes().unwrap() >= spilled);
+    assert_eq!(store.root().unwrap().generation, initial.generation + 10);
+    let child = references[0];
+    let mut wrong = child;
+    wrong.hash.0[0] ^= 1;
+    let end = store.end;
+    assert!(store.put(4096, 1, b"wrong child", &[wrong]).is_err());
+    assert_eq!(store.end, end);
+
+    // Reopen with an empty append index and no decoded payload residency.
+    drop(store);
+    let mut reopened = NativeStore::open(dir.path().join("db.sac"), true).unwrap();
+    reopened.set_decoded_cache_budget(0);
+    let before = reopened.physical_statistics().read_operations;
+    let put = reopened.put(4096, 1, b"reopened", &[child]).unwrap();
+    assert_eq!(reopened.physical_statistics().read_operations, before + 1);
+    assert_eq!(reopened.get(put).unwrap().children, [child]);
+    NativeReader::open(dir.path().join("db.sac"))
+        .unwrap()
+        .validate()
+        .unwrap();
+}
+
+#[test]
 fn put_admits_appended_children_without_a_read_until_the_index_is_gone() {
     let (dir, mut store) = store();
     let base = snapshot(&mut store, b"base");
@@ -1087,7 +1534,9 @@ fn staged_rewrite_is_bound_to_writer_extent_path_and_reopen_generation() {
     std::fs::rename(&path, dir.path().join("replaced.sac")).unwrap();
     std::fs::write(&path, b"foreign replacement").unwrap();
     let before = reopened.end;
-    assert!(
+    // An unchanged staged rewrite is still local to this descriptor. The
+    // publication boundary rejects the replaced destination for the batch.
+    assert_eq!(
         reopened
             .rewrite(
                 &new_source,
@@ -1096,9 +1545,13 @@ fn staged_rewrite_is_bound_to_writer_extent_path_and_reopen_generation() {
                 &new_source.object.bytes,
                 &new_source.object.children
             )
-            .is_err()
+            .unwrap(),
+        new_parent
     );
     assert_eq!(reopened.end, before);
+    let next = snapshot(&mut reopened, b"rejected batch");
+    assert!(reopened.publish(next).is_err());
+    assert_eq!(std::fs::read(&path).unwrap(), b"foreign replacement");
 }
 
 #[test]

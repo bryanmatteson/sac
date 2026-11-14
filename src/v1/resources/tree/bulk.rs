@@ -1,6 +1,7 @@
 //! Initial packing: external key sort followed by one encoding per directory
 //! page. Temporary files are private, quota-charged, and never durable state.
 use super::*;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::{
@@ -49,7 +50,7 @@ struct Spool {
 }
 // One system call moves this many spool bytes. A record that is larger
 // passes through its own call.
-const SPOOL_BUFFER: usize = 64 * 1024;
+const SPOOL_BUFFER: usize = 16 * 1024;
 impl Drop for Spool {
     fn drop(&mut self) {
         self.quota
@@ -115,11 +116,19 @@ impl Spool {
         let span = bytes.len() as u64 + 4;
         self.quota.reserve(span)?;
         self.bytes += span;
-        self.pending
-            .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        self.pending.extend_from_slice(bytes);
-        if self.pending.len() >= SPOOL_BUFFER {
+        let size = (bytes.len() as u32).to_le_bytes();
+        if self.pending.len() + size.len() + bytes.len() > SPOOL_BUFFER {
             self.flush()?;
+        }
+        if size.len() + bytes.len() > SPOOL_BUFFER {
+            self.file.write_all(&size)?;
+            self.file.write_all(bytes)?;
+        } else {
+            if self.pending.capacity() == 0 {
+                self.pending = Vec::with_capacity(SPOOL_BUFFER);
+            }
+            self.pending.extend_from_slice(&size);
+            self.pending.extend_from_slice(bytes);
         }
         self.quota
             .counters
@@ -128,8 +137,13 @@ impl Spool {
         self.count += 1;
         Ok(())
     }
-    fn rewind(&mut self) -> Result<()> {
+    fn seal(&mut self) -> Result<()> {
         self.flush()?;
+        self.pending = Vec::new();
+        Ok(())
+    }
+    fn rewind(&mut self) -> Result<()> {
+        self.seal()?;
         self.file.seek(SeekFrom::Start(0))?;
         self.loaded.clear();
         self.consumed = 0;
@@ -160,6 +174,25 @@ struct Record {
     entry: Entry,
     encoded: Vec<u8>,
 }
+
+struct MergeHead {
+    path: ResourcePath,
+    encoded: Vec<u8>,
+}
+impl MergeHead {
+    fn read(run: &mut Spool) -> Result<Option<Self>> {
+        let Some(encoded) = run.read()? else {
+            return Ok(None);
+        };
+        let path = crate::v1::cbor_view::admitted(&encoded)?
+            .first_field(3)?
+            .array()?
+            .map(|key| Ok(key?.bytes()?.to_vec()))
+            .collect::<Result<_>>()?;
+        Ok(Some(Self { path, encoded }))
+    }
+}
+
 fn reference(r: ObjectRef) -> Value {
     array(vec![
         Value::Bytes(r.hash.0.to_vec()),
@@ -307,6 +340,7 @@ pub(super) struct Bulk {
     levels: Vec<Vec<Spool>>,
     started: Instant,
     max_record: usize,
+    poisoned: bool,
 }
 impl Bulk {
     pub fn new(limits: Limits) -> Result<Self> {
@@ -324,6 +358,7 @@ impl Bulk {
             memory: 0,
             levels: Vec::new(),
             started: Instant::now(),
+            poisoned: false,
         })
     }
     fn time(&self) -> Result<()> {
@@ -334,6 +369,9 @@ impl Bulk {
         }
     }
     pub fn push(&mut self, path: &[Vec<u8>], metadata: Value, data: EntryData) -> Result<()> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
         self.time()?;
         let record = Record::new(path, metadata, data);
         if record.encoded.len() > self.max_record {
@@ -346,7 +384,7 @@ impl Bulk {
             return Err(Error::Limit("bulk record resident memory"));
         }
         if self.memory.saturating_add(charge) > self.limits.max_memory_bytes / 8 {
-            self.flush()?;
+            self.flush().inspect_err(|_| self.poisoned = true)?;
         }
         self.memory += charge;
         self.buffered.push(record);
@@ -365,6 +403,7 @@ impl Bulk {
             run.write(&record.encoded)?;
         }
         self.memory = 0;
+        run.seal()?;
         self.promote(run, 0)
     }
     fn promote(&mut self, run: Spool, level: usize) -> Result<()> {
@@ -384,7 +423,7 @@ impl Bulk {
         let mut heads = Vec::new();
         for run in &mut runs {
             run.rewind()?;
-            heads.push(run.read()?.map(Record::decode).transpose()?);
+            heads.push(MergeHead::read(run)?);
         }
         loop {
             self.time()?;
@@ -398,8 +437,9 @@ impl Bulk {
                 break;
             };
             output.write(&heads[i].take().unwrap().encoded)?;
-            heads[i] = runs[i].read()?.map(Record::decode).transpose()?;
+            heads[i] = MergeHead::read(&mut runs[i])?;
         }
+        output.seal()?;
         Ok(output)
     }
     pub fn finish<S: ObjectStore + ?Sized>(
@@ -418,6 +458,20 @@ impl Bulk {
         ))
     }
     fn finish_inner<S: ObjectStore + ?Sized>(mut self, store: &mut S) -> Result<ObjectRef> {
+        if self.poisoned {
+            return Err(Error::Poisoned);
+        }
+        if self.levels.is_empty() {
+            let mut records = std::mem::take(&mut self.buffered);
+            records.sort_by(|a, b| a.path.cmp(&b.path));
+            return self.build_directories(
+                store,
+                records.into_iter().map(|record| {
+                    crate::v1::cbor_view::view(&record.encoded)?;
+                    Ok(record)
+                }),
+            );
+        }
         self.flush()?;
         let mut runs: Vec<_> = self.levels.drain(..).flatten().collect();
         if runs.is_empty() {
@@ -441,11 +495,26 @@ impl Bulk {
         }
         let mut sorted = runs.pop().unwrap();
         sorted.rewind()?;
-        let mut directories = vec![Directory::new(Vec::new(), empty_metadata(), self.spool()?)];
+        self.build_directories(
+            store,
+            std::iter::from_fn(|| {
+                sorted
+                    .read()
+                    .and_then(|r| r.map(Record::decode).transpose())
+                    .transpose()
+            }),
+        )
+    }
+    fn build_directories<S: ObjectStore + ?Sized>(
+        &self,
+        store: &mut S,
+        records: impl Iterator<Item = Result<Record>>,
+    ) -> Result<ObjectRef> {
+        let mut directories = vec![Directory::new(Vec::new(), empty_metadata())];
         let mut previous: Option<(ResourcePath, bool)> = None;
-        while let Some(encoded) = sorted.read()? {
+        for record in records {
             self.time()?;
-            let record = Record::decode(encoded)?;
+            let record = record?;
             let is_directory = matches!(record.entry.data, EntryData::Directory(_));
             if previous.as_ref().is_some_and(|(p, _)| p == &record.path) {
                 if is_directory && previous.as_ref().unwrap().1 {
@@ -458,7 +527,7 @@ impl Bulk {
             while directories.last().unwrap().path.len() > parent.len()
                 || !parent.starts_with(&directories.last().unwrap().path)
             {
-                close_directory(store, &mut directories, &self)?;
+                close_directory(store, &mut directories, self)?;
             }
             while directories.last().unwrap().path.len() < parent.len() {
                 let depth = directories.last().unwrap().path.len();
@@ -472,11 +541,7 @@ impl Bulk {
                 {
                     return Err(corrupt("resource parent is not a directory"));
                 }
-                directories.push(Directory::new(
-                    parent[..=depth].to_vec(),
-                    empty_metadata(),
-                    self.spool()?,
-                ));
+                directories.push(Directory::new(parent[..=depth].to_vec(), empty_metadata()));
             }
             if is_directory {
                 if directories
@@ -488,13 +553,12 @@ impl Bulk {
                 {
                     return Err(corrupt("duplicate resource path"));
                 }
-                directories.push(Directory::new(
-                    record.path,
-                    record.entry.metadata,
-                    self.spool()?,
-                ));
+                directories.push(Directory::new(record.path, record.entry.metadata));
             } else {
-                directories.last_mut().unwrap().push(store, record.entry)?;
+                directories
+                    .last_mut()
+                    .unwrap()
+                    .push(store, self, record.entry)?;
             }
             let memory: usize = directories.iter().map(Directory::memory).sum();
             if memory > self.limits.max_memory_bytes / 2 {
@@ -502,9 +566,9 @@ impl Bulk {
             }
         }
         while directories.len() > 1 {
-            close_directory(store, &mut directories, &self)?;
+            close_directory(store, &mut directories, self)?;
         }
-        directories.pop().unwrap().finish(store, &self)
+        directories.pop().unwrap().finish(store, self)
     }
 }
 
@@ -524,18 +588,13 @@ fn close_directory<S: ObjectStore + ?Sized>(
         .ok_or_else(|| corrupt("bulk directory parent"))?
         .push(
             store,
+            bulk,
             Entry {
                 name,
                 metadata,
                 data: EntryData::Directory(root),
             },
         )
-}
-fn header(major: u8, n: usize) -> Vec<u8> {
-    let encoded = cbor::encode(&uint(n as u64));
-    let mut encoded = encoded;
-    encoded[0] |= major << 5;
-    encoded
 }
 fn node_bytes(key: &[u8], reference: ObjectRef) -> Vec<u8> {
     cbor::encode(&array(vec![
@@ -555,11 +614,11 @@ struct Directory {
     row_count: usize,
     children: Vec<ObjectRef>,
     last: Option<Vec<u8>>,
-    page_last: Vec<u8>,
-    nodes: Spool,
+    first_node: Option<(Vec<u8>, ObjectRef)>,
+    nodes: Option<Spool>,
 }
 impl Directory {
-    fn new(path: ResourcePath, metadata: Value, nodes: Spool) -> Self {
+    fn new(path: ResourcePath, metadata: Value) -> Self {
         Self {
             path,
             metadata,
@@ -567,106 +626,103 @@ impl Directory {
             row_count: 0,
             children: Vec::new(),
             last: None,
-            page_last: Vec::new(),
-            nodes,
+            first_node: None,
+            nodes: None,
         }
     }
     fn memory(&self) -> usize {
         self.rows.capacity()
             + self.children.capacity() * std::mem::size_of::<ObjectRef>()
             + self.path.iter().map(|p| p.capacity() + 32).sum::<usize>()
+            + value_heap_bytes(&self.metadata)
+            + self
+                .nodes
+                .as_ref()
+                .map_or(0, |spool| spool.pending.capacity())
             + 16384
     }
-    fn row(&mut self, entry: &Entry) -> Vec<u8> {
-        let (value, _) = encode_leaf(std::slice::from_ref(entry));
-        let Value::Array(mut rows) = value else {
-            unreachable!()
-        };
-        let Value::Array(mut row) = rows.pop().unwrap() else {
-            unreachable!()
-        };
-        match &entry.data {
-            EntryData::Directory(r) => row[3] = uint(child_index(&mut self.children, *r)),
-            EntryData::File {
-                data: FileData::Extents(r),
-                ..
-            } => {
-                let Value::Array(v) = &mut row[3] else {
-                    unreachable!()
-                };
-                v[2] = uint(child_index(&mut self.children, *r));
-            }
-            _ => {}
-        }
-        cbor::encode(&array(row))
-    }
-    fn push<S: ObjectStore + ?Sized>(&mut self, store: &mut S, entry: Entry) -> Result<()> {
+    fn push<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &mut S,
+        bulk: &Bulk,
+        entry: Entry,
+    ) -> Result<()> {
         if self.last.as_ref().is_some_and(|last| last >= &entry.name) {
             return Err(corrupt("bulk directory key order"));
         }
         let before = self.children.len();
-        let mut row = self.row(&entry);
+        let row_start = self.rows.len();
+        write_entry_row(&entry, &mut self.children, &mut self.rows);
         if self.children.len() > 1024
             || 8 + 32 * self.children.len()
-                + header(4, self.row_count + 1).len()
+                + cbor::head_len((self.row_count + 1) as u64)
                 + self.rows.len()
-                + row.len()
                 > DIRECTORY_LEAF_LIMIT
         {
             self.children.truncate(before);
+            self.rows.truncate(row_start);
             if self.row_count == 0 {
                 return Err(Error::Limit("directory entry too large"));
             }
-            self.flush(store)?;
-            row = self.row(&entry);
+            self.flush(store, bulk)?;
+            write_entry_row(&entry, &mut self.children, &mut self.rows);
+            if 8 + 32 * self.children.len() + 1 + self.rows.len() > DIRECTORY_LEAF_LIMIT {
+                return Err(Error::Limit("directory entry too large"));
+            }
         }
-        if 8 + 32 * self.children.len() + header(4, 1).len() + row.len() > DIRECTORY_LEAF_LIMIT {
-            return Err(Error::Limit("directory entry too large"));
-        }
-        self.rows.extend(row);
         self.row_count += 1;
-        self.page_last = entry.name.clone();
         self.last = Some(entry.name);
         Ok(())
     }
-    fn flush<S: ObjectStore + ?Sized>(&mut self, store: &mut S) -> Result<()> {
+    fn flush<S: ObjectStore + ?Sized>(&mut self, store: &mut S, bulk: &Bulk) -> Result<()> {
         if self.row_count == 0 {
             return Ok(());
         }
-        let mut body = header(4, self.row_count);
-        body.append(&mut self.rows);
+        let count = self.row_count as u64;
+        let mut body = Vec::with_capacity(cbor::head_len(count) + self.rows.len());
+        cbor::write_head(4, count, &mut body);
+        body.extend_from_slice(&self.rows);
         let reference = store.put(3, 1, &body, &self.children)?;
-        self.nodes.write(&node_bytes(&self.page_last, reference))?;
+        let key = self.last.as_ref().unwrap();
+        if let Some(nodes) = &mut self.nodes {
+            nodes.write(&node_bytes(key, reference))?;
+        } else if let Some((first_key, first_ref)) = self.first_node.take() {
+            let mut nodes = bulk.spool()?;
+            nodes.write(&node_bytes(&first_key, first_ref))?;
+            nodes.write(&node_bytes(key, reference))?;
+            self.nodes = Some(nodes);
+        } else {
+            self.first_node = Some((key.clone(), reference));
+        }
+        self.rows.clear();
         self.children.clear();
         self.row_count = 0;
         Ok(())
     }
     fn finish<S: ObjectStore + ?Sized>(mut self, store: &mut S, bulk: &Bulk) -> Result<ObjectRef> {
-        self.flush(store)?;
-        if self.nodes.count == 0 {
-            return Ok(store_leaf(store, &[])?.1);
-        }
+        self.flush(store, bulk)?;
+        let Some(mut nodes) = self.nodes else {
+            return match self.first_node {
+                Some((_, reference)) => Ok(reference),
+                None => Ok(store_leaf(store, &[])?.1),
+            };
+        };
         let mut level = 0;
-        while self.nodes.count > 1 {
+        while nodes.count > 1 {
             bulk.time()?;
             level += 1;
             if level > 16 {
                 return Err(Error::Limit("directory tree height"));
             }
-            self.nodes.rewind()?;
+            nodes.rewind()?;
             let mut next = bulk.spool()?;
             let mut group = Vec::new();
-            let total = self.nodes.count;
+            let total = nodes.count;
+            let mut size = BranchSize::default();
             for ordinal in 0..total {
-                let node = node_decode(
-                    self.nodes
-                        .read()?
-                        .ok_or_else(|| corrupt("bulk node spool"))?,
-                )?;
-                group.push(node);
-                let (v, c) = encode_branch(level, &group);
-                if !fits(&v, &c) {
-                    let last = group.pop().unwrap();
+                let node = node_decode(nodes.read()?.ok_or_else(|| corrupt("bulk node spool"))?)?;
+                size.push(&node);
+                if !size.fits(group.len() + 1) {
                     // Avoid a unary final branch by moving one prior child into
                     // the final group when precisely one node remains.
                     let tail = if ordinal + 1 == total {
@@ -677,20 +733,47 @@ impl Directory {
                     let (key, r) = store_branch(store, level, &group)?;
                     next.write(&node_bytes(&key, r))?;
                     group.clear();
+                    size.clear();
                     if let Some(tail) = tail {
+                        size.push(&tail);
                         group.push(tail);
                     }
-                    group.push(last);
+                    size.push(&node);
                 }
+                group.push(node);
             }
             if !group.is_empty() {
                 let (key, r) = store_branch(store, level, &group)?;
                 next.write(&node_bytes(&key, r))?;
             }
-            self.nodes = next;
+            nodes = next;
         }
-        self.nodes.rewind()?;
-        Ok(node_decode(self.nodes.read()?.unwrap())?.1)
+        nodes.rewind()?;
+        Ok(node_decode(nodes.read()?.unwrap())?.1)
+    }
+}
+
+#[derive(Default)]
+struct BranchSize {
+    children: HashMap<ObjectHash, u64>,
+    row_bytes: usize,
+}
+impl BranchSize {
+    fn push(&mut self, (key, reference): &(Vec<u8>, ObjectRef)) {
+        let next = self.children.len() as u64;
+        let index = *self.children.entry(reference.hash).or_insert(next);
+        self.row_bytes += 1 + cbor::head_len(key.len() as u64) + key.len() + cbor::head_len(index);
+    }
+    fn fits(&self, rows: usize) -> bool {
+        // Eight canonical header bytes, the child hash table, the enclosing
+        // pair and one-byte height (1..=16), then the CBOR rows array.
+        self.children.len() <= 1024
+            && 8 + 32 * self.children.len() + 2 + cbor::head_len(rows as u64) + self.row_bytes
+                <= PAGE_LIMIT
+    }
+    fn clear(&mut self) {
+        self.children.clear();
+        self.row_bytes = 0;
     }
 }
 

@@ -1,6 +1,6 @@
 //! Disposable bounded-memory closure metadata. Values have fixed width;
 //! a fixed resident prefix handles small closures and overflow stays on disk.
-use super::temporary::{FixedRecordStack, GraphTable};
+use super::temporary::{FixedRecordStack, GraphTable, ReferenceTable};
 use super::*;
 
 pub(super) fn encode_ref(r: ObjectRef) -> [u8; 44] {
@@ -22,15 +22,69 @@ pub(super) fn decode_ref(bytes: &[u8]) -> Result<ObjectRef> {
         },
     })
 }
-pub(super) struct DiskRefs(pub(super) GraphTable);
+pub(super) struct DiskRefs(pub(super) ReferenceTable, Option<LayoutRecords>);
+
+// Rewrite provenance is uncommon and larger than an ordinary address. Keep
+// its full digest in bounded records instead of widening every hash-table slot.
+struct LayoutRecords {
+    spilled: FixedRecordStack<40>,
+    pending: Vec<[u8; 40]>,
+}
+impl LayoutRecords {
+    const BATCH: usize = 64;
+    fn new(budget: temporary::Budget) -> Result<Self> {
+        Ok(Self {
+            spilled: FixedRecordStack::with_budget(budget)?,
+            pending: Vec::with_capacity(Self::BATCH),
+        })
+    }
+    fn push(&mut self, value: &[u8; 40]) -> Result<u64> {
+        if self.pending.len() == Self::BATCH {
+            self.spilled.push_many(&self.pending)?;
+            self.pending.clear();
+        }
+        let index = self.spilled.len() + self.pending.len() as u64;
+        self.pending.push(*value);
+        Ok(index)
+    }
+    fn read(&self, index: u64) -> Result<[u8; 40]> {
+        if index < self.spilled.len() {
+            return self.spilled.read(index);
+        }
+        usize::try_from(index - self.spilled.len())
+            .ok()
+            .and_then(|index| self.pending.get(index))
+            .copied()
+            .ok_or_else(|| corrupt("temporary layout index"))
+    }
+}
 impl DiskRefs {
     pub(super) fn new() -> Result<Self> {
-        Ok(Self(GraphTable::new()?))
+        let mut table = ReferenceTable::new()?;
+        table.set_resident_memory_budget(DEFAULT_APPEND_INDEX_MEMORY_BYTES)?;
+        Ok(Self(table, None))
+    }
+    pub(super) fn with_budget(resident: usize, budget: temporary::Budget) -> Self {
+        Self(ReferenceTable::with_budget(resident, budget), None)
+    }
+    pub(super) fn disk_bytes(&self) -> Result<u64> {
+        Ok(self.0.disk_bytes()? + self.1.as_ref().map_or(0, |rows| rows.spilled.disk_bytes()))
     }
     pub(super) fn get(&self, hash: ObjectHash) -> Result<Option<ObjectRef>> {
         self.0
             .get(&hash.0)?
-            .map(|bytes| decode_ref(&bytes))
+            .map(|bytes| {
+                if bytes.len() != 12 {
+                    return Err(corrupt("temporary address length"));
+                }
+                Ok(ObjectRef {
+                    hash,
+                    address: ChunkAddress {
+                        offset: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+                        length: u32::from_le_bytes(bytes[8..].try_into().unwrap()),
+                    },
+                })
+            })
             .transpose()
     }
     pub(super) fn insert_cancellable(
@@ -38,11 +92,14 @@ impl DiskRefs {
         r: ObjectRef,
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
-        self.0
-            .insert_cancellable(&r.hash.0, &encode_ref(r), cancelled)?;
+        let mut address = [0; 12];
+        address[..8].copy_from_slice(&r.address.offset.to_le_bytes());
+        address[8..].copy_from_slice(&r.address.length.to_le_bytes());
+        self.0.insert_cancellable(&r.hash.0, &address, cancelled)?;
         Ok(())
     }
 }
+
 // Kept in the same bounded/spilled table as append IDs. A full 44-byte
 // parent occurrence key cannot alias the ordinary 32-byte canonical-ID keys.
 // This is writer-local append provenance, never verified-layout cache status.
@@ -61,22 +118,32 @@ impl DiskRefs {
         parent: ObjectRef,
         children: &[ObjectRef],
     ) -> Result<()> {
-        // Forty bytes fit the existing 44-byte GraphTable value. Preserve the
-        // original physical-byte estimate without another key or resident map.
+        // Retain the full layout digest and physical-byte estimate in the
+        // side records; the mixed index needs only an eight-byte record ID.
         let mut value = [0; 40];
         value[..32].copy_from_slice(&rewrite_layout(children));
         let child_bytes: u64 = children.iter().map(|r| u64::from(r.address.length)).sum();
         value[32..].copy_from_slice(&child_bytes.to_le_bytes());
+        if self.1.is_none() {
+            self.1 = Some(LayoutRecords::new(self.0.budget.clone())?);
+        }
+        let index = self.1.as_mut().unwrap().push(&value)?;
         self.0
-            .insert_cancellable(&encode_ref(parent), &value, &|| false)
+            .insert_cancellable(&encode_ref(parent), &index.to_le_bytes(), &|| false)
     }
     pub(super) fn rewrite_layout(&self, parent: ObjectRef) -> Result<Option<([u8; 32], u64)>> {
         self.0
             .get(&encode_ref(parent))?
             .map(|value| {
-                if value.len() != 40 {
+                if value.len() != 8 {
                     return Err(corrupt("writer rewrite layout"));
                 }
+                let index = u64::from_le_bytes(value[..].try_into().unwrap());
+                let value = self
+                    .1
+                    .as_ref()
+                    .ok_or_else(|| corrupt("missing writer rewrite layouts"))?
+                    .read(index)?;
                 Ok((
                     value[..32].try_into().unwrap(),
                     u64::from_le_bytes(value[32..].try_into().unwrap()),
@@ -211,8 +278,8 @@ impl DiskStack {
 }
 
 /// Reusable closure copier for exports containing several selected roots.
-/// Hash remapping, physical validation and traversal state have fixed resident
-/// prefixes and spill larger graphs to disposable local files.
+/// Hash remapping, physical validation and retained-root counts share a
+/// 16 MiB resident index budget and spill larger graphs to disposable files.
 /// One decoded object and one frame's child table are live at a time, with at
 /// most 1 MiB of the parents that the traversal is inside. A copier with
 /// disk-only metadata keeps no parents.
@@ -222,10 +289,11 @@ pub struct ClosureCopy {
     validated: GraphTable,
     retained: GraphTable,
     retained_roots: Vec<ObjectRef>,
-    spilled: bool,
+    index_memory_budget: usize,
     budget: temporary::Budget,
 }
 impl ClosureCopy {
+    const DEFAULT_INDEX_MEMORY_BYTES: usize = 16 * 1024 * 1024;
     pub fn new() -> Result<Self> {
         Self::new_with_stack_limit(RESIDENT_STACK_FRAMES, false)
     }
@@ -256,20 +324,40 @@ impl ClosureCopy {
         disk_only_metadata: bool,
         budget: temporary::Budget,
     ) -> Result<Self> {
-        let resident = if disk_only_metadata {
+        let index_memory_budget = if disk_only_metadata {
             0
         } else {
-            GraphTable::RESIDENT_ENTRIES
+            Self::DEFAULT_INDEX_MEMORY_BYTES
         };
-        Ok(Self {
-            copied: DiskRefs(GraphTable::with_budget(resident, budget.clone())),
+        let mut copy = Self {
+            copied: DiskRefs::with_budget(0, budget.clone()),
             pending: DiskStack::with_budget(resident_frames, budget.clone())?,
-            validated: GraphTable::with_budget(resident, budget.clone()),
+            validated: GraphTable::with_budget(0, budget.clone()),
             retained: GraphTable::with_budget(0, budget.clone()),
             retained_roots: Vec::new(),
-            spilled: disk_only_metadata,
+            index_memory_budget: 0,
             budget,
-        })
+        };
+        copy.set_index_memory_budget(index_memory_budget)?;
+        Ok(copy)
+    }
+    /// Bound resident remapping, validation, retained-root and active-cycle
+    /// indexes together. Each receives one quarter of the allowance. Reducing
+    /// it spills oversized tables without discarding authenticated identities.
+    /// Stack frames and the at-most-1-MiB parent cache have separate bounds.
+    pub fn set_index_memory_budget(&mut self, bytes: usize) -> Result<()> {
+        let per_table = bytes / 4;
+        self.copied.0.set_resident_memory_budget(per_table)?;
+        self.validated.set_resident_memory_budget(per_table)?;
+        self.retained.set_resident_memory_budget(per_table)?;
+        self.index_memory_budget = bytes;
+        Ok(())
+    }
+    /// Conservative resident allocation charge between copy operations.
+    pub fn index_memory_bytes(&self) -> usize {
+        self.copied.0.resident_memory_bytes()
+            + self.validated.resident_memory_bytes()
+            + self.retained.resident_memory_bytes()
     }
     pub(super) fn mark_validated(
         &mut self,
@@ -293,7 +381,7 @@ impl ClosureCopy {
         Ok(self.validated.get(&hash.0)?.as_deref() == Some(&[0]))
     }
     pub fn disk_bytes(&self) -> Result<u64> {
-        Ok(self.copied.0.disk_bytes()?
+        Ok(self.copied.disk_bytes()?
             + self.pending.disk_bytes()?
             + self.validated.disk_bytes()?
             + self.retained.disk_bytes()?)
@@ -419,21 +507,15 @@ impl ClosureCopy {
         // Validate each physical occurrence and copy in the same postorder
         // traversal. A canonical-ID hit never skips a new occurrence's edges.
         // In particular, large childless byte frames are read only once.
-        let mut active = GraphTable::with_budget(
-            if self.spilled {
-                0
-            } else {
-                GraphTable::RESIDENT_ENTRIES
-            },
-            self.budget.clone(),
-        );
+        let mut active = GraphTable::with_budget(0, self.budget.clone());
+        active.set_resident_memory_budget(self.index_memory_budget / 4)?;
         // The parents that the traversal is inside, newest last. A parent
         // returns after all its children; keeping it here avoids a second
         // read and authentication when the source cache has released it.
         // The retained canonical bytes have a fixed limit, and a copier with
         // disk-only metadata retains none.
         const RETAINED_PARENT_BYTES: usize = 1024 * 1024;
-        let retain = if self.spilled {
+        let retain = if self.index_memory_budget == 0 {
             0
         } else {
             RETAINED_PARENT_BYTES
@@ -548,5 +630,77 @@ impl ClosureCopy {
                 DiskStack::with_budget(self.pending.resident_limit, self.budget.clone())?;
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod compact_reference_tests {
+    use super::*;
+
+    fn reference(ordinal: u64) -> ObjectRef {
+        ObjectRef {
+            hash: ObjectHash::digest(&ordinal.to_le_bytes()),
+            address: ChunkAddress {
+                offset: 128 + ordinal * 64,
+                length: 64,
+            },
+        }
+    }
+
+    #[test]
+    fn addresses_and_full_layouts_survive_spill_growth_and_record_boundaries() {
+        let budget = temporary::Budget::new(2 << 20);
+        let mut refs = DiskRefs::with_budget(8, budget.clone());
+        for ordinal in 0..5000 {
+            let parent = reference(ordinal);
+            let child = reference(ordinal + 10000);
+            refs.insert_cancellable(parent, &|| false).unwrap();
+            refs.record_rewrite_layout(parent, &[child]).unwrap();
+        }
+        for ordinal in 0..5000 {
+            let parent = reference(ordinal);
+            let child = reference(ordinal + 10000);
+            assert_eq!(refs.get(parent.hash).unwrap(), Some(parent));
+            assert_eq!(
+                refs.rewrite_layout(parent).unwrap(),
+                Some((rewrite_layout(&[child]), 64))
+            );
+            let mut relocated = parent;
+            relocated.address.offset += 8;
+            assert!(refs.rewrite_layout(relocated).unwrap().is_none());
+        }
+        assert_eq!(refs.disk_bytes().unwrap(), budget.used());
+        assert!(budget.used() < 16384 * 96);
+        drop(refs);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn failed_record_flush_keeps_the_pending_layouts_readable_and_budgeted() {
+        let budget = temporary::Budget::new(64 * 40 - 1);
+        let mut refs = DiskRefs::with_budget(2048, budget.clone());
+        let child = reference(10000);
+        for ordinal in 0..64 {
+            refs.record_rewrite_layout(reference(ordinal), &[child])
+                .unwrap();
+        }
+        assert!(refs.record_rewrite_layout(reference(64), &[child]).is_err());
+        assert_eq!(budget.used(), 0);
+        for ordinal in 0..64 {
+            assert_eq!(
+                refs.rewrite_layout(reference(ordinal)).unwrap(),
+                Some((rewrite_layout(&[child]), 64))
+            );
+        }
+        assert!(refs.rewrite_layout(reference(64)).unwrap().is_none());
+        budget.set_limit(64 * 40).unwrap();
+        refs.record_rewrite_layout(reference(64), &[child]).unwrap();
+        assert_eq!(budget.used(), 64 * 40);
+        assert_eq!(
+            refs.rewrite_layout(reference(0)).unwrap(),
+            refs.rewrite_layout(reference(64)).unwrap()
+        );
+        drop(refs);
+        assert_eq!(budget.used(), 0);
     }
 }

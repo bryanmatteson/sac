@@ -179,6 +179,85 @@ fn reusable_frames_borrow_raw_input_and_authenticate_each_use() {
 }
 
 #[test]
+#[cfg(feature = "compression")]
+fn complete_frame_compression_matches_bulk_across_context_reuse_and_level_changes() {
+    let mut encoder = FrameEncoder::default();
+    let mut decoder = FrameDecoder::default();
+    let children: Vec<_> = (0..3u64)
+        .map(|ordinal| ObjectRef {
+            hash: sac::ObjectHash::digest(&ordinal.to_le_bytes()),
+            address: ChunkAddress {
+                offset: 128 + ordinal * 64,
+                length: 64,
+            },
+        })
+        .collect();
+    let mut random = 0x517cc1b727220a95u64;
+    for length in [0, 1, 63, 255, 4096, 65535, 131071, 131072, 131073, 262144] {
+        for compressible in [true, false] {
+            let bytes = (0..length)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 7;
+                    random ^= random << 17;
+                    if compressible { 71 } else { random as u8 }
+                })
+                .collect();
+            let object = CanonicalObject {
+                kind: 42000,
+                version: 5,
+                bytes,
+                children: if length % 2 == 0 {
+                    children.clone()
+                } else {
+                    Vec::new()
+                },
+            };
+            let canonical = object.canonical_bytes();
+            let raw = encode_frame(&object, 0).unwrap();
+            // The previous bulk API uses compress2's streaming setup. Compare
+            // its stored bytes, not a second call through our own encoder.
+            for level in [1, 3, -3, 1, 0, 9, 1] {
+                let mut bulk = zstd::bulk::Compressor::new(level).unwrap();
+                let compressed = bulk.compress(&canonical).unwrap();
+                let frame = encoder.encode(&object, level).unwrap();
+                if level == 0 || compressed.len() >= canonical.len() {
+                    assert_eq!(frame, raw, "raw fallback, length={length} level={level}");
+                } else {
+                    assert_eq!(frame[4], 1);
+                    let stored = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
+                    assert_eq!(&frame[56..56 + stored], compressed);
+                    let locators = 12 * object.children.len();
+                    assert_eq!(
+                        &frame[56 + stored..56 + stored + locators],
+                        &raw[56 + canonical.len()..56 + canonical.len() + locators]
+                    );
+                    assert!(
+                        frame[56 + stored + locators..]
+                            .iter()
+                            .all(|&byte| byte == 0)
+                    );
+                }
+                let reference = ObjectRef {
+                    hash: object.hash(),
+                    address: ChunkAddress {
+                        offset: 4096,
+                        length: frame.len() as u32,
+                    },
+                };
+                assert_eq!(
+                    decoder
+                        .decode(reference, frame, 128, 4096 + frame.len() as u64)
+                        .unwrap()
+                        .to_owned(),
+                    object
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn repacking_preserves_opaque_strong_closure_and_does_not_follow_embedded_hashes() {
     let mut source = MemoryStore::with_preamble(sac::v1::wire::Preamble::live([7; 16]).unwrap());
     source.set_compression_level(0);

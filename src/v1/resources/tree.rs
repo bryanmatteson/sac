@@ -196,11 +196,41 @@ pub(crate) fn encode_leaf(entries: &[Entry]) -> (Value, Vec<ObjectRef>) {
         .collect();
     (array(rows), children)
 }
-// The CBOR head of an array of `count` items.
-fn array_head(count: usize) -> Vec<u8> {
-    let mut head = cbor::encode(&uint(count as u64));
-    head[0] |= 4 << 5;
-    head
+fn write_entry_row(entry: &Entry, children: &mut Vec<ObjectRef>, out: &mut Vec<u8>) {
+    let kind = match entry.data {
+        EntryData::File { .. } => 0,
+        EntryData::Directory(_) => 1,
+        EntryData::Symlink(_) => 2,
+    };
+    cbor::write_head(4, 4, out);
+    cbor::write_head(2, entry.name.len() as u64, out);
+    out.extend_from_slice(&entry.name);
+    cbor::write_head(0, kind, out);
+    cbor::encode_into(&entry.metadata, out);
+    match &entry.data {
+        EntryData::File { length, data } => {
+            cbor::write_head(4, 3, out);
+            cbor::write_head(0, *length, out);
+            match data {
+                FileData::Inline(bytes) => {
+                    cbor::write_head(0, 0, out);
+                    cbor::write_head(2, bytes.len() as u64, out);
+                    out.extend_from_slice(bytes);
+                }
+                FileData::Extents(reference) => {
+                    cbor::write_head(0, 1, out);
+                    cbor::write_head(0, child_index(children, *reference), out);
+                }
+            }
+        }
+        EntryData::Directory(reference) => {
+            cbor::write_head(0, child_index(children, *reference), out);
+        }
+        EntryData::Symlink(target) => {
+            cbor::write_head(2, target.len() as u64, out);
+            out.extend_from_slice(target);
+        }
+    }
 }
 // The last key and the reference of each page that replaces one page.
 type Pages = Vec<(Vec<u8>, ObjectRef)>;
@@ -259,11 +289,11 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
         }
         Err(position) => (position, false),
     };
-    let mut children = Vec::new();
+    let mut children = Vec::with_capacity(object.children.len() + 1);
     let mut body = Vec::with_capacity(object.bytes.len() + 4096);
-    body.extend_from_slice(&array_head(rows.len() + usize::from(!replaced)));
+    cbor::write_head(4, (rows.len() + usize::from(!replaced)) as u64, &mut body);
     let new_row = |body: &mut Vec<u8>, children: &mut Vec<ObjectRef>| {
-        body.extend_from_slice(&cbor::encode(&entry_row(entry, children)));
+        write_entry_row(entry, children, body);
     };
     for (index, row) in rows.iter().enumerate() {
         if index == position {
@@ -300,7 +330,7 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
         // The index is the last item of the row.
         let prefix = row.encoded().len() - reference.encoded().len();
         body.extend_from_slice(&row.encoded()[..prefix]);
-        body.extend_from_slice(&cbor::encode(&uint(new)));
+        cbor::write_head(0, new, &mut body);
     }
     if position == rows.len() {
         new_row(&mut body, &mut children);
@@ -428,6 +458,7 @@ pub struct ArchiveBuilder<'a, S: ObjectStore + ?Sized> {
     limits: Limits,
     chunk_size: usize,
     page_limit: usize,
+    inline_probe: Vec<u8>,
     entries: u64,
     logical: u64,
     #[cfg(feature = "native")]
@@ -441,6 +472,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             limits: Limits::default(),
             chunk_size: DEFAULT_CHUNK_SIZE,
             page_limit: DIRECTORY_LEAF_LIMIT,
+            inline_probe: Vec::new(),
             entries: 0,
             logical: 0,
             #[cfg(feature = "native")]
@@ -511,6 +543,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             limits,
             chunk_size: DEFAULT_CHUNK_SIZE,
             page_limit: DIRECTORY_LEAF_LIMIT,
+            inline_probe: Vec::new(),
             entries: 0,
             logical: 0,
             #[cfg(feature = "native")]
@@ -548,23 +581,24 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         )?;
         // Most archive entries are small. Determine inline eligibility without
         // allocating and clearing a full interactive/bulk chunk for every file.
-        let mut prefix = vec![0; self.inline_limit() + 1];
+        let inline_limit = self.inline_limit();
+        self.inline_probe.resize(inline_limit + 1, 0);
         let mut filled = 0;
-        while filled < prefix.len() {
+        while filled < self.inline_probe.len() {
             work.time()?;
-            match reader.read(&mut prefix[filled..]) {
+            match reader.read(&mut self.inline_probe[filled..]) {
                 Ok(0) => break,
                 Ok(n) => filled += n,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error.into()),
             }
         }
-        prefix.truncate(filled);
-        if filled <= self.inline_limit() {
-            // Retained inline data must not keep the full probe allocation.
-            // Bulk runs may hold thousands of these small files at once.
-            prefix = prefix.as_slice().to_vec();
-            check_declared_digest(&metadata, blake3::hash(&prefix).as_bytes())?;
+        let has_digest = declared_digests(&metadata).next().is_some();
+        if filled <= inline_limit {
+            let prefix = self.inline_probe[..filled].to_vec();
+            if has_digest {
+                check_declared_digest(&metadata, blake3::hash(&prefix).as_bytes())?;
+            }
             return self.insert(
                 path,
                 metadata,
@@ -575,16 +609,18 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
                 false,
             );
         }
+        let prefix = std::mem::take(&mut self.inline_probe);
         let mut reader = std::io::Cursor::new(prefix).chain(reader);
         // Read as many chunks as the store encodes together. The chunk
         // boundaries and the order of the puts are those of one chunk a time.
         let chunks = self.encode_batch();
-        let capacity = self.chunk_size * chunks;
-        let mut bytes = vec![0u8; capacity.max(self.inline_limit() + 1)];
+        let chunk_size = self.chunk_size;
+        let capacity = chunk_size * chunks;
+        let mut bytes = vec![0u8; capacity.max(inline_limit + 1)];
         let mut first = Vec::new();
         let mut length = 0u64;
         let mut accumulator = ExtentAccumulator::new();
-        let mut hasher = blake3::Hasher::new();
+        let mut hasher = has_digest.then(blake3::Hasher::new);
         loop {
             work.time()?;
             let mut filled = 0;
@@ -600,11 +636,10 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
             if filled == 0 {
                 break;
             }
-            let parallel_digest = chunks > 1 && filled > self.chunk_size;
             let mut put = |hasher: Option<&mut blake3::Hasher>| -> Result<()> {
                 let mut pending = Vec::with_capacity(chunks);
                 let mut hasher = hasher;
-                for chunk in bytes[..filled].chunks(self.chunk_size) {
+                for chunk in bytes[..filled].chunks(chunk_size) {
                     length = length
                         .checked_add(chunk.len() as u64)
                         .ok_or(Error::Limit("file length"))?;
@@ -616,7 +651,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
                     if let Some(hasher) = hasher.as_deref_mut() {
                         hasher.update(chunk);
                     }
-                    if length <= self.inline_limit() as u64 {
+                    if length <= inline_limit as u64 {
                         first.extend_from_slice(chunk);
                     } else {
                         if !first.is_empty() {
@@ -630,11 +665,13 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
                 }
                 accumulator.push_data_batch(self.store, &pending)
             };
-            if parallel_digest {
+            if let Some(whole) = hasher
+                .as_mut()
+                .filter(|_| chunks > 1 && filled > chunk_size)
+            {
                 // The file digest does not depend on the objects. Compute it
                 // on another thread while this thread encodes and puts them.
                 let input = &bytes[..filled];
-                let whole = &mut hasher;
                 std::thread::scope(|scope| {
                     let digest = scope.spawn(move || {
                         whole.update(input);
@@ -646,13 +683,13 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
                     result
                 })?;
             } else {
-                put(Some(&mut hasher))?;
+                put(hasher.as_mut())?;
             }
             if filled < capacity {
                 break;
             }
         }
-        let data = if length <= self.inline_limit() as u64 {
+        let data = if length <= inline_limit as u64 {
             FileData::Inline(first)
         } else {
             FileData::Extents(
@@ -661,7 +698,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
                     .ok_or_else(|| corrupt("missing file extents"))?,
             )
         };
-        check_declared_digest(&metadata, hasher.finalize().as_bytes())?;
+        if let Some(hasher) = hasher {
+            check_declared_digest(&metadata, hasher.finalize().as_bytes())?;
+        }
         self.insert(path, metadata, EntryData::File { length, data }, false)
     }
     pub fn add_sparse(&mut self, path: &[Vec<u8>], segments: Vec<SparseSegment>) -> Result<()> {
@@ -720,7 +759,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         )
     }
     pub fn set_file(&mut self, path: &[Vec<u8>], bytes: &[u8], metadata: Value) -> Result<()> {
-        check_declared_digest(&metadata, blake3::hash(bytes).as_bytes())?;
+        if declared_digests(&metadata).next().is_some() {
+            check_declared_digest(&metadata, blake3::hash(bytes).as_bytes())?;
+        }
         // Construct the file first, then atomically substitute its directory path.
         let data = if bytes.len() <= self.inline_limit() {
             FileData::Inline(bytes.to_vec())
@@ -1644,12 +1685,20 @@ fn store_extent_branch<S: ObjectStore + ?Sized>(
         height,
     })
 }
+fn declared_digests(metadata: &Value) -> impl Iterator<Item = &Value> {
+    let entries = match metadata {
+        Value::Map(entries) => entries.as_slice(),
+        _ => &[],
+    };
+    entries.iter().filter_map(|entry| {
+        matches!(&entry.key, Value::Text(key) if key == "byte_digest").then_some(&entry.value)
+    })
+}
+
 pub(crate) fn check_declared_digest(metadata: &Value, actual: &[u8; 32]) -> Result<()> {
-    if let Value::Map(entries) = metadata {
-        for entry in entries {
-            if entry.key == Value::Text("byte_digest".into()) && bytes(&entry.value)? != actual {
-                return Err(corrupt("whole-resource digest mismatch"));
-            }
+    for expected in declared_digests(metadata) {
+        if bytes(expected)? != actual {
+            return Err(corrupt("whole-resource digest mismatch"));
         }
     }
     Ok(())

@@ -15,17 +15,27 @@ local publication; `NativeReader` pins an immutable admitted view.
 
 ## Write buffering
 
-Small appended frames share a bounded 64 KiB write buffer. A cache miss drains
-it only when the requested frame includes buffered bytes. Reads of older frames
-keep pending writes coalesced and bound read-ahead to the written prefix. Reader
+Appended frames share a bounded 64 KiB write buffer, packing full writes across
+frame boundaries. Large frame prefixes write directly; only their short tails
+occupy the buffer. A cache miss drains it only when the requested frame includes
+buffered bytes. Reads of older frames keep pending writes coalesced and bound
+read-ahead to the written prefix. Reader
 pins and publication drain the buffer before exposing bytes or running the
 ordered durability barriers. Appending alone does not publish data.
+On macOS, published writers write within bounded sparse file extensions in
+1 MiB increments, amortizing length changes and limiting speculative allocation
+from extending writes. Unused logical headroom has no data payload, never exceeds
+the file byte limit, and is removed before publication returns or a new limit
+takes effect. Staging writes stay within their already reserved extent.
+Publication barriers are unchanged; failed append or publication writes poison
+subsequent writes.
 
-Before each write, a native writer checks that the destination name, in the
-directory that it opened, still names its file. A replaced or removed
-destination file fails that write. A replaced ancestor directory does not fail
-a write: each publication and maintenance operation examines the complete
-path, and `NativeStore::verify_current_path` does so at any time.
+A native writer checks its destination when staging begins. Immutable object
+appends then stay local to that descriptor, without repeating the path lookup
+for each object. Publication checks the complete path before its commit write
+and after durability. A replaced or removed file, or a replaced ancestor
+directory, fails publication; previously published pins remain readable.
+`NativeStore::verify_current_path` provides an explicit check at any time.
 
 ## Parallel encoding
 
@@ -37,9 +47,20 @@ with one thread. The default is one thread, and a store that does not encode
 ahead keeps the ordinary `put`. A builder reads as many chunks as the store
 encodes together, to a maximum of one quarter of `Limits::max_memory_bytes`;
 each encoder thread also holds one object and its frame. The whole-file digest
-is computed on one more thread during a parallel batch.
+is computed only for a file declaring `byte_digest`, on one more thread during
+a parallel batch. An object already in the native append index can skip frame
+encoding during preparation. Its destination verifies the existing occurrence
+before reuse, or encodes the object if the occurrence is unavailable.
 `ExtentAccumulator::push_data_batch` gives the same path to a caller that
 builds its own extent trees.
+
+## Bulk directory construction
+
+`ArchiveBuilder::bulk` sorts resident entries in memory until it reaches its
+sort budget. Larger inputs spill into quota-charged merge runs. A directory
+whose entries fit one leaf can publish that leaf without a temporary node run.
+Resident and spilled construction share the same directory page boundaries.
+`finish_with_statistics` reports the scratch bytes used by runs.
 
 ## Allocation-sensitive reads
 
@@ -55,9 +76,49 @@ view pins its page outside the store cache's residency budget.
 `v1::wire::FrameEncoder` and `FrameDecoder` provide reusable workspaces and
 native codec contexts. Raw frame views borrow input without moving the payload;
 compressed views borrow the decoder's reusable output. Native writers compute
-canonical identity once per inserted object.
+canonical identity from the caller's bytes before allocating a new object.
+For compressed writes, the encoder assembles the domain and canonical bytes in
+its existing reusable buffer, hashes that contiguous input, then compresses the
+canonical portion without assembling it again. A matching canonical ID permits
+reuse across relocated child hints; physical locators are always encoded from
+the current references. An unused preparation cannot supply bytes for a different
+ID. Raw writes and control objects retain bounded stack hashing.
+Compressed reads place decoded bytes after the identity domain in the existing
+output buffer and hash the complete contiguous input. Borrowed views exclude
+that domain; owned reads remove it with the canonical header and child IDs.
+Compression uses the direct complete-frame Zstandard API with a reusable
+context and the selected level; it retains the same raw fallback and compressed
+bytes as the bulk API. Native decoding checks single-block frame extents from
+the already parsed header, including RLE storage and optional checksum bytes.
+Multi-block frames use Zstandard's general extent parser. Both paths still
+decompress and authenticate the entire canonical object before returning it.
+Object hashing batches the domain, header and child IDs into 4 KiB stack
+scratch, filling the last batch from the body before streaming its remainder.
+Objects that fit use a single BLAKE3 call. This avoids per-child hash updates
+and enables SIMD from the first chunks without allocating or changing object
+ownership, cache weights or wire bytes.
+Domain-separated hashes likewise combine a short domain with the first input
+batch in stack scratch and stream the rest. Domains at least 4 KiB retain the
+ordinary incremental path. Decoder output and ownership remain unchanged.
+For memory-backed `ReadAt` sources, positional reads borrow the input frame
+through `ReadAt::slice_at`. They still authenticate each requested frame and
+return an owned canonical object.
 
 ## Caches
+
+The disposable append index stays resident within an 8 MiB default memory
+budget. `NativeStore::set_append_index_memory_budget` changes this limit;
+reducing it spills an oversized table without losing deduplication, and a
+failed spill preserves its previous table and limit. The conservative resident
+charge is available through `append_index_memory_bytes`. This budget is
+separate from decoded objects and survives disposable-cache clearing and
+compaction. The index stores each hash only in its key and retains its
+12-byte physical address as the value. Its mapped slots occupy 60 bytes. Full
+rewrite digests and physical-size estimates use 40-byte side records, buffered
+in batches of 64; their eight-byte record IDs share the same index. Both files
+and index resize overlap use the same temporary-storage budget. Side records
+retain the complete digest and never grant authority over an unauthenticated
+frame or a different physical occurrence.
 
 Native cache hits, inserts and evictions take constant time: decoded objects
 and authenticated occurrences are in hash maps with an exact
@@ -96,6 +157,14 @@ available.
 
 ## Verified objects and closure copies
 
+`ClosureCopy` shares a 16 MiB resident index allowance between remapping,
+physical validation, retained-root counts and the active traversal index.
+`set_index_memory_budget` changes that allowance; oversized tables spill
+without losing identities. `index_memory_bytes` reports the conservative
+resident charge between copies. Disk-only constructors start with a zero
+allowance. Traversal frames and the existing 1 MiB parent cache remain
+separately bounded.
+
 When a closure copy moves an object between native stores, the destination
 stores the Zstandard bytes of the source frame again. The bytes come from the
 read that authenticated the object, so a cache hit has none and the
@@ -104,11 +173,19 @@ also take the destination's encoder. A copy from a file that this library
 wrote has the same bytes with and without this path; a copy from a file with
 frames from a different encoder keeps those frames.
 
-A native writer checks each child of a put. A child with an authenticated
-occurrence in the cache needs no read. A child that the same writer appended
-needs none either: the writer's append index has the complete reference, and
-a reference with a different offset, length or hash is not equal to it. The
-writer reads and authenticates every other child. The index is empty after
+A native writer checks each child of a put. For freshly appended byte and opaque
+data objects whose bodies and decoded child vectors exceed 2 KiB, it caches
+authentication metadata and admits their decoded payloads on read. Small data
+objects and core structural pages retain immediate read-after-write caching.
+The first payload read of a large data object decompresses it normally, then
+caches it under the existing byte budget. This keeps streams of newly written
+data from displacing decoded tree pages. A child with an authenticated occurrence
+in the cache needs no read. The append index also authenticates children the writer
+appended when the hash, offset and length all match. The writer reads and
+authenticates every other child with a borrowed frame decoder. This records
+the child's type without creating a decoded cache entry or a child vector.
+The writer reuses its frame and decode buffers up to 256 KiB each and
+releases larger buffers after the operation. The index is empty after
 `discard_disposable_caches`, after maintenance and in a writer that opens an
 existing file. The writer does not read an appended frame again for this
 check, so the check does not find bytes that changed in the file after the
@@ -151,6 +228,13 @@ previous source locality plans are skipped. `ClosureCopy::update_retained_roots`
 tracks up to eight component roots and reports at most 512 removed objects per
 update so applications can bound obsolete derived resources in the catch-up
 tail. Callback or budget errors abort installation and preserve the source.
+
+Both ordinary and projected compaction can retain obsolete frames introduced
+during catch-up. The usual allowance is five percent of the candidate record
+bytes. A replacement can retain up to 16 MiB under the savings allowance,
+which uses half the estimated net space savings before publication.
+`CompactionBudget::max_garbage_bytes` caps both allowances. Catch-up work
+and cutover still use their separate byte and time limits.
 
 ## HTTP range reads
 

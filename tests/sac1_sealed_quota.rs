@@ -74,6 +74,7 @@ fn sealed_repack_preserves_the_callers_disposable_index_limit() {
     let path = directory.path().join("index-limited.sac");
     let (mut store, snapshot, _) = staged(&path);
     store.discard_disposable_caches();
+    store.set_append_index_memory_budget(0).unwrap();
     store.set_temporary_disk_budget(0).unwrap();
     store.set_total_temporary_disk_budget(64 << 20).unwrap();
     assert!(matches!(store.publish(snapshot), Err(Error::Limit(_))));

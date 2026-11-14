@@ -297,6 +297,86 @@ fn ordinary_refresh_prepares_large_delta_outside_the_final_fence() {
 }
 
 #[test]
+fn catch_up_retains_obsolete_frames_only_within_the_reclamation_budget() {
+    use sac::v1::{CompactionBudget, Error};
+
+    for refresh in [false, true] {
+        for (updates, limit, expect_replacement) in [
+            (8, u64::MAX, true),
+            (8, 16 * 1024, false),
+            (1, u64::MAX, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("live.sac");
+            let mut store = NativeStore::create_live(&path, [13; 16]).unwrap();
+            let payload = |sequence: u8| {
+                let mut bytes = vec![0; 256 * 1024];
+                blake3::Hasher::new()
+                    .update(&[sequence])
+                    .finalize_xof()
+                    .fill(&mut bytes);
+                bytes
+            };
+            for sequence in 0..updates {
+                publish(&mut store, &payload(sequence));
+            }
+            let old = store.pin().unwrap();
+            let mut job = store.begin_compaction().unwrap();
+            job.set_budget(CompactionBudget {
+                max_pause: std::time::Duration::from_secs(2),
+                max_garbage_bytes: limit,
+                ..Default::default()
+            })
+            .unwrap();
+            job.copy().unwrap();
+
+            let latest_value = payload(updates);
+            publish(&mut store, &latest_value);
+            let latest = store.root().unwrap();
+            let source_bytes = store.file_len();
+            let result = if refresh {
+                let source = store.pin().unwrap();
+                job.refresh_cancellable(&source, || false)
+                    .and_then(|()| store.finish_compaction(job))
+            } else {
+                store.finish_compaction(job)
+            };
+            if expect_replacement {
+                result.unwrap();
+                let stats = store.last_compaction_statistics().unwrap();
+                assert!(stats.residual_garbage_bytes > stats.copied_bytes / 20);
+                assert!(store.file_len() + 2 * stats.residual_garbage_bytes <= source_bytes);
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Limit("compaction live garbage allowance"))
+                ));
+                assert_eq!(store.file_len(), source_bytes);
+            }
+            assert_eq!(store.root().unwrap().root.hash, latest.root.hash);
+            store.validate().unwrap();
+            for (reader, expected) in [
+                (old, payload(updates - 1)),
+                (store.pin().unwrap(), latest_value),
+            ] {
+                let archive = ArchiveReader::open(
+                    &reader,
+                    reader.reader().snapshot().unwrap(),
+                    Limits::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    archive
+                        .read_range(&path_from_str("value").unwrap(), 0, expected.len())
+                        .unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn ordinary_refresh_rejects_wrong_source_cancellation_and_projection_mode() {
     let directory = tempfile::tempdir().unwrap();
     let mut store = NativeStore::create(

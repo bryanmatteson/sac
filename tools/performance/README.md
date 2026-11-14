@@ -22,6 +22,25 @@ Cases `lookup` and `read` exercise the existing owned lookup and streaming APIs.
 `write` and `compressed-write` append unique 1 MiB byte objects to a native store,
 using respectively relatively incompressible and repeated input bytes. Each
 case checks errors; range cases additionally check lengths or contents.
+`duplicate-write` puts an already indexed 1 MiB object into a native store
+and asserts that it reuses the existing reference with no append growth.
+`append-steady` writes unique compressed byte objects with a warmed encoder
+and a spilled index. `authenticate-steady` writes unique parents whose old
+compressed child must be read and authenticated on every put. Both disable
+the optional decoded cache and keep the index within one mapped capacity
+during measurement. `append-cached-steady` repeats the unique append with
+the default cache and warmed authentication-index capacity.
+These spill fixtures explicitly cap the append index at a 2,048-entry
+resident allowance, independently of the production default memory budget.
+`append-cache-churn` uses 32-byte payloads and a 4 KiB decoded cache so
+each append replaces a resident entry. These cases assert zero Rust
+allocations after warming.
+`rewrite-layout-steady` appends unique parents with eight old compressed child
+references, crossing buffered rewrite-record flushes while the address table
+stays within one capacity. It also asserts zero warmed Rust allocations and
+bounds scratch growth to the fixed-width provenance records.
+`positional-read` reads 4 KiB from a stored 1 MiB chunk in a byte-slice-backed
+sealed archive and checks the returned bytes on each iteration.
 `extent-read` adds a 1 MiB chunked file and reads 4 KiB across a 256 KiB chunk
 boundary with the owned range API. `extent-opened` measures that same range
 through an opened file into caller storage and checks exact byte equivalence.
@@ -40,9 +59,11 @@ pages alive separately from cache residency.
 `result.wall_ns` is elapsed time for that loop. Read timing from the binary built
 without `allocations`. `/usr/bin/time -lp` on macOS additionally reports whole
 process user/system CPU and peak RSS, including fixture setup, native codec
-allocations, cache residency, runtime and mapped libraries. Record host load and
-repeat cases in alternating baseline/candidate order. A busy host can inflate
-wall time, so report CPU and wall time independently.
+allocations, cache residency, runtime and mapped libraries. On macOS versions
+that expose retired instructions through `/usr/bin/time -l`, record that
+counter for each whole-process comparison. Record host load and repeat cases
+in alternating baseline/candidate order. A busy host can inflate wall time,
+so report CPU and wall time independently.
 
 The `allocations` feature measures Rust allocations on the current thread after
 warmup: total allocation calls, cumulative allocated bytes, peak additional

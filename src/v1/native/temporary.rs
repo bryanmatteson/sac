@@ -6,7 +6,7 @@ use super::*;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
-const SLOT: usize = 96;
+const SLOT: usize = 92;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use platform::Mapping;
 // Hosts without block reservation use positional I/O only.
@@ -187,16 +187,18 @@ impl Cell {
     }
 }
 
-pub(super) struct GraphTable {
+pub(super) type GraphTable = ValueGraphTable<44>;
+pub(super) type ReferenceTable = ValueGraphTable<12>;
+pub(super) struct ValueGraphTable<const VALUE_BYTES: usize> {
     resident: HashMap<Cell, Cell, TableHash>,
     resident_limit: usize,
-    disk: Option<DiskTable>,
+    disk: Option<DiskTable<VALUE_BYTES>>,
     // False only in a test of the positional I/O that a host without block
     // reservation uses.
     mapped: bool,
     pub(super) budget: Budget,
 }
-struct DiskTable {
+struct DiskTable<const VALUE_BYTES: usize> {
     // The slots of `file`, mapped. None on a host or filesystem that cannot
     // reserve blocks: the table then reads and writes each slot in the file.
     mapping: Option<Mapping>,
@@ -208,10 +210,11 @@ struct DiskTable {
     hasher: TableHash,
     _reservation: Reservation,
 }
-impl DiskTable {
+impl<const VALUE_BYTES: usize> DiskTable<VALUE_BYTES> {
+    const ROW_BYTES: usize = 48 + VALUE_BYTES;
     fn with_mapping(slots: u64, budget: &Budget, mapped: bool) -> Result<Self> {
         let size = slots
-            .checked_mul(SLOT as u64)
+            .checked_mul(Self::ROW_BYTES as u64)
             .ok_or(Error::Limit("temporary index bytes"))?;
         if size > MAX_DISK {
             return Err(Error::Limit("temporary index bytes"));
@@ -243,20 +246,29 @@ impl DiskTable {
         let mut row = [0; SLOT];
         match &self.mapping {
             Some(mapping) => {
-                let at = index as usize * SLOT;
-                row.copy_from_slice(&mapping.bytes()[at..at + SLOT]);
+                let at = index as usize * Self::ROW_BYTES;
+                row[..Self::ROW_BYTES].copy_from_slice(&mapping.bytes()[at..at + Self::ROW_BYTES]);
             }
-            None => read_at(&self.file, &mut row, index * SLOT as u64)?,
+            None => read_at(
+                &self.file,
+                &mut row[..Self::ROW_BYTES],
+                index * Self::ROW_BYTES as u64,
+            )?,
         }
         Ok(row)
     }
     fn set_row(&mut self, index: u64, row: &[u8; SLOT]) -> Result<()> {
         match &mut self.mapping {
             Some(mapping) => {
-                let at = index as usize * SLOT;
-                mapping.bytes_mut()[at..at + SLOT].copy_from_slice(row);
+                let at = index as usize * Self::ROW_BYTES;
+                mapping.bytes_mut()[at..at + Self::ROW_BYTES]
+                    .copy_from_slice(&row[..Self::ROW_BYTES]);
             }
-            None => write_at(&mut self.file, row, index * SLOT as u64)?,
+            None => write_at(
+                &mut self.file,
+                &row[..Self::ROW_BYTES],
+                index * Self::ROW_BYTES as u64,
+            )?,
         }
         Ok(())
     }
@@ -270,9 +282,13 @@ impl DiskTable {
             let found = match &self.mapping {
                 // Examine a mapped slot in place; copy only the selected one.
                 Some(mapping) => {
-                    let at = index as usize * SLOT;
-                    let row = &mapping.bytes()[at..at + SLOT];
-                    Self::selects(row, key).then(|| row.try_into().unwrap())
+                    let at = index as usize * Self::ROW_BYTES;
+                    let row = &mapping.bytes()[at..at + Self::ROW_BYTES];
+                    Self::selects(row, key).then(|| {
+                        let mut found = [0; SLOT];
+                        found[..Self::ROW_BYTES].copy_from_slice(row);
+                        found
+                    })
                 }
                 None => {
                     let row = self.row(index)?;
@@ -280,7 +296,9 @@ impl DiskTable {
                 }
             };
             if let Some(row) = found {
-                self._reservation.budget.read(probe * SLOT as u64);
+                self._reservation
+                    .budget
+                    .read(probe * Self::ROW_BYTES as u64);
                 return Ok((index, row));
             }
             index = (index + 1) & (self.slots - 1);
@@ -296,14 +314,14 @@ impl DiskTable {
         row[4..4 + key.len()].copy_from_slice(key);
         row[48..48 + value.len()].copy_from_slice(value);
         self.set_row(index, &row)?;
-        self._reservation.budget.wrote(SLOT as u64);
+        self._reservation.budget.wrote(Self::ROW_BYTES as u64);
         if old[0] == 0 {
             self.count += 1;
         }
         Ok(())
     }
 }
-impl GraphTable {
+impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
     pub const RESIDENT_ENTRIES: usize = 2048;
     pub fn new() -> Result<Self> {
         Ok(Self::with_budget(
@@ -312,6 +330,7 @@ impl GraphTable {
         ))
     }
     pub fn with_budget(resident_limit: usize, budget: Budget) -> Self {
+        const { assert!(VALUE_BYTES <= 44) };
         Self {
             resident: HashMap::default(),
             resident_limit,
@@ -335,7 +354,7 @@ impl GraphTable {
             Ok(None)
         } else {
             let length = row[2] as usize;
-            if length > 44 {
+            if length > VALUE_BYTES {
                 return Err(corrupt("temporary value length"));
             }
             Ok(Some(Cell::new(&row[48..48 + length])))
@@ -350,7 +369,7 @@ impl GraphTable {
         if cancelled() {
             return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
         }
-        if key.len() > 44 || value.len() > 44 {
+        if key.len() > 44 || value.len() > VALUE_BYTES {
             return Err(Error::Limit("temporary record"));
         }
         if self.disk.is_none() {
@@ -359,20 +378,7 @@ impl GraphTable {
                 self.resident.insert(cell, Cell::new(value));
                 return Ok(());
             }
-            // The first entry after the resident prefix moves the complete
-            // table to disk slots. A later lookup then examines one table.
-            let mut slots = 4096u64;
-            while (self.resident.len() as u64 + 1) * 2 > slots {
-                slots = slots
-                    .checked_mul(2)
-                    .ok_or(Error::Limit("temporary index slots"))?;
-            }
-            let mut disk = DiskTable::with_mapping(slots, &self.budget, self.mapped)?;
-            for (key, value) in &self.resident {
-                disk.insert(key.as_slice(), value.as_slice())?;
-            }
-            self.resident = HashMap::default();
-            self.disk = Some(disk);
+            self.spill_resident(cancelled)?;
         }
         if self.disk.as_ref().unwrap().count * 4 >= self.disk.as_ref().unwrap().slots * 3 {
             let old = self.disk.as_ref().unwrap();
@@ -388,7 +394,7 @@ impl GraphTable {
                     return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
                 }
                 let row = old.row(index)?;
-                self.budget.read(SLOT as u64);
+                self.budget.read(DiskTable::<VALUE_BYTES>::ROW_BYTES as u64);
                 if row[0] != 0 {
                     next.insert(&row[4..4 + row[1] as usize], &row[48..48 + row[2] as usize])?;
                 }
@@ -397,8 +403,53 @@ impl GraphTable {
         }
         self.disk.as_mut().unwrap().insert(key, value)
     }
+    // Reserve conservatively for HashMap bucket growth, control bytes and
+    // allocator overhead. This is a bound rather than payload-only counting.
+    const RESIDENT_ENTRY_BYTES: usize = 256;
+    const RESIDENT_FIXED_BYTES: usize = 512;
+    pub fn set_resident_memory_budget(&mut self, bytes: usize) -> Result<()> {
+        let limit = bytes.saturating_sub(Self::RESIDENT_FIXED_BYTES) / Self::RESIDENT_ENTRY_BYTES;
+        if self.disk.is_none() && self.resident.len() > limit {
+            self.spill_resident(&|| false)?;
+        }
+        self.resident_limit = limit;
+        Ok(())
+    }
+    pub fn resident_limit(&self) -> usize {
+        self.resident_limit
+    }
+    pub fn resident_memory_bytes(&self) -> usize {
+        if self.resident.is_empty() {
+            0
+        } else {
+            Self::RESIDENT_FIXED_BYTES + self.resident.len() * Self::RESIDENT_ENTRY_BYTES
+        }
+    }
+    fn spill_resident(&mut self, cancelled: &impl Fn() -> bool) -> Result<()> {
+        // Keep the resident map until the entire spill succeeds. A quota or
+        // I/O failure must leave every prior key available for a retry.
+        let mut slots = 4096u64;
+        while (self.resident.len() as u64 + 1) * 2 > slots {
+            slots = slots
+                .checked_mul(2)
+                .ok_or(Error::Limit("temporary index slots"))?;
+        }
+        let mut disk = DiskTable::with_mapping(slots, &self.budget, self.mapped)?;
+        for (key, value) in &self.resident {
+            if cancelled() {
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
+            }
+            disk.insert(key.as_slice(), value.as_slice())?;
+        }
+        self.resident = HashMap::default();
+        self.disk = Some(disk);
+        Ok(())
+    }
     pub fn disk_bytes(&self) -> Result<u64> {
-        Ok(self.disk.as_ref().map_or(0, |d| d.slots * SLOT as u64))
+        Ok(self
+            .disk
+            .as_ref()
+            .map_or(0, |d| d.slots * DiskTable::<VALUE_BYTES>::ROW_BYTES as u64))
     }
 }
 pub(super) struct FixedRecordStack<const N: usize> {
@@ -408,6 +459,18 @@ pub(super) struct FixedRecordStack<const N: usize> {
     reservation: Reservation,
 }
 impl<const N: usize> FixedRecordStack<N> {
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+    pub fn read(&self, index: u64) -> Result<[u8; N]> {
+        if index >= self.len {
+            return Err(corrupt("temporary record index"));
+        }
+        let mut row = [0; N];
+        read_at(&self.file, &mut row, index * N as u64)?;
+        self.reservation.budget.read(N as u64);
+        Ok(row)
+    }
     pub fn with_budget(budget: Budget) -> Result<Self> {
         Ok(Self {
             file: tempfile::tempfile()?,
@@ -472,6 +535,48 @@ impl<const N: usize> FixedRecordStack<N> {
     }
     pub fn disk_bytes(&self) -> u64 {
         self.capacity * N as u64
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn narrow_table_preserves_values_and_cancellation_across_mapped_and_io_growth() {
+    for mapped in [true, false] {
+        let budget = Budget::new(4 << 20);
+        let mut table = ReferenceTable::with_budget(8, budget.clone());
+        table.mapped = mapped;
+        for ordinal in 0..6144u32 {
+            let mut value = [0; 12];
+            value[..4].copy_from_slice(&ordinal.to_le_bytes());
+            value[4..].copy_from_slice(&(u64::from(ordinal) * 4096).to_le_bytes());
+            table
+                .insert_cancellable(&ordinal.to_le_bytes(), &value, &|| false)
+                .unwrap();
+        }
+        assert_eq!(table.disk_bytes().unwrap(), 8192 * 60);
+        let before = budget.used();
+        let calls = std::cell::Cell::new(0);
+        assert!(
+            table
+                .insert_cancellable(&6144u32.to_le_bytes(), &[1; 12], &|| {
+                    calls.set(calls.get() + 1);
+                    calls.get() > 32
+                })
+                .is_err()
+        );
+        assert_eq!(budget.used(), before);
+        assert!(table.get(&6144u32.to_le_bytes()).unwrap().is_none());
+        assert!(table.insert_cancellable(&[1], &[1; 13], &|| false).is_err());
+        for ordinal in (0..6144u32).step_by(17) {
+            let value = table.get(&ordinal.to_le_bytes()).unwrap().unwrap();
+            assert_eq!(&value[..4], &ordinal.to_le_bytes());
+            assert_eq!(&value[4..], &(u64::from(ordinal) * 4096).to_le_bytes());
+        }
+        table.insert_cancellable(&[1], &[7; 12], &|| false).unwrap();
+        assert_eq!(&table.get(&[1]).unwrap().unwrap()[..], &[7; 12]);
+        assert_eq!(table.disk_bytes().unwrap(), 16384 * 60);
+        drop(table);
+        assert_eq!(budget.used(), 0);
     }
 }
 

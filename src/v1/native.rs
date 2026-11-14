@@ -1,6 +1,7 @@
 //! Canonical native SAC1 storage. Published objects are immutable; only the
 //! fenced alternate slot changes in place. Disposable indexes confer no authority.
 use super::*;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -32,6 +33,7 @@ pub struct NativeStore {
     reused_unpublished: bool,
     file: Mutex<File>,
     append_buffer: Mutex<AppendBuffer>,
+    staging_destination_checked: Mutex<bool>,
     path: PathBuf,
     reader: Reader,
     end: u64,
@@ -49,6 +51,8 @@ pub struct NativeStore {
     publication_fault: Option<PublicationFault>,
     compression_level: i32,
     encoder: wire::FrameEncoder,
+    authentication: AuthenticationFrames,
+    rewrite_edges: Vec<ObjectRef>,
     compaction_active: Arc<std::sync::atomic::AtomicBool>,
     compaction_target: bool,
     recovery_preserved: Option<PathBuf>,
@@ -75,19 +79,53 @@ pub struct NativeStore {
 // No unflushed bytes confer durable authority, and a failed drain poisons
 // subsequent writes.
 const APPEND_BUFFER_BYTES: usize = 64 * 1024;
+const DEFAULT_APPEND_INDEX_MEMORY_BYTES: usize = 8 * 1024 * 1024;
+// Small data objects keep the immediate read-after-write fast path. Larger
+// data payloads enter the decoded cache on read, preserving structural pages.
+const MAX_CACHED_DATA_APPEND: usize = 2 * 1024;
+struct AppendObject<'a> {
+    kind: u16,
+    version: u16,
+    bytes: Cow<'a, [u8]>,
+    children: Cow<'a, [ObjectRef]>,
+}
+impl From<CanonicalObject> for AppendObject<'_> {
+    fn from(object: CanonicalObject) -> Self {
+        Self {
+            kind: object.kind,
+            version: object.version,
+            bytes: Cow::Owned(object.bytes),
+            children: Cow::Owned(object.children),
+        }
+    }
+}
 #[derive(Default)]
 struct AppendBuffer {
     offset: u64,
     bytes: Vec<u8>,
     failed: bool,
+    extent: AppendExtent,
+}
+#[derive(Default)]
+struct AppendExtent {
+    #[cfg(target_os = "macos")]
+    end: u64,
+    #[cfg(target_os = "macos")]
+    maximum: u64,
 }
 fn flush_append(file: &Mutex<File>, buffer: &Mutex<AppendBuffer>) -> Result<()> {
-    let mut buffer = buffer.lock().unwrap();
+    let mut guard = buffer.lock().unwrap();
+    let buffer = &mut *guard;
     if buffer.failed {
         return Err(Error::Poisoned);
     }
     if !buffer.bytes.is_empty() {
-        if let Err(error) = write_at(&mut file.lock().unwrap(), &buffer.bytes, buffer.offset) {
+        if let Err(error) = append_at(
+            &mut file.lock().unwrap(),
+            &buffer.bytes,
+            buffer.offset,
+            &mut buffer.extent,
+        ) {
             buffer.failed = true;
             return Err(error);
         }
@@ -100,32 +138,68 @@ fn append_frame(
     buffer: &Mutex<AppendBuffer>,
     offset: u64,
     frame: &[u8],
+    maximum: u64,
 ) -> Result<()> {
+    let mut guard = buffer.lock().unwrap();
+    let buffer = &mut *guard;
+    #[cfg(target_os = "macos")]
     {
-        let buffer = buffer.lock().unwrap();
-        if buffer.failed {
-            return Err(Error::Poisoned);
-        }
-        if !buffer.bytes.is_empty()
-            && buffer.offset.checked_add(buffer.bytes.len() as u64) != Some(offset)
-        {
-            return Err(corrupt("noncontiguous append buffer"));
+        buffer.extent.maximum = maximum;
+    }
+    let _ = maximum;
+    if buffer.failed {
+        return Err(Error::Poisoned);
+    }
+    if !buffer.bytes.is_empty()
+        && buffer.offset.checked_add(buffer.bytes.len() as u64) != Some(offset)
+    {
+        return Err(corrupt("noncontiguous append buffer"));
+    }
+    let mut offset = offset;
+    let mut remaining = frame;
+    if !buffer.bytes.is_empty() {
+        let copied = remaining
+            .len()
+            .min(APPEND_BUFFER_BYTES - buffer.bytes.len());
+        buffer.bytes.extend_from_slice(&remaining[..copied]);
+        remaining = &remaining[copied..];
+        offset += copied as u64;
+        if buffer.bytes.len() == APPEND_BUFFER_BYTES {
+            if let Err(error) = append_at(
+                &mut file.lock().unwrap(),
+                &buffer.bytes,
+                buffer.offset,
+                &mut buffer.extent,
+            ) {
+                buffer.failed = true;
+                return Err(error);
+            }
+            buffer.bytes.clear();
         }
     }
-    if buffer.lock().unwrap().bytes.len() + frame.len() > APPEND_BUFFER_BYTES {
-        flush_append(file, buffer)?;
-    }
-    let mut buffer = buffer.lock().unwrap();
-    if frame.len() >= APPEND_BUFFER_BYTES {
-        if let Err(error) = write_at(&mut file.lock().unwrap(), frame, offset) {
+    // Pack complete buffer-sized writes across frame boundaries. Large frames
+    // still write directly, in one call for their full-sized prefix; only their
+    // final short tail occupies the existing buffer. Publication and reads can
+    // flush that tail normally, including a partially persisted frame.
+    let direct = remaining.len() / APPEND_BUFFER_BYTES * APPEND_BUFFER_BYTES;
+    if direct != 0 {
+        if let Err(error) = append_at(
+            &mut file.lock().unwrap(),
+            &remaining[..direct],
+            offset,
+            &mut buffer.extent,
+        ) {
             buffer.failed = true;
             return Err(error);
         }
-    } else {
+        remaining = &remaining[direct..];
+        offset += direct as u64;
+    }
+    if !remaining.is_empty() {
         if buffer.bytes.is_empty() {
             buffer.offset = offset;
         }
-        buffer.bytes.extend_from_slice(frame);
+        buffer.bytes.extend_from_slice(remaining);
     }
     Ok(())
 }
@@ -223,6 +297,7 @@ impl NativeStore {
             reused_unpublished: false,
             file: Mutex::new(file),
             append_buffer: Mutex::new(AppendBuffer::default()),
+            staging_destination_checked: Mutex::new(false),
             path,
             reader: Reader::from_parts(preamble, None, first, Vec::new()),
             end: first,
@@ -238,6 +313,8 @@ impl NativeStore {
             publication_fault: None,
             compression_level: 1,
             encoder: wire::FrameEncoder::default(),
+            authentication: AuthenticationFrames::default(),
+            rewrite_edges: Vec::new(),
             compaction_target: false,
             recovery_preserved: None,
             last_compaction_statistics: None,
@@ -309,6 +386,7 @@ impl NativeStore {
             reused_unpublished: false,
             file: Mutex::new(file),
             append_buffer: Mutex::new(AppendBuffer::default()),
+            staging_destination_checked: Mutex::new(false),
             path,
             reader,
             end,
@@ -324,6 +402,8 @@ impl NativeStore {
             publication_fault: None,
             compression_level: 1,
             encoder: wire::FrameEncoder::default(),
+            authentication: AuthenticationFrames::default(),
+            rewrite_edges: Vec::new(),
             compaction_target: false,
             recovery_preserved: None,
             last_compaction_statistics: None,
@@ -400,12 +480,24 @@ impl NativeStore {
     pub fn set_encode_threads(&mut self, threads: usize) {
         self.encode_threads = threads.clamp(1, 64);
     }
-    /// The check before each write: the destination name, in the directory
-    /// that this writer opened, still names this writer's file. One lookup
-    /// from the open directory replaces a walk of the complete path. A
-    /// replaced or removed destination file fails here. A replaced ancestor
-    /// directory does not; every publication and maintenance operation
-    /// examines the complete path with [`Self::verify_current_path`].
+    /// Check the destination at the beginning of a staged publication.
+    /// Immutable object appends stay private to this open descriptor; checking
+    /// every object adds no publication authority. Publication checks the
+    /// complete path again before its commit write and after durability.
+    fn begin_staging(&self) -> Result<()> {
+        let mut checked = self
+            .staging_destination_checked
+            .lock()
+            .map_err(|_| Error::Poisoned)?;
+        if !*checked {
+            self.verify_destination_entry()?;
+            *checked = true;
+        }
+        Ok(())
+    }
+    /// The destination name in the directory this writer opened must still
+    /// name its file. Publication and maintenance additionally examine the
+    /// complete path, including ancestor directories.
     fn verify_destination_entry(&self) -> Result<()> {
         #[cfg(unix)]
         if let (Some(directory), Some(name)) = (&self.directory, self.path.file_name()) {
@@ -484,16 +576,27 @@ impl NativeStore {
     pub fn set_decoded_cache_budget(&self, bytes: usize) {
         self.cache.lock().unwrap().set_budget(bytes);
     }
+    /// Bound the resident append-ID index independently of decoded objects.
+    /// The default is 8 MiB. Lowering this budget spills an oversized table;
+    /// lookups and deduplication remain exact after the spill. A failed spill
+    /// preserves the current table and its prior memory limit.
+    pub fn set_append_index_memory_budget(&mut self, bytes: usize) -> Result<()> {
+        self.recent.0.set_resident_memory_budget(bytes)
+    }
+    /// Conservative resident allocation charge for the append-ID index.
+    pub fn append_index_memory_bytes(&self) -> usize {
+        self.recent.0.resident_memory_bytes()
+    }
     /// Release optional decoded/authentication entries and the disposable
     /// append-ID table. No published bytes are read or rewritten, and a later
     /// put may append a duplicate rather than scan historical frames.
     pub fn discard_disposable_caches(&mut self) {
         self.cache.lock().unwrap().clear();
+        self.authentication = AuthenticationFrames::default();
+        self.rewrite_edges = Vec::new();
         let budget = self.recent.0.budget.clone();
-        self.recent = DiskRefs(temporary::GraphTable::with_budget(
-            temporary::GraphTable::RESIDENT_ENTRIES,
-            budget,
-        ));
+        let resident = self.recent.0.resident_limit();
+        self.recent = DiskRefs::with_budget(resident, budget);
     }
     pub fn cache_usage(&self) -> CacheUsage {
         self.cache.lock().unwrap().usage()
@@ -522,6 +625,16 @@ impl NativeStore {
     pub fn set_file_byte_limit(&mut self, max_bytes: u64) -> Result<()> {
         if self.end > max_bytes {
             return Err(Error::Limit("native file bytes"));
+        }
+        trim_append_extent(
+            self.file.get_mut().unwrap(),
+            self.append_buffer.get_mut().unwrap(),
+            self.end,
+        )?;
+        #[cfg(target_os = "macos")]
+        {
+            let extent = &mut self.append_buffer.get_mut().unwrap().extent;
+            extent.maximum = extent.maximum.min(max_bytes);
         }
         self.max_file_bytes = max_bytes;
         Ok(())
@@ -657,6 +770,10 @@ impl NativeStore {
         let result = self.publish_commit_inner(commit);
         if result.is_ok() {
             self.reused_unpublished = false;
+            *self
+                .staging_destination_checked
+                .get_mut()
+                .map_err(|_| Error::Poisoned)? = false;
         }
         if result.is_err() {
             self.poisoned = true;
@@ -692,6 +809,11 @@ impl NativeStore {
         }
         validate_core_object(&object)?;
         if self.root().is_some_and(|p| p.root.hash == commit.hash) {
+            trim_append_extent(
+                self.file.get_mut().map_err(|_| Error::Poisoned)?,
+                self.append_buffer.get_mut().map_err(|_| Error::Poisoned)?,
+                self.end,
+            )?;
             return Ok(self.root().unwrap());
         }
         let cbor::Value::Array(fields) = cbor::decode(&object.bytes)? else {
@@ -800,15 +922,25 @@ impl NativeStore {
             committed_end,
             commit,
         };
+        // Objects may have been staged for many functions since the initial
+        // destination check. A replacement/removal cannot acquire this commit.
+        self.verify_current_path()?;
         self.reserve_temporary_extent(committed_end)?;
         flush_append(&self.file, &self.append_buffer)?;
-        write_at(
+        append_at(
             self.file.get_mut().unwrap(),
             &trailer.encode(),
             trailer_offset,
+            &mut self.append_buffer.get_mut().unwrap().extent,
         )
         .inspect_err(|_| self.poisoned = true)?;
         self.end = committed_end;
+        trim_append_extent(
+            self.file.get_mut().unwrap(),
+            self.append_buffer.get_mut().unwrap(),
+            self.end,
+        )
+        .inspect_err(|_| self.poisoned = true)?;
         self.io.publications.lock().unwrap().appended_bytes += 160;
         self.poisoned = true;
         {
@@ -925,14 +1057,13 @@ impl NativeStore {
         file.try_lock().map_err(lock_error)?;
         _source_extent = self.temporary_extent.replace(replacement_extent);
         self.file = Mutex::new(file);
+        self.append_buffer.get_mut().unwrap().extent = AppendExtent::default();
         self.node = std::sync::OnceLock::new();
         self.pending = Some(pending);
         self.end = 128;
         let index_budget = self.recent.0.budget.clone();
-        self.recent = DiskRefs(temporary::GraphTable::with_budget(
-            temporary::GraphTable::RESIDENT_ENTRIES,
-            index_budget,
-        ));
+        let resident = self.recent.0.resident_limit();
+        self.recent = DiskRefs::with_budget(resident, index_budget);
         self.file_identity = next_file_identity();
         self.generation = Arc::new(FileGeneration::default());
         // Defer requested bootstrap roots and their ancestors until all other
@@ -947,10 +1078,8 @@ impl NativeStore {
         controls.insert(object.children[snapshot_index].hash);
         validate_closure_tracked(&source, Some(commit), &|| false, Some(aggregate.clone()))?;
         let workspace = temporary::Budget::child(temporary::MAX_DISK, aggregate);
-        let mut copied = DiskRefs(temporary::GraphTable::with_budget(
-            temporary::GraphTable::RESIDENT_ENTRIES,
-            workspace.clone(),
-        ));
+        let mut copied =
+            DiskRefs::with_budget(temporary::GraphTable::RESIDENT_ENTRIES, workspace.clone());
         let mut planned = temporary::GraphTable::with_budget(
             temporary::GraphTable::RESIDENT_ENTRIES,
             workspace.clone(),
@@ -1094,30 +1223,46 @@ impl NativeStore {
         Ok(())
     }
     fn append_object(&mut self, object: CanonicalObject) -> Result<ObjectRef> {
-        let hash = object.hash();
-        self.append_hashed(object, hash)
-    }
-    fn append_hashed(&mut self, object: CanonicalObject, hash: ObjectHash) -> Result<ObjectRef> {
-        self.append_encoded(object, hash, None, None)
+        let hash = self.encoder.prepare_hash(
+            object.kind,
+            object.version,
+            &object.bytes,
+            &object.children,
+            self.compression_level,
+        );
+        self.append_encoded(object.into(), hash, None, None)
     }
     /// `prepared` is the frame of `object` at this store's compression level.
     /// `compressed` is the Zstandard encoding of its canonical bytes.
     fn append_encoded(
         &mut self,
-        object: CanonicalObject,
+        object: AppendObject<'_>,
         hash: ObjectHash,
         prepared: Option<Vec<u8>>,
         compressed: Option<&[u8]>,
     ) -> Result<ObjectRef> {
+        let AppendObject {
+            kind,
+            version,
+            bytes,
+            children,
+        } = object;
         let frame: &[u8] = match (&prepared, compressed) {
             (Some(frame), _) => frame,
-            (None, Some(compressed)) => self.encoder.encode_stored(&object, hash, compressed)?,
-            (None, None) => self
+            (None, Some(compressed)) => self
                 .encoder
-                .encode_hashed(&object, self.compression_level, hash)?,
+                .encode_stored(kind, version, &bytes, &children, hash, compressed)?,
+            (None, None) => self.encoder.encode_parts(
+                kind,
+                version,
+                &bytes,
+                &children,
+                self.compression_level,
+                hash,
+            )?,
         };
         #[cfg(unix)]
-        if object.kind == 7
+        if kind == 7
             && let Some(offset) = self
                 .free_frames
                 .as_mut()
@@ -1157,8 +1302,20 @@ impl NativeStore {
         if let Some(reservation) = &mut self.temporary_extent {
             reservation.grow_to(next)?;
         }
-        append_frame(&self.file, &self.append_buffer, self.end, frame)
-            .inspect_err(|_| self.poisoned = true)?;
+        let extension_limit =
+            if self.reader.publication.is_some() && self.temporary_extent.is_none() {
+                self.max_file_bytes
+            } else {
+                next
+            };
+        append_frame(
+            &self.file,
+            &self.append_buffer,
+            self.end,
+            frame,
+            extension_limit,
+        )
+        .inspect_err(|_| self.poisoned = true)?;
         self.end = next;
         self.io.publications.lock().unwrap().appended_bytes += frame.len() as u64;
         self.generation.unpublished.store(
@@ -1171,22 +1328,37 @@ impl NativeStore {
         // Directory pages and expensive generic fanouts can carry exact edges
         // across staged rewrites. The policy depends on physical cost, never a
         // product's kind IDs. Byte objects and cheap fanouts need no index row.
-        let costly_fanout = object.children.len() >= 8
-            && object
-                .children
+        let costly_fanout = children.len() >= 8
+            && children
                 .iter()
                 .map(|child| u64::from(child.address.length))
                 .sum::<u64>()
                 > u64::from(reference.address.length) * 2;
-        if !object.children.is_empty() && (matches!(object.kind, 3 | 4) || costly_fanout) {
+        if !children.is_empty() && (matches!(kind, 3 | 4) || costly_fanout) {
             self.recent
-                .record_rewrite_layout(reference, &object.children)
+                .record_rewrite_layout(reference, &children)
                 .inspect_err(|_| self.poisoned = true)?;
         }
         let mut cache = self.cache.lock().unwrap();
-        let object_type = (object.kind, object.version);
-        cache.insert_shared(self.file_identity, reference, &Arc::new(object));
-        cache.verify(self.file_identity, reference, object_type);
+        // Data objects typically feed parents through their references. Their
+        // append provenance already authenticates that use; eagerly copying
+        // large bodies or child vectors only displaces decoded tree pages.
+        // Structural objects keep their read-after-write locality at any size.
+        let structural = matches!(kind, 1..=6 | 8 | 9);
+        let decoded_size = bytes.len() + std::mem::size_of_val(children.as_ref());
+        if structural || decoded_size <= MAX_CACHED_DATA_APPEND {
+            cache.admit_append(
+                self.file_identity,
+                reference,
+                AppendObject {
+                    kind,
+                    version,
+                    bytes,
+                    children,
+                },
+            );
+        }
+        cache.verify(self.file_identity, reference, (kind, version));
         Ok(reference)
     }
     pub fn rehint(&self, source: &NativeReader, reference: ObjectRef) -> Result<Option<ObjectRef>> {
@@ -1291,6 +1463,7 @@ impl ObjectStore for NativeStore {
         }
         self.check_writable()?;
         let level = self.compression_level;
+        let recent = &self.recent;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let encode = || -> Result<Vec<(usize, PreparedObject)>> {
             let mut encoder = wire::FrameEncoder::default();
@@ -1301,14 +1474,21 @@ impl ObjectStore for NativeStore {
                     return Ok(encoded);
                 };
                 check_input(body, &[])?;
+                let hash = encoder.prepare_hash(kind, version, body, &[], level);
                 let object = CanonicalObject {
                     kind,
                     version,
                     bytes: body.to_vec(),
                     children: Vec::new(),
                 };
-                let hash = object.hash();
-                let frame = encoder.encode_hashed(&object, level, hash)?.to_vec();
+                // A duplicate in the writer's append index will normally be
+                // reused by put_prepared. It still checks the destination
+                // there, and can encode if the index or writer changed.
+                let frame = if recent.get(hash)?.is_some() {
+                    None
+                } else {
+                    Some(encoder.encode_hashed(&object, level, hash)?.to_vec())
+                };
                 encoded.push((
                     index,
                     PreparedObject {
@@ -1356,21 +1536,21 @@ impl ObjectStore for NativeStore {
         }
         // The checks of `put` for an object that has no children.
         self.check_writable()?;
-        self.verify_destination_entry()?;
+        self.begin_staging()?;
         if let Some(reference) = self
             .root()
             .map(|p| p.root)
             .filter(|r| r.hash == hash)
             .or_else(|| self.reader.snapshot().filter(|r| r.hash == hash))
         {
-            self.validate_reference(reference)?;
+            self.admit_duplicate(reference)?;
             return Ok(reference);
         }
         if let Some(reference) = self.recent.get(hash)? {
-            self.validate_reference(reference)?;
+            self.admit_duplicate(reference)?;
             return Ok(reference);
         }
-        self.append_encoded(object, hash, Some(frame), None)
+        self.append_encoded(object.into(), hash, frame, None)
     }
     fn put_verified(
         &mut self,
@@ -1391,7 +1571,7 @@ impl ObjectStore for NativeStore {
     }
     fn rewrite_source(&self, parent: ObjectRef) -> Result<Option<RewriteSource>> {
         self.check_writable()?;
-        self.verify_destination_entry()?;
+        self.begin_staging()?;
         let committed_end = self.reader.committed_end();
         let readable_end = self.physical_read_scope().unwrap().end;
         wire::validate_address(
@@ -1444,7 +1624,7 @@ impl ObjectStore for NativeStore {
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
         self.check_writable()?;
-        self.verify_destination_entry()?;
+        self.begin_staging()?;
         let current_end = self.physical_read_scope().unwrap().end;
         if source.identity != self.file_identity
             || source.committed_end > self.reader.committed_end()
@@ -1459,19 +1639,20 @@ impl ObjectStore for NativeStore {
             self.reader.first_record_offset(),
             source.readable_end,
         )?;
-        if let Some(layout) = source.staged_layout {
+        self.rewrite_edges.clear();
+        self.rewrite_edges
+            .extend_from_slice(&source.object.children);
+        self.rewrite_edges.sort_unstable();
+        if source.staged_layout.is_some() {
             // Cached children need no waiver. Select the strict path before
             // any parent re-read when its remaining exact inherited edges do
             // not repay the bounded source/layout authentication work.
-            let mut prior = source.object.children.iter().collect::<Vec<_>>();
-            prior.sort_unstable();
             let mut cache = self.cache.lock().unwrap();
             let unverified_bytes: u64 = children
                 .iter()
                 .filter(|child| {
-                    prior.binary_search(child).is_ok()
-                        && !cache.verified(self.file_identity, **child)
-                        && cache.get(self.file_identity, **child).is_none()
+                    self.rewrite_edges.binary_search(child).is_ok()
+                        && !cache.admits_child(self.file_identity, **child)
                 })
                 .map(|child| u64::from(child.address.length))
                 .sum();
@@ -1483,23 +1664,24 @@ impl ObjectStore for NativeStore {
             // child/layout status into a shared cache. This also detects a
             // changed locator table after the opaque capability was issued.
             flush_append(&self.file, &self.append_buffer)?;
-            let mut frame = vec![0; source.parent.address.length as usize];
-            counted_read_at(
-                &self.file.lock().unwrap(),
-                &mut frame,
-                source.parent.address.offset,
+            let actual = self.authentication.get(
+                self.file.get_mut().unwrap(),
                 &self.io,
-                ReadClass::Object,
-            )?;
-            let actual = wire::decode_frame_owned(
-                source.parent,
-                frame,
                 self.reader.first_record_offset(),
                 source.readable_end,
-            )?;
-            if actual.children != source.object.children
-                || spill::rewrite_layout(&actual.children) != layout
-            {
+                source.parent,
+            );
+            let same_layout = actual.map(|actual| {
+                actual.child_count() == source.object.children.len()
+                    && source
+                        .object
+                        .children
+                        .iter()
+                        .enumerate()
+                        .all(|(index, child)| actual.child(index) == Some(*child))
+            });
+            self.authentication.trim();
+            if !same_layout? {
                 return Err(corrupt("staged rewrite source layout changed"));
             }
         }
@@ -1508,37 +1690,69 @@ impl ObjectStore for NativeStore {
 }
 
 impl NativeStore {
+    fn admit_duplicate(&mut self, reference: ObjectRef) -> Result<()> {
+        let scope = self.physical_read_scope().unwrap();
+        wire::validate_address(reference.address, scope.first, scope.end)?;
+        if self
+            .cache
+            .lock()
+            .unwrap()
+            .admits_child(scope.identity, reference)
+        {
+            return Ok(());
+        }
+        self.authenticate_child(reference)
+    }
+
+    /// Authenticate a reference for a put without materializing an owned
+    /// object. Repeated checks only need the exact occurrence and its type.
+    fn authenticate_child(&mut self, child: ObjectRef) -> Result<()> {
+        let scope = self.physical_read_scope().unwrap();
+        let end = self.readable_frame_end(child, scope.end)?;
+        let result = self
+            .authentication
+            .get(
+                self.file.get_mut().unwrap(),
+                &self.io,
+                scope.first,
+                end,
+                child,
+            )
+            .map(|view| (view.kind, view.version));
+        self.authentication.trim();
+        let object_type = result?;
+        self.cache
+            .lock()
+            .unwrap()
+            .verify(scope.identity, child, object_type);
+        Ok(())
+    }
+
+    fn readable_frame_end(&self, reference: ObjectRef, end: u64) -> Result<u64> {
+        wire::validate_address(reference.address, self.reader.first_record_offset(), end)?;
+        let pending = self.append_buffer.lock().unwrap();
+        if pending.failed {
+            return Err(Error::Poisoned);
+        }
+        if !pending.bytes.is_empty() {
+            if reference.address.offset + u64::from(reference.address.length) <= pending.offset {
+                // Read-ahead for an inherited frame stops before the pending
+                // suffix, so the caller can keep the appends coalesced.
+                return Ok(end.min(pending.offset));
+            }
+            drop(pending);
+            flush_append(&self.file, &self.append_buffer)?;
+        }
+        Ok(end)
+    }
+
     fn shared_keeping(&self, r: ObjectRef, keep: bool) -> Result<ObjectRead> {
         let end = self.physical_read_scope().unwrap().end;
         wire::validate_address(r.address, self.reader.first_record_offset(), end)?;
         if let Some(object) = self.cache.get(self.file_identity, r) {
             return Ok((object, None));
         }
-        let mut disk_end = if self.end == self.reader.committed_end() {
-            self.reader.trailer_offset()
-        } else {
-            self.end
-        };
-        let needs_flush = {
-            let buffer = self.append_buffer.lock().unwrap();
-            if buffer.failed {
-                return Err(Error::Poisoned);
-            }
-            if buffer.bytes.is_empty() {
-                false
-            } else if r.address.offset + u64::from(r.address.length) <= buffer.offset {
-                // An inherited lookup cannot observe the pending suffix. Keep
-                // small appends coalesced and cap read-ahead at the written
-                // prefix, so a metadata window never includes unflushed bytes.
-                disk_end = disk_end.min(buffer.offset);
-                false
-            } else {
-                true
-            }
-        };
-        if needs_flush {
-            flush_append(&self.file, &self.append_buffer)?;
-        }
+        let disk_end = self.readable_frame_end(r, end)?;
         read_object_keeping(
             &self.file.lock().unwrap(),
             self.reader.header.first_record_offset(),
@@ -1562,7 +1776,7 @@ impl NativeStore {
         compressed: Option<&[u8]>,
     ) -> Result<ObjectRef> {
         self.check_writable()?;
-        self.verify_destination_entry()?;
+        self.begin_staging()?;
         check_input(bytes, children).inspect_err(|error| {
             eprintln!(
                 "canonical physical size rejected: kind={kind} version={version} payload_bytes={} children={}: {error}",
@@ -1570,33 +1784,10 @@ impl NativeStore {
                 children.len(),
             );
         })?;
-        let object = CanonicalObject {
-            kind,
-            version,
-            bytes: bytes.into(),
-            children: children.into(),
-        };
-        // At most 1024 pointers, released before this write returns. No
-        // inherited edge is added to the authenticated-child cache.
-        let inherited = source.map(|source| {
-            let mut references = source.object.children.iter().collect::<Vec<_>>();
-            references.sort_unstable();
-            references
-        });
         for child in children {
             wire::validate_address(child.address, self.reader.first_record_offset(), self.end)?;
-            if inherited
-                .as_ref()
-                .is_some_and(|prior| prior.binary_search(&child).is_ok())
-            {
-                continue;
-            }
-            if self
-                .cache
-                .lock()
-                .unwrap()
-                .verified(self.file_identity, *child)
-            {
+            // Inherited exact edges never enter the authentication cache.
+            if source.is_some() && self.rewrite_edges.binary_search(child).is_ok() {
                 continue;
             }
             // The append index has only the frames that this writer wrote
@@ -1604,50 +1795,66 @@ impl NativeStore {
             // authenticated its object. An entry equal to the complete
             // reference is that authentication without its cache entry: a
             // different offset or length is not equal and is read.
-            if self.recent.get(child.hash)? == Some(*child) {
+            let in_suffix = child.address.offset >= self.reader.committed_end();
+            if (in_suffix && self.recent.get(child.hash)? == Some(*child))
+                || self
+                    .cache
+                    .lock()
+                    .unwrap()
+                    .admits_child(self.file_identity, *child)
+                || (!in_suffix && self.recent.get(child.hash)? == Some(*child))
+            {
                 continue;
             }
-            let object = self.get_shared(*child)?;
-            self.cache.lock().unwrap().verify(
-                self.file_identity,
-                *child,
-                (object.kind, object.version),
-            );
+            self.authenticate_child(*child)?;
         }
         // The prior occurrence is a bounded exact no-op candidate even when
         // disposable ID lookup was discarded. Compare full physical edges:
         // canonical ID equality alone cannot establish unchanged locators.
         if let Some(source) = source
-            && object.kind == source.object.kind
-            && object.version == source.object.version
-            && object.bytes == source.object.bytes
-            && object.children == source.object.children
+            && kind == source.object.kind
+            && version == source.object.version
+            && bytes == source.object.bytes
+            && children == source.object.children
         {
             return Ok(source.parent);
         }
-        let hash = authenticated_hash.unwrap_or_else(|| object.hash());
+        let hash = authenticated_hash.unwrap_or_else(|| {
+            self.encoder
+                .prepare_hash(kind, version, bytes, children, self.compression_level)
+        });
         if let Some(reference) = self
             .root()
             .map(|p| p.root)
             .filter(|r| r.hash == hash)
             .or_else(|| self.reader.snapshot().filter(|r| r.hash == hash))
         {
-            self.validate_reference(reference)?;
+            self.admit_duplicate(reference)?;
             return Ok(reference);
         }
         if let Some(reference) = self.recent.get(hash)? {
-            self.validate_reference(reference)?;
+            self.admit_duplicate(reference)?;
             return Ok(reference);
         }
         // Zstandard bytes that a source authenticated as this object are
         // what this store's encoder makes from the same canonical bytes.
         // Store them again unless this store would keep the object raw.
-        let compressed = compressed.filter(|bytes| {
+        let compressed = compressed.filter(|&stored| {
             self.compression_level != 0
-                && !matches!(object.kind, 1 | 2)
-                && <[u8]>::len(bytes) < object.canonical_len()
+                && !matches!(kind, 1 | 2)
+                && stored.len() < 8 + 32 * children.len() + bytes.len()
         });
-        self.append_encoded(object, hash, None, compressed)
+        self.append_encoded(
+            AppendObject {
+                kind,
+                version,
+                bytes: Cow::Borrowed(bytes),
+                children: Cow::Borrowed(children),
+            },
+            hash,
+            None,
+            compressed,
+        )
     }
 }
 
@@ -2125,6 +2332,38 @@ fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> Result<()> {
     }
     Ok(())
 }
+// macOS can speculatively allocate well beyond extending writes. Write inside
+// a bounded sparse extent instead, amortizing length changes over 1 MiB. Its
+// ceiling is the writer's file limit, or the already reserved staging extent.
+// Publication and a new file limit trim unused headroom before returning.
+fn append_at(file: &mut File, buffer: &[u8], offset: u64, extent: &mut AppendExtent) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let end = offset
+            .checked_add(buffer.len() as u64)
+            .ok_or(Error::Limit("append extent"))?;
+        if end > extent.end {
+            const QUANTUM: u64 = 1024 * 1024;
+            let rounded = end
+                .checked_add(QUANTUM - 1)
+                .map_or(end, |n| n & !(QUANTUM - 1));
+            let next = rounded.min(extent.maximum).max(end);
+            file.set_len(next)?;
+            extent.end = next;
+        }
+    }
+    let _ = extent;
+    write_at(file, buffer, offset)
+}
+fn trim_append_extent(file: &mut File, buffer: &mut AppendBuffer, end: u64) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if buffer.extent.end > end {
+        file.set_len(end)?;
+        buffer.extent.end = end;
+    }
+    let _ = (file, buffer, end);
+    Ok(())
+}
 fn write_at(file: &mut File, buffer: &[u8], offset: u64) -> Result<()> {
     #[cfg(unix)]
     {
@@ -2222,30 +2461,51 @@ impl Drop for ValidationCacheGuard {
         self.cache.lock().unwrap().set_budget(self.old);
     }
 }
-struct ValidationFrames<'a> {
-    file: &'a File,
-    io: &'a PhysicalCounters,
-    first: u64,
-    end: u64,
+#[derive(Default)]
+struct AuthenticationFrames {
     bytes: Vec<u8>,
     decoder: wire::FrameDecoder,
 }
-impl ValidationFrames<'_> {
-    fn get(&mut self, reference: ObjectRef) -> Result<wire::FrameView<'_>> {
-        wire::validate_address(reference.address, self.first, self.end)?;
+impl AuthenticationFrames {
+    fn trim(&mut self) {
+        // Bound idle scratch independently of the largest authenticated
+        // object. Keep the decoder context when dropping oversized output.
+        const RETAINED_BUFFER_LIMIT: usize = 256 * 1024;
+        if self.bytes.capacity() > RETAINED_BUFFER_LIMIT {
+            self.bytes = Vec::new();
+        }
+        self.decoder.trim_buffer(RETAINED_BUFFER_LIMIT);
+    }
+
+    fn get(
+        &mut self,
+        file: &File,
+        io: &PhysicalCounters,
+        first: u64,
+        end: u64,
+        reference: ObjectRef,
+    ) -> Result<wire::FrameView<'_>> {
+        wire::validate_address(reference.address, first, end)?;
         let length = reference.address.length as usize;
         if self.bytes.len() < length {
             self.bytes.resize(length, 0);
         }
         let bytes = &mut self.bytes[..length];
-        counted_read_at(
-            self.file,
-            bytes,
-            reference.address.offset,
-            self.io,
-            ReadClass::Object,
-        )?;
-        self.decoder.decode(reference, bytes, self.first, self.end)
+        counted_read_at(file, bytes, reference.address.offset, io, ReadClass::Object)?;
+        self.decoder.decode(reference, bytes, first, end)
+    }
+}
+struct ValidationFrames<'a> {
+    file: &'a File,
+    io: &'a PhysicalCounters,
+    first: u64,
+    end: u64,
+    frames: AuthenticationFrames,
+}
+impl ValidationFrames<'_> {
+    fn get(&mut self, reference: ObjectRef) -> Result<wire::FrameView<'_>> {
+        self.frames
+            .get(self.file, self.io, self.first, self.end, reference)
     }
 }
 fn validate_physical_closure(
@@ -2342,8 +2602,7 @@ fn validate_physical_closure(
         io,
         first: reader.first_record_offset(),
         end: reader.trailer_offset(),
-        bytes: Vec::new(),
-        decoder: wire::FrameDecoder::default(),
+        frames: AuthenticationFrames::default(),
     };
     // In this traversal the stack flag carries authentication of a byte
     // leaf from its extent role check. Inventory and visit charges still
@@ -2440,6 +2699,7 @@ pub struct CompactionBudget {
     pub max_pause: Duration,
     pub max_elapsed: Duration,
     pub max_temporary_bytes: u64,
+    /// Absolute ceiling for obsolete candidate bytes retained by catch-up.
     pub max_garbage_bytes: u64,
     pub preserve_recovery_input: bool,
 }
@@ -2453,6 +2713,31 @@ impl Default for CompactionBudget {
             max_garbage_bytes: u64::MAX,
             preserve_recovery_input: false,
         }
+    }
+}
+impl CompactionBudget {
+    fn check_live_garbage(
+        &self,
+        garbage: u64,
+        source_end: u64,
+        candidate_end: u64,
+        first_record: u64,
+    ) -> Result<()> {
+        const MAX_EXTRA_LIVE_GARBAGE_BYTES: u64 = 16 * 1024 * 1024;
+
+        let ordinary_allowance = candidate_end.saturating_sub(first_record) / 20;
+        // Keep a useful candidate when a live writer supersedes pages during
+        // the copy. Before writing the replacement publication, budget at most
+        // half the difference between the published and candidate extents.
+        let net_savings = source_end.saturating_sub(candidate_end);
+        let savings_allowance = (net_savings / 2).min(MAX_EXTRA_LIVE_GARBAGE_BYTES);
+        let allowance = self
+            .max_garbage_bytes
+            .min(ordinary_allowance.max(savings_allowance));
+        if garbage > allowance {
+            return Err(Error::Limit("compaction live garbage allowance"));
+        }
+        Ok(())
     }
 }
 // The shared cancellation callback is boolean for copier/temporary APIs. Keep
@@ -2619,6 +2904,10 @@ impl NativeStore {
             };
             target.cache = self.cache.clone();
             target.io = self.io.clone();
+            target.recent = DiskRefs::with_budget(
+                self.recent.0.resident_limit(),
+                target.recent.0.budget.clone(),
+            );
             target.compaction_target = true;
             let budget = CompactionBudget::default();
             let aggregate = temporary::Budget::new(budget.max_temporary_bytes);
@@ -2822,13 +3111,12 @@ impl NativeStore {
             job.adjust_retained(base, false, &cancelled)
                 .map_err(|error| stop.classify(error))?;
         }
-        let allowance = job
-            .budget
-            .max_garbage_bytes
-            .min(job.statistics.copied_bytes / 20);
-        if job.garbage > allowance {
-            return Err(Error::Limit("compaction live garbage allowance"));
-        }
+        job.budget.check_live_garbage(
+            job.garbage,
+            current.committed_end,
+            job.target.end,
+            job.target.reader.first_record_offset(),
+        )?;
         if cancelled() {
             return Err(stop.interruption());
         }
@@ -3198,10 +3486,12 @@ impl Compaction {
         if let Some(previous) = self.base_root {
             self.adjust_retained(previous, false, &cancelled)?;
         }
-        let prepared_bytes = self.target.end - self.target.reader.first_record_offset();
-        if self.garbage > self.budget.max_garbage_bytes.min(prepared_bytes / 20) {
-            return Err(Error::Limit("compaction live garbage allowance"));
-        }
+        self.budget.check_live_garbage(
+            self.garbage,
+            publication.committed_end,
+            self.target.end,
+            self.target.reader.first_record_offset(),
+        )?;
         if cancelled() {
             return Err(Error::Limit("compaction elapsed work"));
         }
@@ -3240,10 +3530,10 @@ impl Compaction {
         // Build the optional locality plan's source lookup without an in-memory
         // object census. All physical occurrences are checked by ClosureCopy.
         if self.plan_groups > 0 && projector.is_none() {
-            let mut sources = DiskRefs(temporary::GraphTable::with_budget(
+            let mut sources = DiskRefs::with_budget(
                 temporary::GraphTable::RESIDENT_ENTRIES,
                 self.layout_budget.clone(),
-            ));
+            );
             let mut seen = temporary::GraphTable::with_budget(
                 temporary::GraphTable::RESIDENT_ENTRIES,
                 self.layout_budget.clone(),
