@@ -329,7 +329,9 @@ pub struct FrameEncoder {
     #[cfg(feature = "compression")]
     canonical_hash: Option<ObjectHash>,
     #[cfg(feature = "compression")]
-    compressor: Option<zstd::zstd_safe::CCtx<'static>>,
+    compressors: [Option<zstd::zstd_safe::CCtx<'static>>; 2],
+    #[cfg(feature = "compression")]
+    compression_levels: [Option<i32>; 2],
 }
 // Cloning a store clones content, never codec state or scratch reservations.
 impl Clone for FrameEncoder {
@@ -431,13 +433,28 @@ impl FrameEncoder {
             self.frame.reserve(bound);
             let mut output = std::io::Cursor::new(&mut self.frame);
             output.set_position(FRAME as u64);
-            // This complete object needs no streaming session or input buffer.
-            // The simple API resets parameters from the level on every call,
-            // while retaining the context's working allocations.
-            let written = self
-                .compressor
-                .get_or_insert_with(zstd::zstd_safe::CCtx::create)
-                .compress(&mut output, canonical, level)
+            // Keep the selected level across complete independent frames.
+            // compress2 starts a fresh session without rebuilding the same
+            // parameter configuration for each object.
+            // Zstd shrinks an oversized workspace after repeated small frames.
+            // Keep small and large frames separate so interleaved writes do not
+            // repeatedly discard and rebuild the larger workspace.
+            let slot = usize::from(canonical.len() > 4096);
+            let compressor =
+                self.compressors[slot].get_or_insert_with(zstd::zstd_safe::CCtx::create);
+            if self.compression_levels[slot] != Some(level) {
+                compressor
+                    .set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(level))
+                    .map_err(|code| std::io::Error::other(zstd::zstd_safe::get_error_name(code)))?;
+                self.compression_levels[slot] = Some(level);
+            }
+            let result = compressor.compress2(&mut output, canonical);
+            if result.is_err() {
+                compressor
+                    .reset(zstd::zstd_safe::ResetDirective::SessionOnly)
+                    .map_err(|code| std::io::Error::other(zstd::zstd_safe::get_error_name(code)))?;
+            }
+            let written = result
                 .map_err(|code| std::io::Error::other(zstd::zstd_safe::get_error_name(code)))?;
             if written < canonical.len() {
                 codec = 1;
@@ -954,6 +971,31 @@ impl FrameDecoder {
 #[cfg(all(test, feature = "compression"))]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn compressor_reuse_preserves_frames_across_sizes_and_levels() {
+        let mut encoder = FrameEncoder::default();
+        let mut object = CanonicalObject {
+            kind: 42000,
+            version: 9,
+            bytes: Vec::new(),
+            children: Vec::new(),
+        };
+        for round in 0..4 {
+            for (length, level) in [(65536, 1), (4089, 3), (4096, 3), (127, -3)] {
+                object.bytes = (0..length).map(|i| ((i + round) % 251) as u8).collect();
+                let expected = encode_frame(&object, level).unwrap();
+                assert_eq!(encoder.encode(&object, level).unwrap(), expected);
+                // Enough small frames to exercise Zstd's workspace retirement
+                // policy before the next larger independent frame.
+                object.bytes.truncate(63);
+                for _ in 0..130 {
+                    let expected = encode_frame(&object, level).unwrap();
+                    assert_eq!(encoder.encode(&object, level).unwrap(), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn prepared_canonical_hash_handles_relocation_and_unprepared_interleaving() {

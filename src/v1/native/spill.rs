@@ -104,13 +104,65 @@ impl DiskRefs {
 // parent occurrence key cannot alias the ordinary 32-byte canonical-ID keys.
 // This is writer-local append provenance, never verified-layout cache status.
 pub(super) fn rewrite_layout(children: &[ObjectRef]) -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"SAC1/writer-rewrite-layout\0");
-    hash.update(&(children.len() as u32).to_le_bytes());
+    // Feeding individual references keeps BLAKE3 on its scalar partial-block
+    // path. Batch into bounded stack storage so full chunks can use SIMD,
+    // without adding a retained writer buffer or per-layout allocation.
+    let domain = b"SAC1/writer-rewrite-layout\0";
+    let mut bytes = [0; 4096];
+    bytes[..domain.len()].copy_from_slice(domain);
+    bytes[domain.len()..domain.len() + 4].copy_from_slice(&(children.len() as u32).to_le_bytes());
+    let mut end = domain.len() + 4;
+    let mut hash = None;
     for child in children {
-        hash.update(&encode_ref(*child));
+        if end + 44 > bytes.len() {
+            hash.get_or_insert_with(blake3::Hasher::new)
+                .update(&bytes[..end]);
+            end = 0;
+        }
+        bytes[end..end + 44].copy_from_slice(&encode_ref(*child));
+        end += 44;
     }
-    *hash.finalize().as_bytes()
+    match hash {
+        Some(mut hash) => {
+            hash.update(&bytes[..end]);
+            *hash.finalize().as_bytes()
+        }
+        None => *blake3::hash(&bytes[..end]).as_bytes(),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn batched_rewrite_layout_preserves_every_physical_reference() {
+    for count in [0, 1, 22, 23, 24, 91, 92, 93, 94, 185, 186, 187, 4096] {
+        let mut children: Vec<_> = (0..count)
+            .map(|index| ObjectRef {
+                hash: ObjectHash(*blake3::hash(&(index as u64).to_le_bytes()).as_bytes()),
+                address: ChunkAddress {
+                    offset: 12288 + index as u64 * 80,
+                    length: 64 + index as u32,
+                },
+            })
+            .collect();
+        let expected = |children: &[ObjectRef]| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"SAC1/writer-rewrite-layout\0");
+            hash.update(&(children.len() as u32).to_le_bytes());
+            for child in children {
+                hash.update(&child.hash.0);
+                hash.update(&child.address.offset.to_le_bytes());
+                hash.update(&child.address.length.to_le_bytes());
+            }
+            *hash.finalize().as_bytes()
+        };
+        let original = rewrite_layout(&children);
+        assert_eq!(original, expected(&children), "children={count}");
+        if let Some(child) = children.last_mut() {
+            child.address.offset += 8;
+            assert_ne!(rewrite_layout(&children), original);
+            assert_eq!(rewrite_layout(&children), expected(&children));
+        }
+    }
 }
 impl DiskRefs {
     pub(super) fn record_rewrite_layout(

@@ -572,6 +572,16 @@ fn verified_shared_default_rejects_untrusted_store_identity() {
         }
     }
     assert!(Untrusted.get_verified_shared(ObjectRef::default()).is_err());
+    let mut visited = false;
+    assert!(
+        Untrusted
+            .visit_verified(ObjectRef::default(), &mut |_| {
+                visited = true;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert!(!visited);
 }
 
 #[test]

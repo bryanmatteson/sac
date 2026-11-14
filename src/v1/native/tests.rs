@@ -146,19 +146,20 @@ fn packed_appends_preserve_bytes_across_frame_boundaries_and_failed_flushes() {
     .enumerate()
     {
         let bytes = vec![ordinal as u8; length];
-        append_frame(&file, &pending, expected.len() as u64, &bytes, 0).unwrap();
+        append_frame(&file, &pending, expected.len() as u64, &bytes).unwrap();
         expected.extend_from_slice(&bytes);
         let stored = file.lock().unwrap().metadata().unwrap().len() as usize;
         assert_eq!(stored % APPEND_BUFFER_BYTES, 0);
         let pending = pending.lock().unwrap();
         assert!(pending.bytes.len() < APPEND_BUFFER_BYTES);
+        assert_eq!(pending.bytes.capacity(), APPEND_BUFFER_BYTES);
         assert_eq!(pending.bytes, expected[stored..]);
         let mut actual = vec![0; stored];
         read_at(&file.lock().unwrap(), &mut actual, 0).unwrap();
         assert_eq!(actual, expected[..stored]);
     }
     let before = file.lock().unwrap().metadata().unwrap().len();
-    assert!(append_frame(&file, &pending, expected.len() as u64 + 8, b"gap", 0).is_err());
+    assert!(append_frame(&file, &pending, expected.len() as u64 + 8, b"gap").is_err());
     assert_eq!(file.lock().unwrap().metadata().unwrap().len(), before);
     flush_append(&file, &pending).unwrap();
     assert!(pending.lock().unwrap().bytes.is_empty());
@@ -185,32 +186,29 @@ fn packed_appends_preserve_bytes_across_frame_boundaries_and_failed_flushes() {
     let path = tempfile::NamedTempFile::new().unwrap();
     let readonly = Mutex::new(File::open(path.path()).unwrap());
     let pending = Mutex::new(AppendBuffer::default());
-    append_frame(&readonly, &pending, 0, b"prefix", 0).unwrap();
-    assert!(append_frame(&readonly, &pending, 6, &vec![1; APPEND_BUFFER_BYTES], 0).is_err());
+    append_frame(&readonly, &pending, 0, b"prefix").unwrap();
+    assert!(append_frame(&readonly, &pending, 6, &vec![1; APPEND_BUFFER_BYTES]).is_err());
     assert!(pending.lock().unwrap().failed);
     assert!(matches!(
-        append_frame(&readonly, &pending, 6, b"later", 0),
+        append_frame(&readonly, &pending, 6, b"later"),
         Err(Error::Poisoned)
     ));
 }
 
 #[test]
 #[cfg(target_os = "macos")]
-fn sparse_append_headroom_is_bounded_and_trimmed_without_changing_bytes() {
+fn sparse_append_extent_tracks_exact_writes_without_changing_bytes() {
     let mut file = tempfile::tempfile().unwrap();
     let mut buffer = AppendBuffer::default();
-    let maximum = APPEND_BUFFER_BYTES as u64 * 2 + 7;
-    buffer.extent.maximum = maximum;
     let bytes = vec![71; APPEND_BUFFER_BYTES];
     append_at(&mut file, &bytes, 0, &mut buffer.extent).unwrap();
-    assert_eq!(file.metadata().unwrap().len(), maximum);
-    assert_eq!(buffer.extent.end, maximum);
+    assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64);
+    assert_eq!(buffer.extent.end, bytes.len() as u64);
     append_at(&mut file, b"tail", bytes.len() as u64, &mut buffer.extent).unwrap();
-    assert_eq!(file.metadata().unwrap().len(), maximum);
+    assert_eq!(file.metadata().unwrap().len(), bytes.len() as u64 + 4);
     // Slot overwrites do not shorten an extent that contains appended bytes.
     write_at(&mut file, b"slot", 0).unwrap();
     let end = bytes.len() as u64 + 4;
-    trim_append_extent(&mut file, &mut buffer, end).unwrap();
     assert_eq!(file.metadata().unwrap().len(), end);
     assert_eq!(buffer.extent.end, end);
     let mut actual = vec![0; end as usize];
@@ -222,21 +220,22 @@ fn sparse_append_headroom_is_bounded_and_trimmed_without_changing_bytes() {
 
 #[test]
 #[cfg(target_os = "macos")]
-fn published_writer_caps_sparse_headroom_and_removes_it_at_publication() {
+fn published_writer_extends_only_persisted_bytes_and_obeys_lowered_limits() {
     let (_dir, mut store) = store();
     let root = snapshot(&mut store, b"initial");
     store.publish(root).unwrap();
     store.compression_level = 0;
-    let maximum = store.file_len() + APPEND_BUFFER_BYTES as u64 * 2 + 7;
+    let before = store.file_len();
+    let maximum = before + APPEND_BUFFER_BYTES as u64 * 2 + 7;
     store.set_file_byte_limit(maximum).unwrap();
     store
         .put(42000, 1, &vec![71; APPEND_BUFFER_BYTES], &[])
         .unwrap();
     assert_eq!(
         store.file.lock().unwrap().metadata().unwrap().len(),
-        maximum
+        before + APPEND_BUFFER_BYTES as u64
     );
-    // An old publication remains readable while its writer has sparse tail.
+    // An old publication remains readable while its writer has a pending tail.
     store.pin().unwrap().validate().unwrap();
     let publication = store.root();
     store.publish(root).unwrap();
@@ -246,14 +245,15 @@ fn published_writer_caps_sparse_headroom_and_removes_it_at_publication() {
         store.file_len()
     );
     store.set_file_byte_limit(u64::MAX).unwrap();
-    let maximum = store.file_len() + APPEND_BUFFER_BYTES as u64 * 2 + 7;
+    let before = store.file_len();
+    let maximum = before + APPEND_BUFFER_BYTES as u64 * 2 + 7;
     store.set_file_byte_limit(maximum).unwrap();
     store
         .put(42000, 1, &vec![72; APPEND_BUFFER_BYTES], &[])
         .unwrap();
     assert_eq!(
         store.file.lock().unwrap().metadata().unwrap().len(),
-        maximum
+        before + APPEND_BUFFER_BYTES as u64
     );
     let logical = store.file_len();
     assert!(logical < maximum);
@@ -277,6 +277,140 @@ fn published_writer_caps_sparse_headroom_and_removes_it_at_publication() {
         store.file_len()
     );
     store.validate().unwrap();
+}
+
+#[test]
+fn opaque_appends_keep_exact_types_and_admit_payloads_only_on_read() {
+    let (_dir, mut store) = store();
+    let bytes = b"small opaque payload";
+    let child = store.put(7, 1, b"small byte leaf", &[]).unwrap();
+    let opaque = store.put(65000, 9, bytes, &[child]).unwrap();
+    let key = (
+        store.file_identity,
+        opaque.hash,
+        opaque.address.offset,
+        opaque.address.length,
+    );
+    {
+        let cache = store.cache.lock().unwrap();
+        assert!(!cache.objects.slots.contains_key(&key));
+        assert!(cache.verified.slots.contains_key(&key));
+    }
+    assert_eq!(store.cached_object_type(opaque).unwrap(), Some((65000, 9)));
+    assert!(!store.append_buffer.lock().unwrap().bytes.is_empty());
+    let mut other = opaque;
+    other.address.length -= 8;
+    assert_eq!(store.cached_object_type(other).unwrap(), None);
+    let parent = store.put(65001, 1, b"parent", &[opaque]).unwrap();
+    assert!(!store.append_buffer.lock().unwrap().bytes.is_empty());
+    let before = store.physical_statistics();
+    let object = store.get_verified_shared(opaque).unwrap();
+    assert_eq!(object.kind, 65000);
+    assert_eq!(object.version, 9);
+    assert_eq!(object.bytes, bytes);
+    assert_eq!(object.children, [child]);
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    let before = store.physical_statistics();
+    assert!(Arc::ptr_eq(
+        &object,
+        &store.get_verified_shared(opaque).unwrap()
+    ));
+    assert_eq!(store.physical_statistics().read_bytes, before.read_bytes);
+    assert_eq!(store.get(parent).unwrap().children, [opaque]);
+    // Small byte leaves still have their immediate read-after-write payload.
+    assert!(store.cache.get(store.file_identity, child).is_some());
+}
+
+#[test]
+fn unretained_puts_preserve_frames_and_strict_authentication() {
+    let (_ordinary_dir, mut ordinary) = store();
+    let (_final_dir, mut final_pages) = store();
+    let expected = ordinary.put(3, 1, &[0x80], &[]).unwrap();
+    let actual = final_pages.put_unretained(3, 1, &[0x80], &[]).unwrap();
+    assert_eq!(actual, expected);
+    let key = (
+        final_pages.file_identity,
+        actual.hash,
+        actual.address.offset,
+        actual.address.length,
+    );
+    {
+        let cache = final_pages.cache.lock().unwrap();
+        assert!(!cache.objects.slots.contains_key(&key));
+        assert!(cache.verified.slots.contains_key(&key));
+    }
+    let before = final_pages.physical_statistics();
+    assert_eq!(final_pages.object_type(actual).unwrap(), (3, 1));
+    final_pages
+        .put_unretained(42000, 1, b"parent", &[actual])
+        .unwrap();
+    assert_eq!(
+        final_pages.physical_statistics().read_bytes,
+        before.read_bytes
+    );
+    ordinary.pin().unwrap();
+    let old = final_pages.pin().unwrap();
+    // New stores still own private staging files until their first publication.
+    let frame = |store: &NativeStore| {
+        let mut bytes = vec![0; actual.address.length as usize];
+        counted_read_at(
+            &store.file.lock().unwrap(),
+            &mut bytes,
+            actual.address.offset,
+            &store.io,
+            ReadClass::Object,
+        )
+        .unwrap();
+        bytes
+    };
+    assert_eq!(frame(&ordinary), frame(&final_pages));
+    let end = final_pages.end;
+    assert!(final_pages.put_unretained(3, 1, &[0xf6], &[]).is_err());
+    let mut wrong = actual;
+    wrong.hash.0[0] ^= 1;
+    assert!(
+        final_pages
+            .put_unretained(42000, 1, b"wrong", &[wrong])
+            .is_err()
+    );
+    assert_eq!(final_pages.end, end);
+    assert!(old.get(actual).is_err());
+    assert_eq!(final_pages.get(actual).unwrap().bytes, [0x80]);
+    assert_eq!(final_pages.put(3, 1, &[0x80], &[]).unwrap(), actual);
+    let root = resources::snapshot(&mut final_pages, actual, vec![], vec![]).unwrap();
+    final_pages.publish(root).unwrap();
+    let published = final_pages.pin().unwrap();
+    drop(final_pages);
+    assert_eq!(published.get(actual).unwrap().bytes, [0x80]);
+}
+
+#[test]
+fn child_authentication_batches_hits_but_releases_the_cache_on_misses() {
+    let (_dir, mut store) = store();
+    let first = store.put(65000, 1, b"first", &[]).unwrap();
+    let second = store.put(65000, 1, b"second", &[]).unwrap();
+    let root = snapshot(&mut store, b"published parent");
+    store.publish(root).unwrap();
+    store.discard_disposable_caches();
+    assert_eq!(store.object_type(first).unwrap(), (65000, 1));
+    // A cached inherited child, a cold inherited child and another cached hit
+    // exercise guard reuse on either side of the physical authentication read.
+    let before = store.physical_statistics();
+    let children = [first, second, first];
+    let parent = store.put(65001, 1, b"parent", &children).unwrap();
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    assert_eq!(store.get(parent).unwrap().children, children);
+    let mut wrong = second;
+    wrong.hash.0[0] ^= 1;
+    let end = store.end;
+    assert!(
+        store
+            .put(65001, 1, b"invalid parent", &[first, wrong])
+            .is_err()
+    );
+    assert_eq!(store.end, end);
+    // A failed batch must also release its guard for subsequent operations.
+    assert_eq!(store.get(parent).unwrap().children, children);
 }
 
 #[test]
@@ -877,7 +1011,7 @@ fn failed_append_index_spill_preserves_the_resident_table() {
 }
 
 #[test]
-fn data_appends_preserve_hot_metadata_and_admit_large_payloads_on_read() {
+fn data_appends_preserve_hot_metadata_and_admit_opaque_payloads_on_read() {
     let (_directory, mut store) = store();
     let root = snapshot(&mut store, b"hot structural metadata");
     store.publish(root).unwrap();
@@ -905,8 +1039,10 @@ fn data_appends_preserve_hot_metadata_and_admit_large_payloads_on_read() {
     }
     assert_eq!(store.physical_statistics(), before);
     let small = store.put(4096, 1, b"small opaque data", &[]).unwrap();
-    assert_eq!(store.get(small).unwrap().bytes, b"small opaque data");
+    assert_eq!(store.object_type(small).unwrap(), (4096, 1));
     assert_eq!(store.physical_statistics(), before);
+    assert_eq!(store.get(small).unwrap().bytes, b"small opaque data");
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
 
     let large = *references.last().unwrap();
     let object = store.get_shared(large).unwrap();

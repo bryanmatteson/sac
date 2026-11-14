@@ -162,22 +162,34 @@ impl Reservation {
 // One key or value of at most 44 bytes, stored inline. The resident tier
 // makes no allocation for an entry, and its size is a fixed number of bytes
 // for each entry.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct Cell {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct Cell<const BYTES: usize = 44> {
     len: u8,
-    bytes: [u8; 44],
+    bytes: [u8; BYTES],
 }
-impl std::ops::Deref for Cell {
+impl<const BYTES: usize> std::borrow::Borrow<[u8]> for Cell<BYTES> {
+    fn borrow(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+impl<const BYTES: usize> std::hash::Hash for Cell<BYTES> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        // Match borrowed slice lookup: include the length, but never hash the
+        // padding reserved for a larger key. Canonical IDs need only 32 bytes.
+        std::hash::Hash::hash(self.as_slice(), state);
+    }
+}
+impl<const BYTES: usize> std::ops::Deref for Cell<BYTES> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         self.as_slice()
     }
 }
-impl Cell {
+impl<const BYTES: usize> Cell<BYTES> {
     fn new(bytes: &[u8]) -> Self {
         let mut cell = Self {
             len: bytes.len() as u8,
-            bytes: [0; 44],
+            bytes: [0; BYTES],
         };
         cell.bytes[..bytes.len()].copy_from_slice(bytes);
         cell
@@ -190,7 +202,7 @@ impl Cell {
 pub(super) type GraphTable = ValueGraphTable<44>;
 pub(super) type ReferenceTable = ValueGraphTable<12>;
 pub(super) struct ValueGraphTable<const VALUE_BYTES: usize> {
-    resident: HashMap<Cell, Cell, TableHash>,
+    resident: HashMap<Cell, Cell<VALUE_BYTES>, TableHash>,
     resident_limit: usize,
     disk: Option<DiskTable<VALUE_BYTES>>,
     // False only in a test of the positional I/O that a host without block
@@ -339,11 +351,11 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
             budget,
         }
     }
-    pub fn get(&self, key: &[u8]) -> Result<Option<Cell>> {
+    pub fn get(&self, key: &[u8]) -> Result<Option<Cell<VALUE_BYTES>>> {
         if key.len() > 44 {
             return Err(Error::Limit("temporary key"));
         }
-        if let Some(value) = self.resident.get(&Cell::new(key)) {
+        if let Some(value) = self.resident.get(key) {
             return Ok(Some(*value));
         }
         let Some(disk) = &self.disk else {
@@ -373,7 +385,7 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
             return Err(Error::Limit("temporary record"));
         }
         if self.disk.is_none() {
-            let cell = Cell::new(key);
+            let cell = Cell::<44>::new(key);
             if self.resident.len() < self.resident_limit || self.resident.contains_key(&cell) {
                 self.resident.insert(cell, Cell::new(value));
                 return Ok(());
@@ -495,6 +507,11 @@ impl<const N: usize> FixedRecordStack<N> {
                 .reservation
                 .budget
                 .reserve((length - self.capacity) * N as u64)?;
+            // APFS can speculatively allocate beyond a small extending write.
+            // Set the already-reserved sparse extent first, so spill storage
+            // follows the actual high-water mark rather than append timing.
+            #[cfg(target_os = "macos")]
+            self.file.set_len(length * N as u64)?;
             self.reservation.bytes += extra.bytes;
             extra.bytes = 0;
             self.capacity = length;
@@ -536,6 +553,46 @@ impl<const N: usize> FixedRecordStack<N> {
     pub fn disk_bytes(&self) -> u64 {
         self.capacity * N as u64
     }
+}
+
+#[cfg(test)]
+#[test]
+fn narrow_resident_values_preserve_mixed_records_when_budget_forces_spill() {
+    let budget = Budget::new(1 << 20);
+    let mut table = ReferenceTable::with_budget(2048, budget.clone());
+    let mut records: Vec<_> = (0..512u64)
+        .map(|index| {
+            let mut key = vec![0; if index % 2 == 0 { 32 } else { 44 }];
+            key[..8].copy_from_slice(&index.to_le_bytes());
+            let value = vec![index as u8; index as usize % 13];
+            (key, value)
+        })
+        .collect();
+    // A borrowed lookup must distinguish equal prefixes and zero padding.
+    for length in [0, 1, 31, 33, 44] {
+        records.push((vec![0; length], vec![length as u8; 12]));
+    }
+    for (key, value) in &records {
+        table.insert_cancellable(key, value, &|| false).unwrap();
+    }
+    assert_eq!(table.disk_bytes().unwrap(), 0);
+    for (key, value) in &records {
+        assert_eq!(&*table.get(key).unwrap().unwrap(), value);
+    }
+    // Updates include replacing a full value with an empty one. The compact
+    // resident representation and its spill must retain the actual length.
+    table
+        .insert_cancellable(&records[12].0, &[], &|| false)
+        .unwrap();
+    table.set_resident_memory_budget(0).unwrap();
+    assert!(table.disk_bytes().unwrap() > 0);
+    for (index, (key, value)) in records.iter().enumerate() {
+        let expected = if index == 12 { &[][..] } else { value };
+        assert_eq!(&*table.get(key).unwrap().unwrap(), expected);
+    }
+    assert_eq!(table.resident_memory_bytes(), 0);
+    drop(table);
+    assert_eq!(budget.used(), 0);
 }
 
 #[cfg(test)]

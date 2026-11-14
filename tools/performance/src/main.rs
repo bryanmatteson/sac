@@ -192,7 +192,14 @@ fn main() {
             let use_cache = case == "append-cached-steady";
             let warm_entries = if use_cache { 8500u64 } else { 3200u64 };
             for i in 0..warm_entries {
-                store.put(7, 1, &i.to_le_bytes(), &[]).unwrap();
+                if use_cache {
+                    // Warm the measured type-only admissions. Small decoded
+                    // objects need no separate authentication metadata.
+                    body[..8].copy_from_slice(&i.to_le_bytes());
+                    store.put(7, 1, &body, &[]).unwrap();
+                } else {
+                    store.put(7, 1, &i.to_le_bytes(), &[]).unwrap();
+                }
             }
             let published = store.publish(snapshot).unwrap();
             assert!(store.temporary_bytes().unwrap() > 0);
@@ -210,7 +217,7 @@ fn main() {
             let scratch = store.temporary_bytes().unwrap();
             let links = [child; 8];
             let iterations = if rewrite { 128 } else { 1024 };
-            let mut ordinal = 0u64;
+            let mut ordinal = if use_cache { warm_entries } else { 0 };
             let result = sample(
                 || {
                     body[..8].copy_from_slice(&ordinal.to_le_bytes());
@@ -242,6 +249,39 @@ fn main() {
             } else {
                 assert_eq!(store.temporary_bytes().unwrap(), scratch);
             }
+            result
+        }
+        #[cfg(feature = "optimized-api")]
+        "append-final-page-steady" => {
+            store
+                .set_append_index_memory_budget(512 + 256 * 2048)
+                .unwrap();
+            // One valid inline-file directory row; change only its eight-byte
+            // payload so every measured final page has a distinct identity.
+            let mut body = [
+                0x81, 0x84, 0x41, b'f', 0, 0xa0, 0x83, 8, 0, 0x48, 0, 0, 0, 0, 0, 0, 0, 0,
+            ];
+            let warm_entries = 8500u64;
+            for ordinal in 0..warm_entries {
+                body[10..].copy_from_slice(&ordinal.to_le_bytes());
+                store.put_unretained(3, 1, &body, &[]).unwrap();
+            }
+            let published = store.publish(snapshot).unwrap();
+            let scratch = store.temporary_bytes().unwrap();
+            assert!(scratch > 0);
+            let mut ordinal = warm_entries;
+            let result = sample(
+                || {
+                    body[10..].copy_from_slice(&ordinal.to_le_bytes());
+                    ordinal += 1;
+                    let reference = store.put_unretained(3, 1, black_box(&body), &[]).unwrap();
+                    operation_hash = Some(reference.hash);
+                    black_box(reference);
+                },
+                1024,
+            );
+            assert_eq!(store.root(), Some(published));
+            assert_eq!(store.temporary_bytes().unwrap(), scratch);
             result
         }
         "append-cache-churn" => {
@@ -392,6 +432,7 @@ fn main() {
             | "compressed-decode-view"
             | "append-steady"
             | "append-cached-steady"
+            | "append-final-page-steady"
             | "append-cache-churn"
             | "authenticate-steady"
             | "rewrite-layout-steady"

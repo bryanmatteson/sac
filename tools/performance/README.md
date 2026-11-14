@@ -30,6 +30,9 @@ compressed child must be read and authenticated on every put. Both disable
 the optional decoded cache and keep the index within one mapped capacity
 during measurement. `append-cached-steady` repeats the unique append with
 the default cache and warmed authentication-index capacity.
+`append-final-page-steady` writes distinct valid directory pages through
+`put_unretained`, keeping exact type authentication with no eager decoded
+payload copies. It checks zero warmed Rust allocations and stable spill size.
 These spill fixtures explicitly cap the append index at a 2,048-entry
 resident allowance, independently of the production default memory budget.
 `append-cache-churn` uses 32-byte payloads and a 4 KiB decoded cache so

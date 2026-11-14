@@ -65,6 +65,17 @@ pub(crate) enum DirectoryNode {
     },
 }
 pub(crate) fn directory(object: &CanonicalObject) -> Result<DirectoryNode> {
+    directory_view(ObjectView::from(object))
+}
+pub(crate) fn directory_view(object: ObjectView<'_>) -> Result<DirectoryNode> {
+    let child = |value: &Value| {
+        let index = usize::try_from(number(value)?).map_err(|_| corrupt("child index overflow"))?;
+        object
+            .children
+            .get(index)
+            .copied()
+            .ok_or_else(|| corrupt("child index out of bounds"))
+    };
     if object.version != 1 {
         return Err(Error::Unsupported("directory schema".into()));
     }
@@ -77,7 +88,7 @@ pub(crate) fn directory(object: &CanonicalObject) -> Result<DirectoryNode> {
     {
         return Err(Error::Limit("directory page bytes"));
     }
-    let body = cbor::decode(&object.bytes)?;
+    let body = cbor::decode(object.bytes)?;
     match object.kind {
         3 => {
             let mut entries = Vec::new();
@@ -112,13 +123,13 @@ pub(crate) fn directory(object: &CanonicalObject) -> Result<DirectoryNode> {
                                 if length == 0 {
                                     return Err(corrupt("zero file must be inline"));
                                 }
-                                FileData::Extents(child(object, &v[2])?)
+                                FileData::Extents(child(&v[2])?)
                             }
                             _ => return Err(corrupt("unknown file storage")),
                         };
                         EntryData::File { length, data }
                     }
-                    1 => EntryData::Directory(child(object, &row[3])?),
+                    1 => EntryData::Directory(child(&row[3])?),
                     2 => {
                         let target = bytes(&row[3])?;
                         if target.len() > 4096 {
@@ -156,7 +167,7 @@ pub(crate) fn directory(object: &CanonicalObject) -> Result<DirectoryNode> {
                 if fences.last().is_some_and(|(k, _)| k.as_slice() >= key) {
                     return Err(corrupt("directory fence ordering"));
                 }
-                fences.push((key.to_vec(), child(object, &pair[1])?));
+                fences.push((key.to_vec(), child(&pair[1])?));
             }
             if fences.len() < 2 {
                 return Err(corrupt("single-child directory branch"));

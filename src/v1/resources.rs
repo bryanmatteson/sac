@@ -4,7 +4,7 @@
 //! routes from validated indexes and never turn an unchecked miss into absence.
 
 use super::cbor::{self, Value};
-use super::{CanonicalObject, Error, ObjectHash, ObjectRef, ObjectStore, Result};
+use super::{CanonicalObject, Error, ObjectHash, ObjectRef, ObjectStore, ObjectView, Result};
 use std::time::{Duration, Instant};
 
 mod extract;
@@ -429,6 +429,19 @@ impl Budget {
         r: ObjectRef,
     ) -> Result<std::sync::Arc<CanonicalObject>> {
         self.get_for_copy(store, r, None)
+    }
+    pub fn visit<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &S,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(ObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.charge_reference(reference)?;
+        self.time()?;
+        store.visit_verified(reference, &mut |object| {
+            self.charge_decoded(object.canonical_len())?;
+            visitor(object)
+        })
     }
     fn get_for_copy<S: ObjectStore + ?Sized>(
         &mut self,

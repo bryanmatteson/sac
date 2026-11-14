@@ -11,6 +11,23 @@ wire version remains 1 and the Rust package version remains 0.2.0.
 - Check destination identity at staging and publication boundaries rather than
   per object; keep append-ID tables resident within a configurable memory
   budget and preserve exact deduplication when pressure spills them.
+- Batch rewrite-provenance hashing in fixed stack storage, keep Zstandard's
+  compression-level configuration across independent frames, and use compact
+  resident append-index values with borrowed, unpadded key lookup.
+- Use cached decoded occurrences directly for appended-object type queries,
+  without duplicate type metadata; retain shared-reader lookup and exact
+  physical authentication. Bound macOS append and spill growth to exact write
+  extents, removing speculative headroom and its publication-time trimming;
+  coalesce appends in one fixed-capacity 1 MiB buffer.
+- Admit opaque extension payloads on demand while keeping exact append/type
+  authentication and immediate structural/small byte-leaf caching. Batch cached
+  child authentication under one guard, releasing it before a miss reads the
+  file. Reuse separate Zstandard contexts for small and large independent
+  frames to avoid repeatedly retiring the larger compression workspace.
+- Expose authenticated borrowed object visits for bounded staging arenas and
+  strict final-page writes with deferred decoded-cache admission. Parse batch
+  directory edits through borrowed parts without changing validation charges,
+  child authentication, deduplication or stored frame bytes.
 - Share canonical object identity and public resource/profile schemas between
   sealed archives and live stores, using distinct locator/publication policies.
 - Use exactly four ASCII magic bytes `SAC1`, followed by four reserved zero bytes

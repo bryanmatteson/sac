@@ -119,10 +119,11 @@ fn repeated_native_staged_batches_bound_reads_with_identical_archive_bytes() {
     // ancestors of the later batches are frames that the same writer
     // appended: an ordinary put admits them from the append index, and the
     // capability adds only the exact authentication of each rewritten parent.
+    // Read coalescing may reduce its bytes; bound any additional reads.
     for n in 1..4 {
         let (strict, checked) = (outputs[0].0[n], outputs[1].0[n]);
         assert!(
-            strict <= checked && checked - strict <= strict / 16,
+            checked <= strict + strict / 16,
             "batch {n}: strict {:?}, checked {:?}",
             outputs[0].0,
             outputs[1].0

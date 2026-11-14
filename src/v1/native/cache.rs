@@ -690,13 +690,28 @@ impl DecodedCache {
         file_identity: u64,
         reference: ObjectRef,
     ) -> Option<(u16, u16)> {
-        let value = self.verified_type(file_identity, reference)?;
         let key = (
             file_identity,
             reference.hash,
             reference.address.offset,
             reference.address.length,
         );
+        let value = if !self.verified.slots.contains_key(&key) {
+            // Keep the decoded entry as the authority. Type queries take the
+            // cache lock so a separate verified entry, if later admitted,
+            // retains the same precedence and eviction age as exclusive hits.
+            let object = self.get_fronted(file_identity, reference)?;
+            let value = (object.kind, object.version);
+            if object.bytes.capacity() < FRONT_PAYLOAD_LIMIT {
+                return Some(value);
+            }
+            // Large payloads stay out of the reader shards. Give shared type
+            // queries their small independent entry only when first needed.
+            self.verify(file_identity, reference, value);
+            value
+        } else {
+            self.verified_type(file_identity, reference)?
+        };
         if let Some(front) = &self.front
             && let Some((slot, serial)) = self.verified.mark_front(&key)
         {
@@ -874,7 +889,11 @@ impl DecodedCache {
             reference.address.offset,
             reference.address.length,
         );
-        self.verified.touch(&key, age).copied()
+        self.verified.touch(&key, age).copied().or_else(|| {
+            self.objects
+                .touch(&key, age)
+                .map(|(object, _)| (object.kind, object.version))
+        })
     }
     fn verify(&mut self, file_identity: u64, reference: ObjectRef, object_type: (u16, u16)) {
         let available = self.budget.saturating_sub(self.pinned_metadata);
@@ -982,15 +1001,20 @@ impl DecodedCache {
             .insert(key, (Arc::clone(object), size), age, self.serial);
         self.bytes += size;
     }
-    fn admit_append(&mut self, identity: u64, reference: ObjectRef, append: AppendObject<'_>) {
+    fn admit_append(
+        &mut self,
+        identity: u64,
+        reference: ObjectRef,
+        append: AppendObject<'_>,
+    ) -> bool {
         let available = self.budget.saturating_sub(self.pinned_metadata);
         let (bytes, children) = (append.bytes.len(), append.children.len());
-        // Reserve space for the exact authentication entry that immediately
-        // follows this admission. Its eviction can also supply the victim.
+        // Leave room for a type-only admission if the payload is later evicted.
+        // The decoded occurrence already authenticates its own type and edges.
         let target =
             2 * DECODED_ENTRY_METADATA + bytes + children * std::mem::size_of::<ObjectRef>();
         if target > available {
-            return;
+            return false;
         }
         let mut recycled = None;
         while self.bytes + target > available {
@@ -1023,13 +1047,106 @@ impl DecodedCache {
                 children: append.children.into_owned(),
             }),
         };
+        if DECODED_ENTRY_METADATA
+            + object.bytes.capacity()
+            + object.children.capacity() * std::mem::size_of::<ObjectRef>()
+            > available
+        {
+            return false;
+        }
         self.insert_shared(identity, reference, &object);
+        true
     }
 }
 
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn decoded_append_types_need_no_duplicate_metadata_and_front_exact_occurrences() {
+        use std::sync::atomic::Ordering::Relaxed;
+        for size in [32, FRONT_PAYLOAD_LIMIT] {
+            let cache = CacheLock::new(DecodedCache {
+                budget: 4 * FRONT_PAYLOAD_LIMIT + 4096,
+                ..Default::default()
+            });
+            let bytes = vec![7; size];
+            let reference = ObjectRef {
+                hash: ObjectHash::digest(&bytes),
+                address: ChunkAddress {
+                    offset: 128,
+                    length: 256,
+                },
+            };
+            assert!(cache.lock().unwrap().admit_append(
+                3,
+                reference,
+                AppendObject {
+                    kind: 42000,
+                    version: 9,
+                    bytes: Cow::Borrowed(&bytes),
+                    children: Cow::Borrowed(&[]),
+                }
+            ));
+            assert_eq!(cache.lock().unwrap().verified.len(), 0);
+            assert_eq!(cache.verified_type(3, reference), Some((42000, 9)));
+            assert_eq!(cache.lock().unwrap().verified.len(), 0);
+            cache.front.shared.store(true, Relaxed);
+            assert_eq!(cache.verified_type(3, reference), Some((42000, 9)));
+            let key = (
+                3,
+                reference.hash,
+                reference.address.offset,
+                reference.address.length,
+            );
+            if size < FRONT_PAYLOAD_LIMIT {
+                assert!(cache.front.object(&key).is_some());
+                assert_eq!(cache.lock().unwrap().verified.len(), 0);
+            } else {
+                assert!(cache.front.verified(&key).is_some());
+            }
+            for _ in 0..8 {
+                assert_eq!(cache.verified_type(3, reference), Some((42000, 9)));
+            }
+            assert_eq!(cache.verified_type(4, reference), None);
+            let mut other = reference;
+            other.address.offset += 8;
+            assert_eq!(cache.verified_type(3, other), None);
+            other = reference;
+            other.address.length += 8;
+            assert_eq!(cache.verified_type(3, other), None);
+            other = reference;
+            other.hash.0[0] ^= 1;
+            assert_eq!(cache.verified_type(3, other), None);
+            cache.lock().unwrap().set_budget(0);
+            assert_eq!(cache.verified_type(3, reference), None);
+        }
+        let mut cache = DecodedCache {
+            budget: 1024,
+            ..Default::default()
+        };
+        let mut bytes = Vec::with_capacity(4096);
+        bytes.extend_from_slice(b"small body with an oversized owned reservation");
+        let reference = ObjectRef {
+            hash: ObjectHash::digest(&bytes),
+            address: ChunkAddress {
+                offset: 128,
+                length: 256,
+            },
+        };
+        assert!(!cache.admit_append(
+            3,
+            reference,
+            AppendObject {
+                kind: 42000,
+                version: 9,
+                bytes: Cow::Owned(bytes),
+                children: Cow::Borrowed(&[]),
+            }
+        ));
+        assert_eq!(cache.verified_type(3, reference), None);
+    }
 
     #[test]
     fn append_reuses_an_unpinned_victim_and_preserves_a_pinned_one() {

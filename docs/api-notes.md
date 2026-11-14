@@ -173,11 +173,10 @@ also take the destination's encoder. A copy from a file that this library
 wrote has the same bytes with and without this path; a copy from a file with
 frames from a different encoder keeps those frames.
 
-A native writer checks each child of a put. For freshly appended byte and opaque
-data objects whose bodies and decoded child vectors exceed 2 KiB, it caches
-authentication metadata and admits their decoded payloads on read. Small data
-objects and core structural pages retain immediate read-after-write caching.
-The first payload read of a large data object decompresses it normally, then
+A native writer checks each child of a put. For freshly appended opaque objects
+and byte leaves above 2 KiB, it caches authentication metadata and admits their
+decoded payloads on read. Small byte leaves and core structural pages retain
+immediate read-after-write caching. The first deferred payload read decompresses it normally, then
 caches it under the existing byte budget. This keeps streams of newly written
 data from displacing decoded tree pages. A child with an authenticated occurrence
 in the cache needs no read. The append index also authenticates children the writer
@@ -190,6 +189,21 @@ releases larger buffers after the operation. The index is empty after
 existing file. The writer does not read an appended frame again for this
 check, so the check does not find bytes that changed in the file after the
 append; `validate` reads every frame of the published graph.
+
+`ObjectStore::visit_verified` exposes authenticated `ObjectView` parts only for
+the callback's lifetime. Its default uses the ordinary verified shared read;
+arena-backed stores can borrow their immutable slices instead. Resource batch
+editing uses this visit when parsing a directory page, preserving the same
+frame, decoded-byte and resident-memory charges without requiring an owned
+payload copy. Callers needing a pin can still request a shared owned object.
+
+`put_unretained` is a strict write with deferred decoded-cache admission. Native
+stores still compute identity, validate the schema and authenticate every child,
+but retain only exact type/provenance metadata for a newly appended object.
+This lets a publication write final pages from an arena without copying their
+bodies and child vectors into the cache. An adapter's default is ordinary `put`.
+Duplicate references, stored frame bytes and publication behavior are unchanged;
+the first subsequent payload read uses normal authenticated cache admission.
 
 `VerifiedObject` carries immutable bytes and their authenticated identity from a
 store read into a closure copy. Native and private staging writers reuse that

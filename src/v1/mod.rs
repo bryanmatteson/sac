@@ -112,6 +112,46 @@ pub struct CanonicalObject {
     pub bytes: Vec<u8>,
     pub children: Vec<ObjectRef>,
 }
+/// Borrowed canonical parts. A staging store can expose immutable arena storage
+/// for the duration of a visit without constructing an owned object.
+#[derive(Clone, Copy)]
+pub struct ObjectView<'a> {
+    pub kind: u16,
+    pub version: u16,
+    pub bytes: &'a [u8],
+    pub children: &'a [ObjectRef],
+}
+impl<'a> From<&'a CanonicalObject> for ObjectView<'a> {
+    fn from(object: &'a CanonicalObject) -> Self {
+        Self {
+            kind: object.kind,
+            version: object.version,
+            bytes: &object.bytes,
+            children: &object.children,
+        }
+    }
+}
+impl ObjectView<'_> {
+    pub fn canonical_len(&self) -> usize {
+        8 + 32 * self.children.len() + self.bytes.len()
+    }
+    pub fn hash(&self) -> ObjectHash {
+        hash_object_parts(self.kind, self.version, self.bytes, self.children)
+    }
+    /// Validate intrinsic size and schema. This does not authenticate an
+    /// expected identity, child occurrences or the reachable closure.
+    pub fn validate(&self) -> Result<()> {
+        schema::validate_core_shape(self.kind, self.version, self.bytes, self.children.len())
+    }
+    pub fn to_owned(&self) -> CanonicalObject {
+        CanonicalObject {
+            kind: self.kind,
+            version: self.version,
+            bytes: self.bytes.to_vec(),
+            children: self.children.to_vec(),
+        }
+    }
+}
 impl CanonicalObject {
     /// Check the canonical byte and child-count limits without encoding or
     /// hashing. Custom staging stores must enforce the same limits as writers.
@@ -315,6 +355,17 @@ pub trait ObjectStore {
         validate_core_object(&object)?;
         Ok(object)
     }
+    /// Visit one authenticated object without requiring owned payload storage.
+    /// Overrides uphold the same identity and intrinsic-schema checks as
+    /// `get_verified_shared`. Borrowed parts cannot outlive the callback.
+    fn visit_verified(
+        &self,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(ObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let object = self.get_verified_shared(reference)?;
+        visitor(ObjectView::from(object.as_ref()))
+    }
     /// Capture the result of this source's authenticated read without exposing
     /// a caller-supplied known-hash write API.
     fn verified_object(&self, reference: ObjectRef) -> Result<VerifiedObject> {
@@ -373,6 +424,19 @@ pub trait ObjectStore {
         bytes: &[u8],
         children: &[ObjectRef],
     ) -> Result<ObjectRef>;
+    /// Strict put for a final staged object whose payload need not be retained
+    /// eagerly in the destination's decoded cache. This changes only admission;
+    /// identity, schema, physical child authentication and deduplication remain
+    /// those of `put`. Stores without an admission policy use ordinary put.
+    fn put_unretained(
+        &mut self,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        self.put(kind, version, bytes, children)
+    }
     /// The number of objects that [`ObjectStore::prepare`] encodes at the same
     /// time. One means that this store encodes each object in its put.
     fn prepare_width(&self) -> usize {

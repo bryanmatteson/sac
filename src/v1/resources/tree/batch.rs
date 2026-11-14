@@ -207,28 +207,28 @@ fn batch_page<S: ObjectStore + ?Sized>(
     retained: usize,
 ) -> Result<(u64, Pages)> {
     budget.edge()?;
-    let object = root
-        .map(|r| batch_get(store, r, budget, retained))
-        .transpose()?;
-    let node = object
-        .as_ref()
-        .map(|o| directory(o))
-        .transpose()?
-        .unwrap_or(DirectoryNode::Leaf(Vec::new()));
+    let mut decoded = None;
+    if let Some(root) = root {
+        budget.memory(retained)?;
+        let previous = budget.resident_overhead;
+        budget.resident_overhead = previous
+            .checked_add(retained)
+            .ok_or(Error::Limit("resident memory"))?;
+        let result = budget.visit(store, root, &mut |object| {
+            decoded = Some((directory_view(object)?, object.canonical_len()));
+            Ok(())
+        });
+        budget.resident_overhead = previous;
+        result?;
+    }
+    let (node, object_len) = decoded.unwrap_or((DirectoryNode::Leaf(Vec::new()), 0));
     let retained = retained
-        .checked_add(
-            object
-                .as_ref()
-                .map_or(0, |o| o.canonical_len().saturating_mul(3)),
-        )
+        .checked_add(object_len.saturating_mul(3))
         .ok_or(Error::Limit("resident memory"))?;
     budget.memory(retained)?;
     match node {
         DirectoryNode::Leaf(mut entries) => {
-            let write_limit = if object
-                .as_ref()
-                .is_some_and(|o| o.canonical_len() > budget.directory_write_limit)
-            {
+            let write_limit = if object_len > budget.directory_write_limit {
                 leaf_write_limit(&entries, budget.directory_write_limit)
             } else {
                 budget.directory_write_limit
