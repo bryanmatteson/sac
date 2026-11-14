@@ -312,7 +312,15 @@ impl<'a> Iterator for Items<'a> {
             return None;
         }
         self.remaining -= 1;
-        match prefix(self.bytes) {
+        // Every Item spans exactly one well-formed value. Its last child
+        // therefore occupies the entire remaining slice: scanning a nested
+        // last field again only rediscovers the boundary we already have.
+        let item = if self.remaining == 0 {
+            admitted(self.bytes)
+        } else {
+            prefix(self.bytes)
+        };
+        match item {
             Ok(item) => {
                 self.bytes = &self.bytes[item.encoded.len()..];
                 Some(Ok(item))
@@ -337,8 +345,13 @@ impl<'a> Iterator for Pairs<'a> {
     }
 }
 
+/// Navigate one already validated, exactly bounded value. Callers must
+/// establish the same well-formedness and single-item boundary as `view`.
 pub(crate) fn admitted(bytes: &[u8]) -> Result<Item<'_>> {
-    let (major, argument, head) = header(bytes)?;
+    let (major, argument, head) = match valid_header(bytes) {
+        Some(header) => header,
+        None => header(bytes)?,
+    };
     Ok(Item {
         encoded: bytes,
         head,
@@ -379,6 +392,46 @@ mod tests {
             ),
         }
     }
+    #[test]
+    fn last_children_keep_exact_boundaries_through_nested_arrays_and_maps() {
+        fn compare(item: Item<'_>) {
+            let owned = cbor::decode(item.encoded()).unwrap();
+            let children = match owned {
+                Value::Array(children) => children,
+                Value::Map(pairs) => pairs
+                    .into_iter()
+                    .flat_map(|entry| [entry.key, entry.value])
+                    .collect(),
+                _ => return,
+            };
+            let mut items = Items {
+                bytes: &item.encoded[item.head..],
+                remaining: children.len(),
+            };
+            for child in children {
+                let next = items.next().unwrap().unwrap();
+                assert_eq!(next.encoded(), cbor::encode(&child));
+                compare(next);
+            }
+            assert!(items.next().is_none());
+        }
+        let mut seed = 712;
+        for _ in 0..2000 {
+            let encoded = cbor::encode(&value(&mut seed, 0));
+            compare(view(&encoded).unwrap());
+        }
+        // Validation still precedes navigation, including in the last child.
+        for malformed in [
+            &[0x81, 0x81][..],
+            &[0x81, 0x18, 0][..],
+            &[0x81, 0xa2, 1, 0, 0, 0][..],
+            &[0x81, 0x61, 0xff][..],
+            &[0x81, 0x80, 0][..],
+        ] {
+            assert!(view(malformed).is_err());
+        }
+    }
+
     #[test]
     fn flat_skip_agrees_with_the_recursive_scan() {
         let mut seed = 1;

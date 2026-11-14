@@ -74,7 +74,10 @@ view pins its page outside the store cache's residency budget.
 ## Frame encoding and decoding
 
 `v1::wire::FrameEncoder` and `FrameDecoder` provide reusable workspaces and
-native codec contexts. Raw frame views borrow input without moving the payload;
+native codec contexts. Borrowed CBOR navigation uses each validated value's
+exact boundary for its last child, so a nested final field is not scanned again
+to find its end. Validation still checks the complete value before navigation.
+Raw frame views borrow input without moving the payload;
 compressed views borrow the decoder's reusable output. Native writers compute
 canonical identity from the caller's bytes before allocating a new object.
 For compressed writes, the encoder assembles the domain and canonical bytes in
@@ -173,11 +176,11 @@ also take the destination's encoder. A copy from a file that this library
 wrote has the same bytes with and without this path; a copy from a file with
 frames from a different encoder keeps those frames.
 
-A native writer checks each child of a put. For freshly appended opaque objects
-and byte leaves above 2 KiB, it caches authentication metadata and admits their
-decoded payloads on read. Small byte leaves and core structural pages retain
-immediate read-after-write caching. The first deferred payload read decompresses it normally, then
-caches it under the existing byte budget. This keeps streams of newly written
+A native writer checks each child of a put. For freshly appended opaque objects,
+extent leaves and byte leaves, it caches authentication metadata and admits their
+decoded payloads on read. Directory and ordered-map pages, extent branches and
+publication controls retain immediate read-after-write caching. The first deferred
+payload read decompresses it normally, then caches it under the existing byte budget. This keeps streams of newly written
 data from displacing decoded tree pages. A child with an authenticated occurrence
 in the cache needs no read. The append index also authenticates children the writer
 appended when the hash, offset and length all match. The writer reads and

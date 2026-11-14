@@ -252,7 +252,7 @@ fn main() {
             result
         }
         #[cfg(feature = "optimized-api")]
-        "append-final-page-steady" => {
+        "append-final-page-steady" | "append-extent-leaf-steady" => {
             store
                 .set_append_index_memory_budget(512 + 256 * 2048)
                 .unwrap();
@@ -261,10 +261,19 @@ fn main() {
             let mut body = [
                 0x81, 0x84, 0x41, b'f', 0, 0xa0, 0x83, 8, 0, 0x48, 0, 0, 0, 0, 0, 0, 0, 0,
             ];
+            let extent_leaf = case == "append-extent-leaf-steady";
+            // An extent of holes needs no backing byte child. Fixed-width
+            // values above u32::MAX keep the CBOR integer minimal and valid.
+            let mut extent = [0x81, 0x82, 0x1b, 0, 0, 0, 0, 0, 0, 0, 0, 0xf6];
             let warm_entries = 8500u64;
             for ordinal in 0..warm_entries {
-                body[10..].copy_from_slice(&ordinal.to_le_bytes());
-                store.put_unretained(3, 1, &body, &[]).unwrap();
+                if extent_leaf {
+                    extent[3..11].copy_from_slice(&(ordinal + (1 << 32)).to_be_bytes());
+                    store.put(5, 1, &extent, &[]).unwrap();
+                } else {
+                    body[10..].copy_from_slice(&ordinal.to_le_bytes());
+                    store.put_unretained(3, 1, &body, &[]).unwrap();
+                }
             }
             let published = store.publish(snapshot).unwrap();
             let scratch = store.temporary_bytes().unwrap();
@@ -272,9 +281,14 @@ fn main() {
             let mut ordinal = warm_entries;
             let result = sample(
                 || {
-                    body[10..].copy_from_slice(&ordinal.to_le_bytes());
+                    let reference = if extent_leaf {
+                        extent[3..11].copy_from_slice(&(ordinal + (1 << 32)).to_be_bytes());
+                        store.put(5, 1, black_box(&extent), &[]).unwrap()
+                    } else {
+                        body[10..].copy_from_slice(&ordinal.to_le_bytes());
+                        store.put_unretained(3, 1, black_box(&body), &[]).unwrap()
+                    };
                     ordinal += 1;
-                    let reference = store.put_unretained(3, 1, black_box(&body), &[]).unwrap();
                     operation_hash = Some(reference.hash);
                     black_box(reference);
                 },
@@ -433,6 +447,7 @@ fn main() {
             | "append-steady"
             | "append-cached-steady"
             | "append-final-page-steady"
+            | "append-extent-leaf-steady"
             | "append-cache-churn"
             | "authenticate-steady"
             | "rewrite-layout-steady"

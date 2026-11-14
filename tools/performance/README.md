@@ -32,11 +32,13 @@ during measurement. `append-cached-steady` repeats the unique append with
 the default cache and warmed authentication-index capacity.
 `append-final-page-steady` writes distinct valid directory pages through
 `put_unretained`, keeping exact type authentication with no eager decoded
-payload copies. It checks zero warmed Rust allocations and stable spill size.
+payload copies. `append-extent-leaf-steady` writes distinct valid extent leaves
+through ordinary `put`, exercising deferred payload admission with the default
+cache enabled. Both check zero warmed Rust allocations and stable spill size.
 These spill fixtures explicitly cap the append index at a 2,048-entry
 resident allowance, independently of the production default memory budget.
 `append-cache-churn` uses 32-byte payloads and a 4 KiB decoded cache so
-each append replaces a resident entry. These cases assert zero Rust
+each append replaces a resident authentication entry. These cases assert zero Rust
 allocations after warming.
 `rewrite-layout-steady` appends unique parents with eight old compressed child
 references, crossing buffered rewrite-record flushes while the address table

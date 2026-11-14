@@ -80,9 +80,6 @@ pub struct NativeStore {
 // subsequent writes. One MiB amortizes exact sparse growth as well as writes.
 const APPEND_BUFFER_BYTES: usize = 1024 * 1024;
 const DEFAULT_APPEND_INDEX_MEMORY_BYTES: usize = 8 * 1024 * 1024;
-// Small data objects keep the immediate read-after-write fast path. Larger
-// data payloads enter the decoded cache on read, preserving structural pages.
-const MAX_CACHED_DATA_APPEND: usize = 2 * 1024;
 struct AppendObject<'a> {
     kind: u16,
     version: u16,
@@ -1303,15 +1300,12 @@ impl NativeStore {
                 .inspect_err(|_| self.poisoned = true)?;
         }
         let mut cache = self.cache.lock().unwrap();
-        // Opaque objects feed parents through their references. Append
-        // provenance and type metadata serve that use without copying bodies
-        // and child vectors into the decoded cache. Populate those on read.
-        // Structural objects and small byte leaves retain immediate locality.
-        let structural = matches!(kind, 1..=6 | 8 | 9);
-        let decoded_size = bytes.len() + std::mem::size_of_val(children.as_ref());
-        let decoded = if retain_payload
-            && (structural || kind == 7 && decoded_size <= MAX_CACHED_DATA_APPEND)
-        {
+        // Payload leaves feed parents through authenticated references. Extent
+        // leaves, byte leaves and opaque objects need no decoded copy
+        // until read. Retain mutable tree pages and publication controls for
+        // read-after-write locality without displacing them with leaf payloads.
+        let structural = matches!(kind, 1..=4 | 6 | 8 | 9);
+        let decoded = if retain_payload && structural {
             cache.admit_append(
                 self.file_identity,
                 reference,

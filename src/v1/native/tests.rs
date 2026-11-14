@@ -317,8 +317,46 @@ fn opaque_appends_keep_exact_types_and_admit_payloads_only_on_read() {
     ));
     assert_eq!(store.physical_statistics().read_bytes, before.read_bytes);
     assert_eq!(store.get(parent).unwrap().children, [opaque]);
-    // Small byte leaves still have their immediate read-after-write payload.
-    assert!(store.cache.get(store.file_identity, child).is_some());
+    // Small byte leaves also defer payload residency until explicitly read.
+    assert!(store.cache.get(store.file_identity, child).is_none());
+}
+
+#[test]
+fn extent_and_byte_leaf_payloads_are_deferred_without_losing_exact_authentication() {
+    let (_dir, mut store) = store();
+    for bytes in [b"leaf".as_slice(), &[7; 2048], &[9; 8192]] {
+        let leaf = store.put(7, 1, bytes, &[]).unwrap();
+        let body = cbor::encode(&cbor::Value::Array(vec![cbor::Value::Array(vec![
+            cbor::Value::Uint(bytes.len() as u64),
+            cbor::Value::Uint(0),
+        ])]));
+        let extent = store.put(5, 1, &body, &[leaf]).unwrap();
+        for (reference, kind) in [(leaf, 7), (extent, 5)] {
+            assert!(store.cache.get(store.file_identity, reference).is_none());
+            assert_eq!(
+                store.cached_object_type(reference).unwrap(),
+                Some((kind, 1))
+            );
+            let mut wrong = reference;
+            wrong.address.length += 8;
+            assert!(store.put(65000, 1, b"bad locator", &[wrong]).is_err());
+        }
+        let before = store.physical_statistics();
+        store.put(65000, 1, b"parent", &[extent]).unwrap();
+        assert_eq!(store.physical_statistics(), before);
+        let pin = store.get_verified_shared(extent).unwrap();
+        assert_eq!(pin.bytes, body);
+        assert_eq!(pin.children, [leaf]);
+        let before = store.physical_statistics();
+        assert!(Arc::ptr_eq(
+            &pin,
+            &store.get_verified_shared(extent).unwrap()
+        ));
+        assert_eq!(store.physical_statistics(), before);
+        store.discard_disposable_caches();
+        assert_eq!(pin.bytes, body);
+        assert_eq!(store.get(leaf).unwrap().bytes, bytes);
+    }
 }
 
 #[test]
@@ -420,9 +458,14 @@ fn small_frame_appends_coalesce_and_cache_misses_drain_before_reading() {
     assert!(store.file.lock().unwrap().metadata().unwrap().len() < store.end);
     assert!(!store.append_buffer.lock().unwrap().bytes.is_empty());
     assert_eq!(store.get(first).unwrap().bytes, b"buffered immutable bytes");
+    assert!(store.append_buffer.lock().unwrap().bytes.is_empty());
+    // The first read admits the deferred leaf. Subsequent hits need no
+    // flush even when another frame is waiting in the append buffer.
+    let second = store.put(7, 1, b"another buffered leaf", &[]).unwrap();
+    assert_eq!(store.get(first).unwrap().bytes, b"buffered immutable bytes");
     assert!(!store.append_buffer.lock().unwrap().bytes.is_empty());
     store.set_decoded_cache_budget(0);
-    assert_eq!(store.get(first).unwrap().bytes, b"buffered immutable bytes");
+    assert_eq!(store.get(second).unwrap().bytes, b"another buffered leaf");
     assert!(store.append_buffer.lock().unwrap().bytes.is_empty());
     let root = snapshot(&mut store, b"durable buffered snapshot");
     store.publish(root).unwrap();
