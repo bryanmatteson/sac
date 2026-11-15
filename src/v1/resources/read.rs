@@ -543,114 +543,118 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     ) -> Result<()> {
         budget.depth(depth)?;
         budget.edge()?;
-        let object = budget.get(self.store, root)?;
-        if object.version != 1 || object.canonical_len() > PAGE_LIMIT {
-            return Err(corrupt("extent schema or page size"));
-        }
-        let body = crate::v1::cbor_view::admitted(&object.bytes)?;
-        match object.kind {
-            5 => {
-                if expected_height.is_some_and(|h| h != 0) {
-                    return Err(corrupt("extent leaf height"));
-                }
-                let rows = body.array()?;
-                if rows.len() == 0 {
-                    return Err(corrupt("empty extent leaf"));
-                }
-                let mut prior = 0u64;
-                for value in rows {
-                    let row = value?.fields::<2>()?;
-                    let length = row[0].uint()?;
-                    if length == 0 {
-                        return Err(corrupt("zero extent"));
+        budget.visit_for_copy(self.store, root, None, &mut |object, budget, _| {
+            if object.version != 1 || object.canonical_len() > PAGE_LIMIT {
+                return Err(corrupt("extent schema or page size"));
+            }
+            let body = crate::v1::cbor_view::admitted(object.bytes)?;
+            match object.kind {
+                5 => {
+                    if expected_height.is_some_and(|h| h != 0) {
+                        return Err(corrupt("extent leaf height"));
                     }
-                    let next = prior
-                        .checked_add(length)
-                        .ok_or_else(|| corrupt("extent sum overflow"))?;
-                    if start < next && end > prior {
-                        let a = start.saturating_sub(prior);
-                        let b = end.min(next) - prior;
-                        if !row[1].is_null() {
+                    let rows = body.array()?;
+                    if rows.len() == 0 {
+                        return Err(corrupt("empty extent leaf"));
+                    }
+                    let mut prior = 0u64;
+                    for value in rows {
+                        let row = value?.fields::<2>()?;
+                        let length = row[0].uint()?;
+                        if length == 0 {
+                            return Err(corrupt("zero extent"));
+                        }
+                        let next = prior
+                            .checked_add(length)
+                            .ok_or_else(|| corrupt("extent sum overflow"))?;
+                        if start < next && end > prior {
+                            let a = start.saturating_sub(prior);
+                            let b = end.min(next) - prior;
+                            if !row[1].is_null() {
+                                let r = *object
+                                    .children
+                                    .get(row[1].uint()? as usize)
+                                    .ok_or_else(|| corrupt("child index"))?;
+                                budget.check_reference(root, r)?;
+                                budget.edge()?;
+                                if let Some(output) = output.as_deref_mut() {
+                                    budget.visit_for_copy(self.store, r, None, &mut |data, _, _| {
+                                        if data.kind != 7
+                                            || data.version != 1
+                                            || !data.children.is_empty()
+                                            || data.bytes.len() as u64 != length
+                                        {
+                                            return Err(corrupt("extent byte object length or type"));
+                                        }
+                                        output
+                                            .write_all(&data.bytes[a as usize..b as usize])
+                                            .map_err(Error::from)
+                                    })?;
+                                } else {
+                                    // A successful graph copy checks this exact edge's
+                                    // kind and length. Charge the namespace visit now.
+                                    let decoded = length
+                                        .checked_add(8)
+                                        .and_then(|len| usize::try_from(len).ok())
+                                        .filter(|len| *len <= super::super::MAX_CHUNK_SIZE)
+                                        .ok_or_else(|| corrupt("extent byte object length or type"))?;
+                                    budget.charge_reference(r)?;
+                                    budget.charge_decoded(decoded)?;
+                                }
+                            } else if let Some(output) = output.as_deref_mut() {
+                                write_zeros(output, b - a, budget)?;
+                            }
+                        }
+                        prior = next;
+                    }
+                    if prior != expected_length {
+                        return Err(corrupt("extent root length mismatch"));
+                    }
+                }
+                6 => {
+                    let fields = body.fields::<2>()?;
+                    let height = fields[0].uint()?;
+                    if !(1..=16).contains(&height) || expected_height.is_some_and(|h| h != height) {
+                        return Err(corrupt("extent branch height"));
+                    }
+                    let rows = fields[1].array()?;
+                    if rows.len() < 2 {
+                        return Err(corrupt("unary extent branch"));
+                    }
+                    let mut prior = 0u64;
+                    for value in rows {
+                        let row = value?.fields::<2>()?;
+                        let next = row[0].uint()?;
+                        if next <= prior {
+                            return Err(corrupt("unordered extent ends"));
+                        }
+                        if start < next && end > prior {
                             let r = *object
                                 .children
                                 .get(row[1].uint()? as usize)
                                 .ok_or_else(|| corrupt("child index"))?;
                             budget.check_reference(root, r)?;
-                            budget.edge()?;
-                            if let Some(output) = output.as_deref_mut() {
-                                let data = budget.get(self.store, r)?;
-                                if data.kind != 7
-                                    || data.version != 1
-                                    || !data.children.is_empty()
-                                    || data.bytes.len() as u64 != length
-                                {
-                                    return Err(corrupt("extent byte object length or type"));
-                                }
-                                output.write_all(&data.bytes[a as usize..b as usize])?;
-                            } else {
-                                // A successful graph copy checks this exact edge's
-                                // kind and length. Charge the namespace visit now.
-                                let decoded = length
-                                    .checked_add(8)
-                                    .and_then(|len| usize::try_from(len).ok())
-                                    .filter(|len| *len <= super::super::MAX_CHUNK_SIZE)
-                                    .ok_or_else(|| corrupt("extent byte object length or type"))?;
-                                budget.charge_reference(r)?;
-                                budget.charge_decoded(decoded)?;
-                            }
-                        } else if let Some(output) = output.as_deref_mut() {
-                            write_zeros(output, b - a, budget)?;
+                            self.extents(
+                                r,
+                                next - prior,
+                                Some(height - 1),
+                                start.saturating_sub(prior),
+                                end.min(next) - prior,
+                                output.as_deref_mut(),
+                                budget,
+                                depth + 1,
+                            )?;
                         }
+                        prior = next;
                     }
-                    prior = next;
+                    if prior != expected_length {
+                        return Err(corrupt("extent branch coverage mismatch"));
+                    }
                 }
-                if prior != expected_length {
-                    return Err(corrupt("extent root length mismatch"));
-                }
+                _ => return Err(corrupt("expected extent node")),
             }
-            6 => {
-                let fields = body.fields::<2>()?;
-                let height = fields[0].uint()?;
-                if !(1..=16).contains(&height) || expected_height.is_some_and(|h| h != height) {
-                    return Err(corrupt("extent branch height"));
-                }
-                let rows = fields[1].array()?;
-                if rows.len() < 2 {
-                    return Err(corrupt("unary extent branch"));
-                }
-                let mut prior = 0u64;
-                for value in rows {
-                    let row = value?.fields::<2>()?;
-                    let next = row[0].uint()?;
-                    if next <= prior {
-                        return Err(corrupt("unordered extent ends"));
-                    }
-                    if start < next && end > prior {
-                        let r = *object
-                            .children
-                            .get(row[1].uint()? as usize)
-                            .ok_or_else(|| corrupt("child index"))?;
-                        budget.check_reference(root, r)?;
-                        self.extents(
-                            r,
-                            next - prior,
-                            Some(height - 1),
-                            start.saturating_sub(prior),
-                            end.min(next) - prior,
-                            output.as_deref_mut(),
-                            budget,
-                            depth + 1,
-                        )?;
-                    }
-                    prior = next;
-                }
-                if prior != expected_length {
-                    return Err(corrupt("extent branch coverage mismatch"));
-                }
-            }
-            _ => return Err(corrupt("expected extent node")),
-        }
-        Ok(())
+            Ok(())
+        })
     }
     /// Verify the selected snapshot closure. Commit attachments are verified
     /// only when the caller supplies its selected Commit to `verify_commit`.
@@ -789,6 +793,23 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         output: W,
         max_copy_temp_bytes: u64,
     ) -> Result<W> {
+        self.pack_verified_commit_with_options(
+            commit,
+            output,
+            max_copy_temp_bytes,
+            super::super::SealingOptions::default(),
+        )
+    }
+    /// Verify and seal with an explicit source-encoding policy. Authentication,
+    /// namespace geometry and operation charges match `pack_verified_commit`.
+    #[cfg(feature = "native")]
+    pub fn pack_verified_commit_with_options<W: Write>(
+        &self,
+        commit: ObjectRef,
+        output: W,
+        max_copy_temp_bytes: u64,
+        options: super::super::SealingOptions,
+    ) -> Result<W> {
         let mut verification = Budget::new(self.limits.clone());
         // The copy's direct role checks authenticate every extent byte leaf
         // before it is exported, including its declared length.
@@ -800,7 +821,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
             commit,
             output,
             copy_limits,
-            1,
+            options,
             Some((self.snapshot, verification)),
         )
     }
@@ -882,6 +903,24 @@ impl ResourceView {
                 .uint()
                 .expect("admitted length")
         })
+    }
+    /// Borrow a file's authenticated storage descriptor without reading or
+    /// copying its payload. An extent descriptor retains its exact child
+    /// reference; validate the complete extent graph before sharing it into a
+    /// new snapshot, as required by `ArchiveBuilder::set_files_batch`.
+    pub fn file_contents(&self) -> Result<Option<FileContents<'_>>> {
+        if self.kind() != EntryKind::File {
+            return Ok(None);
+        }
+        let [length, storage, data] = self.entry.fields()?[3].fields()?;
+        Ok(Some(match storage.uint()? {
+            0 => FileContents::Inline(data.bytes()?),
+            1 => FileContents::Extents {
+                length: length.uint()?,
+                root: self.entry.child(data)?,
+            },
+            _ => return Err(corrupt("unknown file storage")),
+        }))
     }
     pub fn link_target(&self) -> Option<&[u8]> {
         (self.kind() == EntryKind::Symlink).then(|| {

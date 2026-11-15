@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 mod extract;
 mod graph;
+pub mod live_map;
+pub use live_map::{LiveMap, LiveMapReader};
 mod pages;
 mod read;
 #[cfg(feature = "native")]
@@ -20,7 +22,7 @@ pub use read::{
 };
 #[cfg(feature = "native")]
 pub use salvage::{SalvageReport, salvage};
-pub use tree::{ArchiveBuilder, ExtentAccumulator, PackingStatistics, SparseSegment};
+pub use tree::{ArchiveBuilder, ExtentAccumulator, FileContents, PackingStatistics, SparseSegment};
 
 pub type ResourcePath = Vec<Vec<u8>>;
 pub const INLINE_LIMIT: usize = 48 * 1024;
@@ -193,7 +195,9 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
     // parent after its children; immutable stores can serve that from cache.
     graph.push(root, false, &budget)?;
     let mut children = Vec::new();
-    while let Some((r, expanded)) = graph.pop()? {
+    let mut byte_lengths = [0u32; super::MAX_CHILDREN];
+    let preserve_encoding = destination.preserves_source_encoding();
+    while let Some((r, expanded, byte_length)) = graph.pop_for_copy()? {
         budget.time()?;
         if expanded {
             if graph.mapped(r.hash)?.is_some() {
@@ -201,28 +205,59 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
                 continue;
             }
         } else {
-            if graph.completed(r)? {
+            if graph.completed_for_copy(r, byte_length)? {
                 continue;
             }
             graph.enter(r, &budget)?;
         }
-        budget.visit_for_copy(
+        budget.visit_for_copy_encoded(
             source,
             r,
+            preserve_encoding,
             if expanded {
                 None
             } else {
                 verification.as_mut()
             },
-            &mut |object, budget, mut verification| {
+            &mut |verified, budget, mut verification| {
+                let object = verified.object();
+                if byte_length != 0 {
+                    super::schema::CoreRole::Bytes(u64::from(byte_length)).check::<false>(
+                        super::schema::CoreShape {
+                            kind: object.kind,
+                            version: object.version,
+                            bytes: object.bytes,
+                            child_count: object.children.len(),
+                        },
+                    )?;
+                }
                 if !expanded {
-                    super::schema::validate_core_edges_with(object, |child, check| {
+                    byte_lengths[..object.children.len()].fill(0);
+                    super::schema::visit_core_roles(object, |index, role| {
+                        let child = object.children[index];
+                        if let super::schema::CoreRole::Bytes(length) = role {
+                            // A valid byte leaf has no children and exactly
+                            // eight canonical header bytes. Charge every role
+                            // edge now, but authenticate its actual kind/length
+                            // on the ordinary copy visit, before writing it.
+                            if length == 0 || length > (super::MAX_CHUNK_SIZE - 8) as u64 {
+                                return Err(corrupt("extent byte length"));
+                            }
+                            let length = length as u32;
+                            let expected = &mut byte_lengths[index];
+                            if *expected != 0 && *expected != length {
+                                return Err(corrupt("extent byte length"));
+                            }
+                            *expected = length;
+                            budget.charge_byte_role(child, length, verification.as_deref_mut())?;
+                            return Ok(());
+                        }
                         budget.visit_for_copy(
                             source,
                             child,
                             verification.as_deref_mut(),
                             &mut |child, _, _| {
-                                check(super::schema::CoreShape {
+                                role.check::<false>(super::schema::CoreShape {
                                     kind: child.kind,
                                     version: child.version,
                                     bytes: child.bytes,
@@ -241,15 +276,15 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
                     // Retain only references across descendants, never payloads.
                     if !object.children.is_empty() {
                         graph.push(r, true, budget)?;
-                        for child in object.children.iter().rev() {
-                            graph.push(*child, false, budget)?;
+                        for (index, child) in object.children.iter().enumerate().rev() {
+                            graph.push_for_copy(*child, byte_lengths[index], budget)?;
                         }
                         return Ok(());
                     }
                 }
                 // Deduplicate only completed identical physical occurrences.
                 // Another offset/span with the same ID can carry other locators.
-                graph.complete(r, budget)?;
+                graph.complete_for_copy(r, object, budget)?;
                 if !expanded && graph.mapped(r.hash)?.is_some() {
                     return Ok(());
                 }
@@ -257,10 +292,6 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
                 for child in object.children {
                     children.push(graph.mapped(child.hash)?.ok_or(Error::Missing)?);
                 }
-                let verified = super::VerifiedObjectView {
-                    hash: r.hash,
-                    object,
-                };
                 let result = destination.put_verified_view(&verified, &children)?;
                 if result.hash != r.hash {
                     return Err(corrupt("copy changed canonical identity"));
@@ -374,6 +405,8 @@ pub(crate) struct Budget {
 }
 type CopyVisitor<'a> =
     dyn FnMut(ObjectView<'_>, &mut Budget, Option<&mut Budget>) -> Result<()> + 'a;
+type EncodedCopyVisitor<'a> =
+    dyn FnMut(super::VerifiedObjectView<'_>, &mut Budget, Option<&mut Budget>) -> Result<()> + 'a;
 impl Budget {
     pub fn new(limits: Limits) -> Self {
         Self {
@@ -502,6 +535,60 @@ impl Budget {
             }
             self.charge_decoded(object.canonical_len())?;
             visitor(object, self, verification.as_deref_mut())
+        })
+    }
+    fn charge_byte_role(
+        &mut self,
+        reference: ObjectRef,
+        length: u32,
+        verification: Option<&mut Self>,
+    ) -> Result<()> {
+        self.charge_reference(reference)?;
+        self.time()?;
+        if let Some(verification) = verification {
+            verification.charge_reference(reference)?;
+            verification.charge_decoded(8 + length as usize)?;
+        }
+        self.charge_decoded(8 + length as usize)
+    }
+    fn visit_for_copy_encoded<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &S,
+        r: ObjectRef,
+        preserve_encoding: bool,
+        mut verification: Option<&mut Self>,
+        visitor: &mut EncodedCopyVisitor<'_>,
+    ) -> Result<()> {
+        if !preserve_encoding {
+            return self.visit_for_copy(
+                store,
+                r,
+                verification,
+                &mut |object, budget, verification| {
+                    visitor(
+                        super::VerifiedObjectView {
+                            hash: r.hash,
+                            object,
+                            encoded: None,
+                        },
+                        budget,
+                        verification,
+                    )
+                },
+            );
+        }
+        self.charge_reference(r)?;
+        self.time()?;
+        if let Some(verification) = &mut verification {
+            verification.charge_reference(r)?;
+        }
+        store.visit_verified_encoded(r, &mut |verified| {
+            let length = verified.object().canonical_len();
+            if let Some(verification) = &mut verification {
+                verification.charge_decoded(length)?;
+            }
+            self.charge_decoded(length)?;
+            visitor(verified, self, verification.as_deref_mut())
         })
     }
     fn charge_reference(&mut self, r: ObjectRef) -> Result<()> {

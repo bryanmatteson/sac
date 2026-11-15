@@ -13,6 +13,7 @@ pub(crate) mod graph;
 mod leases;
 #[cfg(unix)]
 mod maintenance;
+mod memtable;
 #[cfg(unix)]
 mod platform;
 mod spill;
@@ -20,11 +21,14 @@ mod temporary;
 mod validation;
 #[cfg(unix)]
 pub use maintenance::{OnlineReclamation, ReclamationOptions, ReclamationStatistics};
+pub use memtable::{MemtableIoStatistics, MemtableOptions, MemtableStatistics, MemtableStore, Mutation};
 pub use spill::ClosureCopy;
 use spill::{DiskRefs, DiskStack};
 pub use temporary::TemporaryIoStatistics;
 include!("native/cache.rs");
 include!("native/metrics.rs");
+
+type RecoveryCheck<'a> = dyn Fn(&NativeStore) -> Result<()> + 'a;
 
 pub struct NativeStore {
     #[cfg(unix)]
@@ -324,11 +328,21 @@ impl NativeStore {
         })
     }
     pub fn open(path: impl AsRef<Path>, writable: bool) -> Result<Self> {
+        Self::open_with_recovery_check(path.as_ref(), writable, None)
+    }
+    // A WAL-owning consumer may explicitly opt into recovery of a torn slot
+    // after validating its durable recovery input. Ordinary NativeStore opens
+    // retain their fail-closed RecoveryRequired contract.
+    fn open_with_recovery_check(
+        path: &Path,
+        writable: bool,
+        recovery_check: Option<&RecoveryCheck<'_>>,
+    ) -> Result<Self> {
         let (path, fence) = if writable {
-            let (p, f) = publication_fence(path.as_ref())?;
+            let (p, f) = publication_fence(path)?;
             (p, Some(f))
         } else {
-            (path.as_ref().into(), None)
+            (path.to_path_buf(), None)
         };
         let mut file = options(writable).open(&path)?;
         #[cfg(unix)]
@@ -366,7 +380,7 @@ impl NativeStore {
         if writable && reader.header.policy != wire::LocatorPolicy::Live {
             return Err(Error::Unsupported("sealed files are immutable".into()));
         }
-        if writable && !reader.recovery_diagnostics.is_empty() {
+        if writable && !reader.recovery_diagnostics.is_empty() && recovery_check.is_none() {
             return Err(Error::RecoveryRequired);
         }
         let end = reader.committed_end();
@@ -423,7 +437,10 @@ impl NativeStore {
         }
         // A complete cached slot is not evidence of durability. Stabilize both
         // ordered phases before granting a writer a durable no-op baseline.
-        if writable && has_suffix {
+        if writable && (has_suffix || !store.reader.recovery_diagnostics.is_empty()) {
+            if let Some(check) = recovery_check {
+                check(&store)?;
+            }
             let mut job = store.begin_compaction()?;
             job.budget.preserve_recovery_input = true;
             job.budget.max_pause = Duration::from_secs(3600);
@@ -564,6 +581,19 @@ impl NativeStore {
                     error: cleanup.error.clone(),
                 }
             })
+    }
+    /// Open the published flat live map (or import a plain flat resource snapshot).
+    /// Retain the returned editor across updates; opening fully authenticates the view.
+    pub fn live_map(&mut self) -> Result<super::resources::LiveMap> {
+        if self.root().is_some() {
+            let snapshot = self
+                .reader()
+                .snapshot()
+                .ok_or_else(|| Error::Corrupt("published snapshot missing".into()))?;
+            super::resources::LiveMap::open(self, snapshot)
+        } else {
+            super::resources::LiveMap::new(self)
+        }
     }
     pub fn root(&self) -> Option<Publication> {
         self.reader.publication
@@ -2023,24 +2053,34 @@ impl Drop for NativeReader {
         c.pinned_metadata = c.pinned_metadata.saturating_sub(self.metadata_charge);
     }
 }
-impl ObjectStore for NativeReader {
-    fn get_verified_shared(&self, r: ObjectRef) -> Result<Arc<CanonicalObject>> {
-        self.get_shared(r)
-    }
-    fn visit_verified(
+impl NativeReader {
+    fn visit_verified_parts(
         &self,
         reference: ObjectRef,
-        visitor: &mut dyn FnMut(ObjectView<'_>) -> Result<()>,
+        keep_encoding: bool,
+        visitor: &mut dyn FnMut(VerifiedObjectView<'_>) -> Result<()>,
     ) -> Result<()> {
         let first = self.reader.first_record_offset();
         let end = self.reader.trailer_offset();
         wire::validate_address(reference.address, first, end)?;
-        let mut read = match self
-            .cache
-            .get_or(self.file_identity, reference, |cache| cache.take_borrowed())
-        {
-            Ok(object) => return visitor(object.as_ref().into()),
-            Err(read) => read,
+        let (mut read, cached, track_encoding) = if keep_encoding {
+            let mut cache = self.cache.lock().unwrap();
+            cache.track_encoding = true;
+            let cached = cache.encoded_object(self.file_identity, reference);
+            (cache.take_borrowed(), cached, true)
+        } else {
+            match self.cache.get_or(self.file_identity, reference, |cache| {
+                (cache.take_borrowed(), cache.track_encoding)
+            }) {
+                Ok(object) => {
+                    return visitor(VerifiedObjectView {
+                        hash: reference.hash,
+                        object: object.as_ref().into(),
+                        encoded: None,
+                    });
+                }
+                Err((read, tracking)) => (read, None, tracking),
+            }
         };
         let result = (|| {
             read.frame.resize(reference.address.length as usize, 0);
@@ -2058,34 +2098,95 @@ impl ObjectStore for NativeReader {
                     ReadClass::Object,
                 )?;
             }
+            // A digest retained with authenticated canonical parts binds all
+            // frame bytes, including codec, padding and original child locators.
+            // Check newly read bytes before granting the encoded capability;
+            // a decoded-cache hit by itself cannot authenticate those bytes.
+            if let Some((object, expected)) = &cached {
+                let proof = ObjectHash(*blake3::hash(&read.frame).as_bytes());
+                if proof != *expected {
+                    return Err(corrupt("source frame changed during encoded visit"));
+                }
+                return visitor(VerifiedObjectView {
+                    hash: reference.hash,
+                    object: object.as_ref().into(),
+                    encoded: Some(super::EncodedPayload {
+                        codec: read.frame[4],
+                        bytes: &read.frame[56..56
+                            + u32::from_le_bytes(read.frame[8..12].try_into().unwrap()) as usize],
+                    }),
+                });
+            }
             let returning_workspace = read.retained_bytes();
             let frame = read.decoder.decode(reference, &read.frame, first, end)?;
             read.children.clear();
             read.children
                 .extend((0..frame.child_count()).map(|index| frame.child(index).unwrap()));
-            // Role checks and postorder traversal revisit the same occurrence.
-            // Retain authenticated parts under the ordinary cache budget, reusing
-            // unpinned victims instead of transferring the decoder's allocation.
-            self.cache.lock().unwrap().admit_parts(
-                self.file_identity,
-                reference,
-                AppendObject {
-                    kind: frame.kind,
-                    version: frame.version,
-                    bytes: Cow::Borrowed(frame.body),
-                    children: Cow::Borrowed(&read.children),
-                },
-                returning_workspace,
-            );
-            visitor(ObjectView {
+            let parts = AppendObject {
                 kind: frame.kind,
                 version: frame.version,
-                bytes: frame.body,
-                children: &read.children,
+                bytes: Cow::Borrowed(frame.body),
+                children: Cow::Borrowed(&read.children),
+            };
+            // Compute a proof only if an authenticated decoded entry can
+            // retain it. One-pass encoded leaves have no entry to certify;
+            // their ordinary decode already authenticated these exact bytes.
+            let proof = || track_encoding.then(|| ObjectHash(*blake3::hash(&read.frame).as_bytes()));
+            // Encoded reads only refresh proofs on existing entries. Their
+            // borrowed payloads never force another owned cache allocation.
+            // Ordinary role/read visits retain bounded cache admission.
+            if keep_encoding {
+                self.cache.lock().unwrap().certify_parts(
+                    self.file_identity,
+                    reference,
+                    &parts,
+                    proof,
+                );
+            } else {
+                self.cache.lock().unwrap().admit_parts(
+                    self.file_identity,
+                    reference,
+                    parts,
+                    returning_workspace,
+                    proof,
+                );
+            }
+            visitor(VerifiedObjectView {
+                hash: reference.hash,
+                object: ObjectView {
+                    kind: frame.kind,
+                    version: frame.version,
+                    bytes: frame.body,
+                    children: &read.children,
+                },
+                encoded: keep_encoding.then(|| super::EncodedPayload {
+                    codec: read.frame[4],
+                    bytes: &read.frame[56..56
+                        + u32::from_le_bytes(read.frame[8..12].try_into().unwrap()) as usize],
+                }),
             })
         })();
         self.cache.lock().unwrap().return_borrowed(read);
         result
+    }
+}
+impl ObjectStore for NativeReader {
+    fn get_verified_shared(&self, r: ObjectRef) -> Result<Arc<CanonicalObject>> {
+        self.get_shared(r)
+    }
+    fn visit_verified(
+        &self,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(ObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_verified_parts(reference, false, &mut |verified| visitor(verified.object()))
+    }
+    fn visit_verified_encoded(
+        &self,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(VerifiedObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_verified_parts(reference, true, visitor)
     }
     fn cached_object_type(&self, reference: ObjectRef) -> Result<Option<(u16, u16)>> {
         let scope = self.physical_read_scope().unwrap();
@@ -2281,17 +2382,23 @@ fn read_object_keeping(
     // A larger cached window may also contain a later request for a larger
     // frame. Cached bytes still confer no authority before frame validation.
     // Each step of a read that needs the cache takes the exclusive lock once.
-    let (use_window, resident) = {
+    let (use_window, resident, window_buffer) = {
         let mut governing = cache.lock().unwrap();
         let use_window =
             (recent_metadata || length <= 1024) && governing.can_read_window(window_length);
         let hit = governing.read_window(identity, r.address.offset, &mut frame);
-        (use_window, hit.then(|| governing.take_decoder()))
+        let buffer = if use_window && !hit {
+            governing.take_window_buffer(window_length)
+        } else {
+            None
+        };
+        (use_window, hit.then(|| governing.take_decoder()), buffer)
     };
     let mut decoder = match resident {
         Some(decoder) => decoder,
         None if use_window => {
-            let mut bytes = vec![0; window_length];
+            let mut bytes = window_buffer.unwrap_or_default();
+            bytes.resize(window_length, 0);
             counted_read_at(file, &mut bytes, window_start, io, ReadClass::Object)?;
             let at = (r.address.offset - window_start) as usize;
             frame.copy_from_slice(&bytes[at..at + length]);
@@ -2313,14 +2420,20 @@ fn read_object_keeping(
                 .map(|bytes| Arc::new(bytes.to_vec()))
         })
         .flatten();
+    let proof = cache
+        .lock()
+        .unwrap()
+        .track_encoding
+        .then(|| ObjectHash(*blake3::hash(&frame).as_bytes()));
     let decoded = decoder.decode_owned(r, frame, first, end);
     let mut cache = cache.lock().unwrap();
     cache.return_decoder(decoder);
     let object = Arc::new(decoded?);
     cache.verify(identity, r, (object.kind, object.version));
-    cache.insert_shared(identity, r, &object);
+    cache.insert_shared(identity, r, &object, proof);
     Ok((object, compressed))
 }
+
 struct FileSource<'a> {
     file: &'a File,
     io: &'a PhysicalCounters,
@@ -2658,7 +2771,7 @@ fn validate_physical_closure(
     let budget = temporary::Budget::new(limits.max_temp_bytes);
     // Inventory keys are physical offsets; values contain span/decoded length.
     // The occurrence table below retains only the facts needed by direct roles.
-    let mut inventory = temporary::ValueGraphTable::<8, 8>::with_budget(
+    let mut inventory = temporary::ValueGraphTable::<6, 8>::with_budget(
         temporary::GraphTable::RESIDENT_ENTRIES,
         budget.clone(),
     );
@@ -2708,9 +2821,7 @@ fn validate_physical_closure(
                 return Err(corrupt("frame crosses selected extent"));
             }
             let decoded = u32::from_le_bytes(header[12..16].try_into().unwrap());
-            let mut value = [0; 8];
-            value[..4].copy_from_slice(&(span as u32).to_le_bytes());
-            value[4..].copy_from_slice(&decoded.to_le_bytes());
+            let value = validation::record(span as u32, decoded);
             inventory.insert_cancellable(&offset.to_le_bytes(), &value, &|| false)?;
             let children = u16::from_le_bytes(header[6..8].try_into().unwrap()) as u64;
             let stored = u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
@@ -2745,7 +2856,7 @@ fn validate_physical_closure(
         return Err(corrupt("physical selected end"));
     }
     drop(window);
-    let mut seen = temporary::ValueGraphTable::<12>::with_budget(
+    let mut seen = temporary::ValueGraphTable::<4>::with_budget(
         temporary::GraphTable::RESIDENT_ENTRIES,
         budget.clone(),
     );
@@ -2785,9 +2896,7 @@ fn validate_physical_closure(
         let record = inventory
             .get(&r.address.offset.to_le_bytes())?
             .ok_or_else(|| corrupt("reachable locator is not a top-level frame"))?;
-        if record[..4] != r.address.length.to_le_bytes() {
-            return Err(corrupt("reachable locator span"));
-        }
+        let decoded = validation::record_decoded(&record, r.address.length)?;
         records = records
             .checked_add(1)
             .ok_or(Error::Limit("validation frame visits"))?;
@@ -2795,7 +2904,6 @@ fn validate_physical_closure(
             return Err(Error::Limit("validation frame visits"));
         }
         charge(&mut source_bytes, r.address.length as u64)?;
-        let decoded = u32::from_le_bytes(record[4..8].try_into().unwrap()) as u64;
         let next = report
             .decoded_bytes
             .checked_add(decoded)
@@ -2845,10 +2953,7 @@ fn validate_physical_closure(
                 let record = inventory
                     .get(&child.address.offset.to_le_bytes())?
                     .ok_or_else(|| corrupt("reachable locator is not a top-level frame"))?;
-                if record[..4] != child.address.length.to_le_bytes() {
-                    return Err(corrupt("reachable locator span"));
-                }
-                let canonical_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as u64;
+                let canonical_len = validation::record_decoded(&record, child.address.length)?;
                 report.decoded_bytes = report
                     .decoded_bytes
                     .checked_add(canonical_len)

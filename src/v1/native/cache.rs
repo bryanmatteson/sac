@@ -568,7 +568,10 @@ struct DecodedCache {
     pinned_metadata: usize,
     clock: u64,
     // A decoded object and its charged size.
-    objects: Lru<(Arc<CanonicalObject>, usize)>,
+    objects: Lru<(Arc<CanonicalObject>, usize, Option<ObjectHash>)>,
+    // Enabled by an encoded visit; ordinary reads then remember a digest of
+    // the exact authenticated frame in the existing decoded entry.
+    track_encoding: bool,
     // The authenticated kind and version of one physical occurrence.
     verified: Lru<(u16, u16)>,
     windows: BTreeMap<(u64, u64), (Vec<u8>, u64, u64)>,
@@ -593,7 +596,7 @@ type DecodedKey = (u64, ObjectHash, u64, u32);
 // queue can grow beyond the live cache.
 // Successful frame authentication may outlive its decoded payload. Preserve a
 // small metadata working set under payload churn, within the same byte budget.
-const DECODED_ENTRY_METADATA: usize = 384;
+const DECODED_ENTRY_METADATA: usize = 384 + std::mem::size_of::<Option<ObjectHash>>();
 // The reader coalesces at most two adjacent 16 KiB windows. Smaller windows may
 // overlap a wider one, so an interval lookup must look past those inner starts.
 const MAX_READ_WINDOW_BYTES: usize = 32 * 1024;
@@ -605,6 +608,7 @@ impl DecodedCache {
             }
         }
         self.decoder=None;
+        self.track_encoding = false;
         self.borrowed = Default::default();
         self.objects.clear();
         self.verified.clear();
@@ -739,7 +743,7 @@ impl DecodedCache {
         Some(value)
     }
     fn remove(&mut self, key: &DecodedKey) {
-        if let Some(((_, size), fronted)) = self.objects.remove(key) {
+        if let Some(((_, size, _), fronted)) = self.objects.remove(key) {
             if fronted {
                 self.unfront(key, false);
             }
@@ -789,7 +793,7 @@ impl DecodedCache {
             self.bytes -= DECODED_ENTRY_METADATA;
             return true;
         }
-        let Some((key, (mut object, size), fronted)) = self.objects.remove_oldest() else {
+        let Some((key, (mut object, size, _), fronted)) = self.objects.remove_oldest() else {
             if let Some(read) = self.borrowed.iter_mut().find_map(Option::take) {
                 self.bytes -= read.retained_bytes();
                 return true;
@@ -810,8 +814,10 @@ impl DecodedCache {
         self.bytes -= size;
         if let Some((slot, bytes, children)) = recycle
             && slot.is_none()
-            && object.bytes.capacity() == bytes
-            && object.children.capacity() == children
+            && object.bytes.capacity() >= bytes
+            && object.bytes.capacity() <= bytes.saturating_mul(2).max(64)
+            && object.children.capacity() >= children
+            && object.children.capacity() <= children.saturating_mul(2)
             && Arc::get_mut(&mut object).is_some()
         {
             *slot = Some(object);
@@ -819,15 +825,33 @@ impl DecodedCache {
         true
     }
     fn evict_window(&mut self) -> bool {
+        self.take_oldest_window().is_some()
+    }
+    fn take_oldest_window(&mut self) -> Option<Vec<u8>> {
         self.refresh_order();
-        let Some((_, key)) = self.window_oldest.pop_first() else {
-            return false;
-        };
+        let (_, key) = self.window_oldest.pop_first()?;
         let (bytes, _, _) = self.windows.remove(&key).expect("window cache age index");
         let charge = bytes.capacity() + DECODED_ENTRY_METADATA;
         self.window_bytes -= charge;
         self.bytes -= charge;
-        true
+        Some(bytes)
+    }
+    fn take_window_buffer(&mut self, length: usize) -> Option<Vec<u8>> {
+        let available = self.budget.saturating_sub(self.pinned_metadata);
+        let charge = length.saturating_add(DECODED_ENTRY_METADATA);
+        let limit = (available / 8).min(1024 * 1024);
+        if self.window_bytes.saturating_add(charge) <= limit
+            && self.bytes.saturating_add(charge) <= available
+        {
+            return None;
+        }
+        self.refresh_order();
+        let (_, key) = self.window_oldest.first()?;
+        let capacity = self.windows.get(key)?.0.capacity();
+        if capacity < length || capacity > length.saturating_mul(2) {
+            return None;
+        }
+        self.take_oldest_window()
     }
     fn can_read_window(&self, length: usize) -> bool {
         length.saturating_add(DECODED_ENTRY_METADATA)
@@ -914,7 +938,7 @@ impl DecodedCache {
         self.verified.touch(&key, age).copied().or_else(|| {
             self.objects
                 .touch(&key, age)
-                .map(|(object, _)| (object.kind, object.version))
+                .map(|(object, _, _)| (object.kind, object.version))
         })
     }
     fn verify(&mut self, file_identity: u64, reference: ObjectRef, object_type: (u16, u16)) {
@@ -998,7 +1022,7 @@ impl DecodedCache {
         let key = (file_identity, r.hash, r.address.offset, r.address.length);
         self.objects
             .touch(&key, age)
-            .map(|(object, _)| Arc::clone(object))
+            .map(|(object, _, _)| Arc::clone(object))
     }
     /// Transfer an LRU victim into the one in-flight positional read. Its
     /// allocation leaves the cache charge; it is never retained as a spare.
@@ -1018,7 +1042,7 @@ impl DecodedCache {
             .objects
             .oldest_first()
             .take(8)
-            .find(|(_, (object, _))| {
+            .find(|(_, (object, _, _))| {
                 object.kind == 7
                     && object.children.is_empty()
                     && object.bytes.capacity() >= length
@@ -1026,12 +1050,36 @@ impl DecodedCache {
             })
             .map(|(key, _)| *key)?;
         // An object of this capacity has no copy in the reader shards.
-        let ((object, size), _) = self.objects.remove(&key)?;
+        let ((object, size, _), _) = self.objects.remove(&key)?;
         self.bytes -= size;
         // The cache held the only reference, and it is locked for this call.
         Arc::try_unwrap(object).ok().map(|object| object.bytes)
     }
-    fn insert_shared(&mut self, file_identity: u64, r: ObjectRef, object: &Arc<CanonicalObject>) {
+    fn encoded_object(
+        &mut self,
+        identity: u64,
+        reference: ObjectRef,
+    ) -> Option<(Arc<CanonicalObject>, ObjectHash)> {
+        let age = self.tick();
+        self.objects
+            .touch(
+                &(
+                    identity,
+                    reference.hash,
+                    reference.address.offset,
+                    reference.address.length,
+                ),
+                age,
+            )
+            .and_then(|(object, _, proof)| proof.map(|proof| (Arc::clone(object), proof)))
+    }
+    fn insert_shared(
+        &mut self,
+        file_identity: u64,
+        r: ObjectRef,
+        object: &Arc<CanonicalObject>,
+        proof: Option<ObjectHash>,
+    ) {
         let size = DECODED_ENTRY_METADATA
             + object.bytes.capacity()
             + object.children.capacity() * std::mem::size_of::<ObjectRef>();
@@ -1048,8 +1096,42 @@ impl DecodedCache {
         }
         self.serial += 1;
         self.objects
-            .insert(key, (Arc::clone(object), size), age, self.serial);
+            .insert(key, (Arc::clone(object), size, proof), age, self.serial);
         self.bytes += size;
+    }
+    fn certify_parts(
+        &mut self,
+        identity: u64,
+        reference: ObjectRef,
+        append: &AppendObject<'_>,
+        mut proof: impl FnMut() -> Option<ObjectHash>,
+    ) -> bool {
+        // An entry admitted before encoded tracking started can already hold
+        // these exact parts. Attach the newly authenticated frame proof in
+        // place instead of allocating a duplicate before replacing it.
+        let key = (
+            identity,
+            reference.hash,
+            reference.address.offset,
+            reference.address.length,
+        );
+        if let Some(slot) = self.objects.slots.get(&key).copied() {
+            let (object, _, retained_proof) =
+                self.objects.nodes[slot as usize].value.as_mut().unwrap();
+            if object.kind == append.kind
+                && object.version == append.version
+                && object.bytes.as_slice() == append.bytes.as_ref()
+                && object.children.as_slice() == append.children.as_ref()
+            {
+                if let Some(proof) = proof() {
+                    *retained_proof = Some(proof);
+                }
+                let age = self.tick();
+                self.objects.touch_slot(slot, age);
+                return true;
+            }
+        }
+        false
     }
     fn admit_append(
         &mut self,
@@ -1057,7 +1139,7 @@ impl DecodedCache {
         reference: ObjectRef,
         append: AppendObject<'_>,
     ) -> bool {
-        self.admit_parts(identity, reference, append, 0)
+        self.admit_parts(identity, reference, append, 0, || None)
     }
     fn admit_parts(
         &mut self,
@@ -1065,19 +1147,25 @@ impl DecodedCache {
         reference: ObjectRef,
         append: AppendObject<'_>,
         returning_workspace: usize,
+        mut proof: impl FnMut() -> Option<ObjectHash>,
     ) -> bool {
         // Leave room for the caller's borrowed workspace to return. Otherwise
         // each visit fills its temporary cache hole with a new allocation, and
         // returning the workspace evicts a victim too late to recycle it.
-        let available = self.budget.saturating_sub(self.pinned_metadata)
+        let available = self
+            .budget
+            .saturating_sub(self.pinned_metadata)
             .saturating_sub(returning_workspace);
         let (bytes, children) = (append.bytes.len(), append.children.len());
         // Leave room for a type-only admission if the payload is later evicted.
         // The decoded occurrence already authenticates its own type and edges.
-        let target =
+        let mut target =
             2 * DECODED_ENTRY_METADATA + bytes + children * std::mem::size_of::<ObjectRef>();
         if target > available {
             return false;
+        }
+        if self.certify_parts(identity, reference, &append, &mut proof) {
+            return true;
         }
         let mut recycled = None;
         while self.bytes + target > available {
@@ -1088,6 +1176,14 @@ impl DecodedCache {
             };
             if !self.evict_oldest_for_append(victim) {
                 break;
+            }
+            if let Some(object) = &recycled {
+                // A slightly larger victim avoids a fresh allocation for each
+                // nearby page size. Charge its actual capacity and reserve the
+                // returning workspace before accepting it into the cache.
+                target = 2 * DECODED_ENTRY_METADATA
+                    + object.bytes.capacity()
+                    + object.children.capacity() * std::mem::size_of::<ObjectRef>();
             }
         }
         let object = match recycled {
@@ -1117,14 +1213,123 @@ impl DecodedCache {
         {
             return false;
         }
-        self.insert_shared(identity, reference, &object);
+        self.insert_shared(identity, reference, &object, proof());
         true
     }
+
 }
 
 #[cfg(test)]
 mod buffer_tests {
     use super::*;
+
+    #[test]
+    fn encoded_proofs_are_computed_only_for_retained_matching_parts() {
+        let mut cache = DecodedCache {
+            budget: 32 * 1024,
+            ..Default::default()
+        };
+        let object = CanonicalObject {
+            kind: 42000,
+            version: 1,
+            bytes: vec![9; 1024],
+            children: Vec::new(),
+        };
+        let reference = ObjectRef {
+            hash: object.hash(),
+            address: ChunkAddress {
+                offset: 128,
+                length: 1088,
+            },
+        };
+        let parts = || AppendObject {
+            kind: object.kind,
+            version: object.version,
+            bytes: Cow::Borrowed(&object.bytes),
+            children: Cow::Borrowed(&object.children),
+        };
+        let proof = ObjectHash::digest(b"exact authenticated frame");
+        assert!(!cache.certify_parts(1, reference, &parts(), || {
+            panic!("an absent entry cannot retain a proof")
+        }));
+        let calls = std::cell::Cell::new(0);
+        let make_proof = || {
+            calls.set(calls.get() + 1);
+            Some(proof)
+        };
+        assert!(cache.admit_parts(1, reference, parts(), 0, make_proof));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.encoded_object(1, reference).unwrap().1, proof);
+        assert!(cache.certify_parts(1, reference, &parts(), make_proof));
+        assert_eq!(calls.get(), 2);
+        let mut mismatch = parts();
+        mismatch.version += 1;
+        assert!(!cache.certify_parts(1, reference, &mismatch, || {
+            panic!("mismatching parts cannot retain a proof")
+        }));
+        cache.set_budget(0);
+        assert!(!cache.admit_parts(1, reference, parts(), 0, || {
+            panic!("an over-budget entry cannot retain a proof")
+        }));
+    }
+    #[test]
+    fn encoded_proofs_follow_exact_decoded_residency_and_clear_on_replacement() {
+        let mut cache = DecodedCache {
+            budget: 32 * 1024,
+            ..Default::default()
+        };
+        let object = Arc::new(CanonicalObject {
+            kind: 42000,
+            version: 1,
+            bytes: vec![9; 1024],
+            children: Vec::new(),
+        });
+        let reference = ObjectRef {
+            hash: object.hash(),
+            address: ChunkAddress {
+                offset: 128,
+                length: 1088,
+            },
+        };
+        let proof = ObjectHash::digest(b"exact authenticated frame");
+        cache.insert_shared(1, reference, &object, Some(proof));
+        assert_eq!(cache.encoded_object(1, reference).unwrap().1, proof);
+        assert!(cache.encoded_object(2, reference).is_none());
+        let mut other = reference;
+        other.address.offset += 8;
+        assert!(cache.encoded_object(1, other).is_none());
+        other = reference;
+        other.address.length += 8;
+        assert!(cache.encoded_object(1, other).is_none());
+        other = reference;
+        other.hash = proof;
+        assert!(cache.encoded_object(1, other).is_none());
+        cache.insert_shared(1, reference, &object, None);
+        assert!(cache.encoded_object(1, reference).is_none());
+        let charged = cache.bytes;
+        assert!(cache.admit_parts(
+            1,
+            reference,
+            AppendObject {
+                kind: object.kind,
+                version: object.version,
+                bytes: Cow::Borrowed(&object.bytes),
+                children: Cow::Borrowed(&object.children),
+            },
+            0,
+            || Some(proof)
+        ));
+        let (retained, retained_proof) = cache.encoded_object(1, reference).unwrap();
+        assert!(Arc::ptr_eq(&object, &retained));
+        assert_eq!(retained_proof, proof);
+        assert_eq!(cache.bytes, charged);
+        cache.insert_shared(1, reference, &object, Some(proof));
+        cache.set_budget(0);
+        assert!(cache.encoded_object(1, reference).is_none());
+        cache.track_encoding = true;
+        cache.clear();
+        assert!(!cache.track_encoding);
+    }
 
     #[test]
     fn decoded_append_types_need_no_duplicate_metadata_and_front_exact_occurrences() {
@@ -1252,6 +1457,41 @@ mod buffer_tests {
     }
 
     #[test]
+    fn append_recycles_bounded_spare_capacity_without_growing_the_cache() {
+        let mut cache = DecodedCache {
+            budget: 2 * DECODED_ENTRY_METADATA + 64,
+            ..Default::default()
+        };
+        let put = |cache: &mut DecodedCache, ordinal, length| {
+            let body = vec![ordinal; length];
+            let reference = occurrence(u64::from(ordinal));
+            assert!(cache.admit_append(
+                1,
+                reference,
+                AppendObject {
+                    kind: 7,
+                    version: 1,
+                    bytes: Cow::Borrowed(&body),
+                    children: Cow::Borrowed(&[]),
+                }
+            ));
+            reference
+        };
+        let first = put(&mut cache, 1, 64);
+        let pointer = Arc::as_ptr(&cache.get(1, first).unwrap());
+        let second = put(&mut cache, 2, 40);
+        let retained = cache.get(1, second).unwrap();
+        assert_eq!(Arc::as_ptr(&retained), pointer);
+        assert_eq!(retained.bytes, [2; 40]);
+        assert_eq!(retained.bytes.capacity(), 64);
+        assert!(cache.bytes <= cache.budget);
+        let third = put(&mut cache, 3, 48);
+        assert!(!Arc::ptr_eq(&retained, &cache.get(1, third).unwrap()));
+        assert_eq!(retained.bytes, [2; 40]);
+        assert!(cache.bytes <= cache.budget);
+    }
+
+    #[test]
     fn payload_churn_preserves_bounded_exact_occurrence_authentication() {
         let mut cache = DecodedCache { budget: 2 * 1024 * 1024, ..Default::default() };
         let reference = |ordinal: u64| ObjectRef {
@@ -1263,7 +1503,7 @@ mod buffer_tests {
             kind: 7, version: 1, bytes: vec![3; 1024 * 1024], children: vec![],
         });
         for ordinal in 16..80u64 {
-            cache.insert_shared(7, reference(ordinal), &object);
+            cache.insert_shared(7, reference(ordinal), &object, None);
             cache.verify(7, reference(ordinal), (7, 1));
             assert!(cache.bytes <= cache.budget);
         }
@@ -1284,8 +1524,8 @@ mod buffer_tests {
         let object = Arc::new(CanonicalObject { kind: 7, version: 1, bytes: vec![1; 32], children: vec![] });
         let reference = |offset| ObjectRef { hash: object.hash(), address: ChunkAddress { offset, length: 96 } };
         let mut cache = DecodedCache { budget: 4 * (DECODED_ENTRY_METADATA + 32), ..Default::default() };
-        cache.insert_shared(1, reference(128), &object);
-        cache.insert_shared(1, reference(224), &object);
+        cache.insert_shared(1, reference(128), &object, None);
+        cache.insert_shared(1, reference(224), &object, None);
         cache.verify(1, reference(320), (7, 1));
         for _ in 0..10_000 {
             assert!(cache.get(1, reference(128)).is_some());
@@ -1341,8 +1581,8 @@ mod buffer_tests {
             let key = (1, r.hash, r.address.offset, r.address.length);
             match next(if step % 5000 < 2500 { 400 } else { 8 }) {
                 0 => {
-                    shared.lock().unwrap().insert_shared(1, r, &object);
-                    exclusive.lock().unwrap().insert_shared(1, r, &object);
+                    shared.lock().unwrap().insert_shared(1, r, &object, None);
+                    exclusive.lock().unwrap().insert_shared(1, r, &object, None);
                 }
                 1 => {
                     shared.lock().unwrap().verify(1, r, (7, 1));
@@ -1392,7 +1632,7 @@ mod buffer_tests {
             })
         };
         for ordinal in 0..32 {
-            cache.lock().unwrap().insert_shared(1, occurrence(ordinal), &object(ordinal));
+            cache.lock().unwrap().insert_shared(1, occurrence(ordinal), &object(ordinal), None);
             cache.lock().unwrap().verify(1, occurrence(ordinal), (7, 1));
         }
         cache.front.shared.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1406,7 +1646,7 @@ mod buffer_tests {
                         let ordinal = (state >> 33) % 96;
                         if thread == 0 && state >> 60 == 0 {
                             let mut cache = cache.lock().unwrap();
-                            cache.insert_shared(1, occurrence(ordinal), &object(ordinal));
+                            cache.insert_shared(1, occurrence(ordinal), &object(ordinal), None);
                             cache.verify(1, occurrence(ordinal), (7, 1));
                         } else if let Some(found) = cache.get(1, occurrence(ordinal)) {
                             assert_eq!(found.bytes[..8], ordinal.to_le_bytes());
@@ -1420,7 +1660,7 @@ mod buffer_tests {
         let tables = cache.front.tables.get().unwrap();
         let cache = cache.lock().unwrap();
         assert!(cache.bytes <= cache.budget);
-        let charged: usize = cache.objects.oldest_first().map(|(_, (_, size))| size).sum();
+        let charged: usize = cache.objects.oldest_first().map(|(_, (_, size, _))| size).sum();
         assert_eq!(
             cache.bytes,
             charged + cache.verified.len() * DECODED_ENTRY_METADATA
@@ -1502,6 +1742,34 @@ mod buffer_tests {
         assert_eq!(cache.window_bytes, 0);
     }
     #[test]
+    fn read_window_recycling_transfers_only_pressure_victims_and_rekeys_bytes() {
+        let mut cache = DecodedCache {
+            budget: 64 * 1024,
+            ..Default::default()
+        };
+        cache.insert_window(1, 128, vec![7; 1024]);
+        assert!(cache.take_window_buffer(1024).is_none());
+        for offset in 1..8 {
+            cache.insert_window(1, 128 + offset * 1024, vec![7; 1024]);
+        }
+        let (_, key) = cache.window_oldest.first().copied().unwrap();
+        let pointer = cache.windows[&key].0.as_ptr();
+        let before = cache.window_bytes;
+        let mut bytes = cache.take_window_buffer(1024).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        assert_eq!(cache.window_bytes, before - 1024 - DECODED_ENTRY_METADATA);
+        let mut output = [0; 16];
+        assert!(!cache.read_window(key.0, key.1, &mut output));
+        bytes.fill(9);
+        cache.insert_window(2, 32768, bytes);
+        assert!(cache.read_window(2, 32768, &mut output));
+        assert_eq!(output, [9; 16]);
+        assert!(!cache.read_window(1, 32768, &mut output));
+        assert!(cache.take_window_buffer(4096).is_none());
+        assert!(cache.bytes <= cache.budget);
+    }
+
+    #[test]
     fn read_buffer_reuse_is_pressure_bounded_and_never_mutates_pins() {
         let mut bytes = Vec::with_capacity(1024 * 1024 + 64);
         bytes.resize(1024 * 1024, 7);
@@ -1522,7 +1790,7 @@ mod buffer_tests {
             budget: 2 * 1024 * 1024,
             ..Default::default()
         };
-        cache.insert_shared(1, r, &object);
+        cache.insert_shared(1, r, &object, None);
         let charge = cache.bytes;
         assert!(cache.take_read_buffer(1024 * 1024 + 64).is_none());
         assert_eq!(object.bytes[0], 7);

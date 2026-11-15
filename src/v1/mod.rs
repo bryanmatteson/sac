@@ -298,6 +298,15 @@ pub struct VerifiedObject {
 pub struct VerifiedObjectView<'a> {
     hash: ObjectHash,
     object: ObjectView<'a>,
+    encoded: Option<EncodedPayload<'a>>,
+}
+// Only a wire-authenticating source supplies this capability. It borrows the
+// exact payload authenticated by decoding or by a retained full-frame digest,
+// not a caller's codec or identity hint.
+#[derive(Clone, Copy)]
+pub(crate) struct EncodedPayload<'a> {
+    codec: u8,
+    bytes: &'a [u8],
 }
 impl VerifiedObjectView<'_> {
     pub fn hash(&self) -> ObjectHash {
@@ -346,6 +355,10 @@ impl VerifiedObject {
         VerifiedObjectView {
             hash: self.hash,
             object: self.object.as_ref().into(),
+            encoded: self
+                .compressed
+                .as_ref()
+                .map(|bytes| EncodedPayload { codec: 1, bytes }),
         }
     }
     fn validate_children(&self, children: &[ObjectRef]) -> Result<()> {
@@ -388,6 +401,27 @@ pub trait ObjectStore {
     ) -> Result<()> {
         let object = self.get_verified_shared(reference)?;
         visitor(ObjectView::from(object.as_ref()))
+    }
+    /// Visit an authenticated object and, when available, its exact stored
+    /// encoding. The capability and its backing expire when the callback
+    /// returns. Generic stores supply canonical parts without an encoding.
+    fn visit_verified_encoded(
+        &self,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(VerifiedObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        self.visit_verified(reference, &mut |object| {
+            visitor(VerifiedObjectView {
+                hash: reference.hash,
+                object,
+                encoded: None,
+            })
+        })
+    }
+    /// Whether a copy should request authenticated source encodings. This
+    /// preference never weakens source authentication or destination edges.
+    fn preserves_source_encoding(&self) -> bool {
+        false
     }
     /// Capture the result of this source's authenticated read without exposing
     /// a caller-supplied known-hash write API.
@@ -1344,19 +1378,46 @@ pub struct SealedWriter<W: Write> {
     compression_level: i32,
     encoder: wire::FrameEncoder,
 }
+/// Encoding policy for a sealed copy. Preserving source encoding is explicit:
+/// canonical identity does not prescribe a compressor implementation or level.
+#[derive(Clone, Copy, Debug)]
+pub struct SealingOptions {
+    pub compression_level: i32,
+    /// Reuse authenticated raw or compressed source payloads when available.
+    /// The selected level applies to objects without an encoded capability.
+    pub preserve_source_encoding: bool,
+}
+impl Default for SealingOptions {
+    fn default() -> Self {
+        Self {
+            compression_level: 1,
+            preserve_source_encoding: false,
+        }
+    }
+}
 impl<W: Write> SealedWriter<W> {
     pub fn new(mut output: W) -> Result<Self> {
         output.write_all(&Preamble::sealed().encode())?;
-        Ok(Self {
+        Ok(Self::after_prefix(output, 128))
+    }
+    // Internal continuation after a caller has copied a validated sealed frame
+    // prefix. Keep workspace initialization here rather than in sibling modules.
+    pub(super) fn after_prefix(output: W, end: u64) -> Self {
+        Self {
             output,
-            end: 128,
+            end,
             last: None,
             compression_level: 1,
             encoder: wire::FrameEncoder::default(),
-        })
+        }
     }
     pub fn set_compression_level(&mut self, level: i32) {
         self.compression_level = level;
+    }
+    /// Opt into retaining exact authenticated source payload encodings.
+    /// Unavailable encodings use this writer's configured compression level.
+    pub fn set_preserve_source_encoding(&mut self, preserve: bool) {
+        self.encoder.preserve_source_encoding = preserve;
     }
     pub fn finish(self, snapshot: ObjectRef) -> Result<W> {
         self.finish_attested(snapshot, None)
@@ -1403,18 +1464,30 @@ impl<W: Write> SealedWriter<W> {
         bytes: &[u8],
         children: &[ObjectRef],
         hash: ObjectHash,
+        encoded: Option<EncodedPayload<'_>>,
     ) -> Result<ObjectRef> {
         for child in children {
             validate_address(child.address, 128, self.end)?;
         }
-        let frame = self.encoder.encode_parts(
-            kind,
-            version,
-            bytes,
-            children,
-            self.compression_level,
-            hash,
-        )?;
+        let frame = if let Some(encoded) = encoded.filter(|_| self.encoder.preserve_source_encoding)
+        {
+            self.encoder.encode_payload(
+                kind,
+                8 + children.len() * 32 + bytes.len(),
+                children,
+                hash,
+                encoded,
+            )?
+        } else {
+            self.encoder.encode_parts(
+                kind,
+                version,
+                bytes,
+                children,
+                self.compression_level,
+                hash,
+            )?
+        };
         let reference = ObjectRef {
             hash,
             address: ChunkAddress {
@@ -1432,6 +1505,9 @@ impl<W: Write> SealedWriter<W> {
     }
 }
 impl<W: Write> ObjectStore for SealedWriter<W> {
+    fn preserves_source_encoding(&self) -> bool {
+        self.encoder.preserve_source_encoding
+    }
     fn get(&self, _: ObjectRef) -> Result<CanonicalObject> {
         Err(Error::Unsupported("forward writer has no readback".into()))
     }
@@ -1444,7 +1520,7 @@ impl<W: Write> ObjectStore for SealedWriter<W> {
     ) -> Result<ObjectRef> {
         check_input(bytes, children)?;
         let hash = CanonicalObject::hash_parts(kind, version, bytes, children);
-        self.write_object(kind, version, bytes, children, hash)
+        self.write_object(kind, version, bytes, children, hash, None)
     }
     fn put_verified(
         &mut self,
@@ -1460,14 +1536,16 @@ impl<W: Write> ObjectStore for SealedWriter<W> {
     ) -> Result<ObjectRef> {
         source.validate_children(children)?;
         let object = source.object();
-        // Keep the configured sealed codec and level. The source encoding may
-        // have used another level even though its canonical bytes match.
+        // The ordinary policy retains the configured codec and level. Reuse
+        // requires the explicit preserve-source policy and an authenticated
+        // capability, never a claim that source bytes used the same encoder.
         self.write_object(
             object.kind,
             object.version,
             object.bytes,
             children,
             source.hash,
+            source.encoded,
         )
     }
 }
@@ -1516,14 +1594,34 @@ fn pack_commit_at_level<S: ObjectStore + ?Sized, W: Write>(
     limits: resources::Limits,
     level: i32,
 ) -> Result<W> {
-    pack_commit_impl(source, commit, output, limits, level, None)
+    pack_commit_with_options(
+        source,
+        commit,
+        output,
+        limits,
+        SealingOptions {
+            compression_level: level,
+            ..SealingOptions::default()
+        },
+    )
+}
+/// Seal a commit with an explicit encoding policy. Resource and graph checks
+/// are identical to `pack_commit_with_limits`.
+pub fn pack_commit_with_options<S: ObjectStore + ?Sized, W: Write>(
+    source: &S,
+    commit: ObjectRef,
+    output: W,
+    limits: resources::Limits,
+    options: SealingOptions,
+) -> Result<W> {
+    pack_commit_impl(source, commit, output, limits, options, None)
 }
 fn pack_commit_impl<S: ObjectStore + ?Sized, W: Write>(
     source: &S,
     commit: ObjectRef,
     output: W,
     limits: resources::Limits,
-    level: i32,
+    options: SealingOptions,
     verification: Option<(ObjectRef, resources::Budget)>,
 ) -> Result<W> {
     let object = source.get(commit)?;
@@ -1543,7 +1641,8 @@ fn pack_commit_impl<S: ObjectStore + ?Sized, W: Write>(
         })
         .transpose()?;
     let mut writer = SealedWriter::new(output)?;
-    writer.set_compression_level(level);
+    writer.set_compression_level(options.compression_level);
+    writer.set_preserve_source_encoding(options.preserve_source_encoding);
     let att = if fields[1] == cbor::Value::Null {
         None
     } else {

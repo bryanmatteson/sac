@@ -8,15 +8,15 @@ mod resident {
     use std::collections::{BTreeMap, BTreeSet};
     pub(crate) struct Workspace {
         active: BTreeSet<ObjectHash>,
-        completed: BTreeSet<ObjectRef>,
+        completed: BTreeMap<ObjectRef, u32>,
         copied: BTreeMap<ObjectHash, ObjectRef>,
-        pending: Vec<(ObjectRef, bool)>,
+        pending: Vec<(ObjectRef, bool, u32)>,
     }
     impl Workspace {
         pub(crate) fn new(budget: &mut Budget) -> Result<Self> {
             let graph = Self {
                 active: BTreeSet::new(),
-                completed: BTreeSet::new(),
+                completed: BTreeMap::new(),
                 copied: BTreeMap::new(),
                 pending: vec![],
             };
@@ -36,14 +36,41 @@ mod resident {
         }
         pub(crate) fn push(&mut self, r: ObjectRef, expanded: bool, budget: &Budget) -> Result<()> {
             self.room(budget, 1)?;
-            self.pending.push((r, expanded));
+            self.pending.push((r, expanded, 0));
+            Ok(())
+        }
+        pub(crate) fn push_for_copy(
+            &mut self,
+            r: ObjectRef,
+            byte_length: u32,
+            budget: &Budget,
+        ) -> Result<()> {
+            self.room(budget, 1)?;
+            self.pending.push((r, false, byte_length));
             Ok(())
         }
         pub(crate) fn pop(&mut self) -> Result<Option<(ObjectRef, bool)>> {
+            Ok(self.pending.pop().map(|(r, expanded, _)| (r, expanded)))
+        }
+        pub(crate) fn pop_for_copy(&mut self) -> Result<Option<(ObjectRef, bool, u32)>> {
             Ok(self.pending.pop())
         }
         pub(crate) fn completed(&self, r: ObjectRef) -> Result<bool> {
-            Ok(self.completed.contains(&r))
+            Ok(self.completed.contains_key(&r))
+        }
+        pub(crate) fn completed_for_copy(&self, r: ObjectRef, byte_length: u32) -> Result<bool> {
+            let Some(fact) = self.completed.get(&r) else {
+                return Ok(false);
+            };
+            if byte_length != 0 {
+                if *fact == 0 {
+                    return Err(corrupt("core child role kind or schema"));
+                }
+                if *fact != byte_length + 1 {
+                    return Err(corrupt("extent byte length"));
+                }
+            }
+            Ok(true)
         }
         pub(crate) fn enter(&mut self, r: ObjectRef, budget: &Budget) -> Result<()> {
             self.room(budget, 1)?;
@@ -55,7 +82,23 @@ mod resident {
         pub(crate) fn complete(&mut self, r: ObjectRef, budget: &Budget) -> Result<()> {
             self.room(budget, 1)?;
             self.active.remove(&r.hash);
-            self.completed.insert(r);
+            self.completed.entry(r).or_insert(0);
+            Ok(())
+        }
+        pub(crate) fn complete_for_copy(
+            &mut self,
+            r: ObjectRef,
+            object: ObjectView<'_>,
+            budget: &Budget,
+        ) -> Result<()> {
+            self.room(budget, 1)?;
+            self.active.remove(&r.hash);
+            let fact = if object.kind == 7 && object.version == 1 && object.children.is_empty() {
+                object.bytes.len() as u32 + 1
+            } else {
+                0
+            };
+            self.completed.insert(r, fact);
             Ok(())
         }
         pub(crate) fn mapped(&self, hash: ObjectHash) -> Result<Option<ObjectRef>> {

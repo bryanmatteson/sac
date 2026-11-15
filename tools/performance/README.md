@@ -85,6 +85,13 @@ shapes and identities. Persistent leaves now have a 192-row writer limit as
 well as their byte limit, so before/after comparisons of this policy should
 compare verified contents and appended bytes, while retaining the distinct
 root IDs in their reports.
+
+For a paired comparison against an authenticated, durable Merkle prefix trie,
+see [the trie prototype and workload runner](PREFIX_TRIE.md). It uses the same
+four key/value sequences and compares trie, bucketed-trie and paged deltas over a packed base.
+It reports durable publication, reader preparation, sequential/permuted lookup,
+live packed size, final export and append costs as well as edit speed.
+
 `append-steady` writes unique compressed byte objects with a warmed encoder
 and a spilled index. `authenticate-steady` writes unique parents whose old
 compressed child must be read and authenticated on every put. Both disable
@@ -263,3 +270,13 @@ input frames in both builds, check exact live/seal hashes, and run Splice's
 existing verifier on the original, materialized live and sealed databases.
 Rust allocation counts are current-thread counts, excluding native codec C
 allocations; process RSS and allocated disk are separate measurements.
+
+For bounded WAL-backed buffering versus direct SAC writes, see the
+[memtable comparison](MEMTABLE.md). It measures durable throughput, warm read
+latency, checkpoint contention, timer publication and fresh-process RSS using
+identical verified inputs.
+
+The trie comparison also includes `live-map`, which exercises the supported
+public native bucket-delta editor and publication API. See
+[PREFIX_TRIE.md](PREFIX_TRIE.md#public-live-map-integration) for repeated resident,
+frequent-merge, zero-cache and per-edit durability workloads.

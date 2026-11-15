@@ -2,9 +2,72 @@
 
 ## Unreleased — 0.2.0 prerelease
 
+- Added the public authenticated `LiveMap` editor and native live-map entry point,
+  with a bucketed trie delta, incremental checkpoints, durable native publication,
+  explicit ordinary-resource export and experimental bucket snapshot import.
+
+- Add an experimental bucketed Patricia delta comparison with bounded binary
+  node payloads, inline small values and shared authenticated large-value
+  descriptors. Preserve incremental merges, exact payload reuse and native
+  durability barriers; compare warm and decoded-cache-disabled reads.
+
+- Add a paged-delta dual-map benchmark alongside the trie-delta control, with
+  authenticated range routing, small shared directory pages and exact extent
+  reuse during incremental merges. Measure reader setup, permuted reads and
+  misses separately. Add `ResourceView::file_contents` for borrowed storage
+  descriptors without payload materialization; publication barriers are unchanged.
+
+- Borrow authenticated extent pages and byte ranges during namespace checks
+  and reads, avoiding temporary owned objects and child vectors. Compute
+  full-frame encoding proofs only when a matching decoded entry retains them;
+  one-pass encoded copies keep their ordinary frame authentication. Pack
+  transient active markers and bounded byte lengths into smaller spill records;
+  retain only direct-role decisions in physical validation facts and narrow its
+  bounded header inventory to reduce final validation's peak disk usage.
+
+- Share extent byte-leaf role authentication with the sealed-copy visit instead
+  of reading each leaf for its role and then again for export. Retain exact
+  physical completion facts, all logical quota charges and output order; narrow
+  disposable content-map keys and physical-validation facts to reduce spill
+  storage.
+
+- Add mixed inline/shared-extent resource batches through `FileContents` and
+  `ArchiveBuilder::set_files_batch`. Persistent merges retain untouched page
+  and payload references, with bounded batches and atomic root replacement.
+  Replace full-base rebuilding in the experimental dual map with delta-only
+  merges and retain a matched full-rebuild benchmark control.
+
+- Add explicit `compact --preserve-encoding` and sealed-copy options to reuse
+  authenticated raw/compressed payloads through borrowed source visits. Rebuild
+  physical child locators without recompression, keep ordinary encoding as the
+  default, and retain full validation, installation and resource limits.
+  Bind cache reuse to authenticated full-frame digests, recycle bounded read
+  windows and unpinned page buffers, and release source caches before final
+  output validation.
+
 Replace the earlier prerelease section format with the current SAC1 immutable
 object graph. This is the first format being prepared for stabilization; the
 wire version remains 1 and the Rust package version remains 0.2.0.
+
+- Add `MemtableStore`, a bounded byte-key/value overlay with atomic synchronous
+  WAL batches, overlay reads and tombstones, configurable time/memory/WAL
+  checkpoint thresholds, and bounded replay on recovery. Bind checkpoint
+  sequences to a snapshot profile before retiring WAL data. Publish one immutable
+  generation in the background while active writes sync a successor WAL; charge
+  both tables against one budget and preserve pinned base reads. The
+  `sac.memtable.v2` profile prevents older writers from ignoring the successor;
+  v1 stores are recovered and durably upgraded before acceptance.
+  Preserve hot-set coalescing with a seven-eighths proactive watermark, prepare
+  the synchronized successor during the dirty interval, and buffer complete WAL
+  framing together without changing acknowledgment barriers or admission bounds.
+  Expose bounded WAL/checkpoint wall-time attribution and native publication
+  barrier counters for separating storage waits from code and admission costs.
+  Gather Unix WAL header/payload/digest slices in bounded groups of 64 mutations,
+  reducing file-write calls without copying payloads, enlarging the output
+  scratch bound or changing full-sync acknowledgements. Retry short/interrupted
+  writes before synchronization and preserve the buffered fallback elsewhere.
+  Recover torn publication slots through a private validated native recovery
+  path while preserving ordinary native admission rules and damaged inputs.
 
 - Reuse exact writer provenance for duplicate appends after cache eviction and
   avoid repeated exact child authentication with a bounded per-put table.

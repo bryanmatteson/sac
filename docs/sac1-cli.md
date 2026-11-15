@@ -9,6 +9,25 @@ latency-sensitive live appends; CLI compression defaults remain level 1.
 All commands use current SAC1 archives. `sac inspect` reports selected-root admission without
 claiming complete graph or profile verification.
 
+The Rust `MemtableStore` API provides a WAL-backed key/value overlay with
+periodic checkpoints; see [the API notes](api-notes.md#durable-memtable).
+Generic CLI readers see its latest published checkpoint, with keys encoded as
+`k` plus lowercase hexadecimal resource names. They do not replay its `.wal`
+or transient `.wal.next` sidecars. Open the store through `MemtableStore` to
+recover pending writes before using CLI tools, and keep the archive and all
+present WAL sidecars together for backup or relocation. This
+dedicated profile must be updated through the memtable API.
+
+The development-only Merkle trie/dual-map comparison under
+`tools/performance/PREFIX_TRIE.md` uses an application profile for its live view.
+Generic CLI commands preserve that profile's authenticated closure but do not
+interpret its overlay. This applies to the trie-delta, bucketed-trie-delta and paged-delta
+profiles; their combined live view requires the owning reader. The benchmark's
+incremental checkpoint/export produces
+an ordinary resource snapshot for `list`, `read` and `verify`, retaining shared
+payloads and untouched directory pages. It does not add a CLI backend or change
+the default writer.
+
 ## Command summary
 
 ```
@@ -95,7 +114,23 @@ portable graph while writing to private staging. Source and staged output both
 receive physical validation, and resource namespace validation still runs.
 Native copy visits reuse bounded decoder and relocation storage. Borrowed
 payloads remain valid only for their visit; direct child roles and destination
-occurrences retain their ordinary checks, and the sealed codec is unchanged.
+occurrences retain their ordinary checks. By default, sealing re-encodes at the
+configured sealed compression level.
+`compact --preserve-encoding` explicitly retains authenticated source payload
+encodings when available, including raw frames, and rewrites only their physical
+child locators. This avoids recompression and borrows only the active frame;
+source and output validation and all quotas remain in force. A source with
+another compression level can produce different sealed bytes from ordinary
+compaction while retaining the same canonical identities. Sources without an
+encoded-payload capability use ordinary encoding.
+Sealed copying checks extent byte-leaf kinds and lengths during the leaf's
+ordinary authenticated export visit. Repeated roles retain their full logical
+frame, source-byte and decoded-byte charges. A bounded, spillable completion
+table records the authenticated byte length for each exact physical occurrence;
+shared leaves still check every incoming requirement, and another locator with
+the same content ID must authenticate independently. This avoids an eager
+payload read and owned cache admission for each byte role without changing
+traversal or output order.
 Physical validation shares child authentication with direct role checks within
 one walk, while preserving logical validation charges. Namespace validation
 borrows directory rows and still checks inherited fences, heights, file geometry
@@ -295,3 +330,11 @@ requires explicit `--strip-local` before editing. The snapshot API itself never
 silently changes a commit's attachments. Ordinary quota options apply to metadata
 commands. `verify` checks the known metadata profile and separately reports its
 status, while other application-profile semantics remain unchecked.
+
+## Live map compatibility
+
+Live maps created through `NativeStore::live_map` declare the required
+`sac.live-map` capability. Resource-only commands reject that view. Use
+`LiveMap::checkpoint` and explicitly publish its returned ordinary resource
+snapshot before listing or extracting it with resource CLI commands. Generic
+core packing preserves a live map without interpreting it.

@@ -13,8 +13,10 @@ pub use v1::{
     CompactionRanges, Error, Header, LocatorPolicy, MAX_CHUNK_SIZE, MemoryStore, ObjectHash,
     ObjectRef, ObjectStore, ObjectView, PAGE_SIZE, PhysicalReadScope, PositionalStore, Preamble,
     PreparedObject, Publication, ReadAt, ReadRequest, ReadStatistics, Reader, Result,
-    RewriteSource, SealedWriter, Slot, Trailer, TraversalLimits, ValidationReport, VerifiedObject,
-    VerifiedObjectView, cbor, copy_closure, copy_closure_with_cache, pack_commit,
-    pack_commit_with_limits, pack_snapshot, pack_snapshot_with_limits, recovery, resources,
-    validate_closure, validate_core_edges, validate_core_object,
+    RewriteSource, SealedWriter, SealingOptions, Slot, Trailer, TraversalLimits, ValidationReport,
+    VerifiedObject, VerifiedObjectView, cbor, copy_closure, copy_closure_with_cache, pack_commit,
+    pack_commit_with_limits, pack_commit_with_options, pack_snapshot, pack_snapshot_with_limits,
+    recovery, resources, validate_closure, validate_core_edges, validate_core_object,
 };
+
+pub use v1::resources::{LiveMap, LiveMapReader};

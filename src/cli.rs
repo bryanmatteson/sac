@@ -24,7 +24,7 @@ usage:
   sac read <archive|URL|-> <resource> [--offset N] [--length N] [--http-statistics]
   sac compact-in-place <live-archive>
   sac reclaim <live-archive> [--no-punch]
-  sac compact <archive|-> <new-archive|-> [--strip-local]
+  sac compact <archive|-> <new-archive|-> [--strip-local] [--preserve-encoding]
   sac recover-live <archive> <new-live-archive> [--strip-local]
   sac salvage <archive|-> <new-archive|-> [--snapshot HEX]
   sac recovery create <quiescent-archive> <new-records> [--redundancy-percent N] [--block-size N]
@@ -81,6 +81,7 @@ struct Args {
     metadata_json: bool,
     no_punch: bool,
     strip_local: bool,
+    preserve_encoding: bool,
     max_input: u64,
     max_output: u64,
     max_temp: u64,
@@ -130,6 +131,7 @@ impl Args {
             metadata_json: false,
             no_punch: false,
             strip_local: false,
+            preserve_encoding: false,
             max_input: DEFAULT_BYTES,
             max_output: DEFAULT_BYTES,
             max_temp: DEFAULT_BYTES * 2,
@@ -213,6 +215,16 @@ impl Args {
                     ));
                 }
                 out.http_statistics = true;
+                continue;
+            }
+            if !literal && argument == "--preserve-encoding" {
+                if out.command != "compact" {
+                    return Err(failure(
+                        "Usage",
+                        "--preserve-encoding is only valid with compact",
+                    ));
+                }
+                out.preserve_encoding = true;
                 continue;
             }
             if !literal && argument == "--strip-local" {
@@ -1191,7 +1203,9 @@ fn execute(args: Args) -> Result<()> {
         return salvage(&args, input);
     }
     let source = NativeReader::open_file(input.file.try_clone()?)?;
-    source.set_decoded_cache_budget(8 << 20);
+    // Encoded copies stream payloads and only need a small decoded role cache.
+    // Keep that working set smaller than ordinary reads/recompression.
+    source.set_decoded_cache_budget(if args.preserve_encoding { 4 << 20 } else { 8 << 20 });
     let snapshot = source
         .reader()
         .snapshot()
@@ -1372,20 +1386,29 @@ fn execute(args: Args) -> Result<()> {
                 )?;
             } else {
                 write_archive(&args, spool, |writer| {
+                    let options = sac::v1::SealingOptions {
+                        preserve_source_encoding: args.preserve_encoding,
+                        ..sac::v1::SealingOptions::default()
+                    };
                     if staged_compact {
-                        reader.pack_verified_commit(
+                        reader.pack_verified_commit_with_options(
                             commit,
                             writer,
                             copy_limits(&args).max_temp_bytes,
+                            options,
                         )?;
                     } else {
-                        sac::v1::pack_commit_with_limits(
+                        sac::v1::pack_commit_with_options(
                             &source,
                             commit,
                             writer,
                             copy_limits(&args),
+                            options,
                         )?;
                     }
+                    // Copying has finished. Retire optional source payloads
+                    // before write_archive validates the completed output.
+                    source.clear_decoded_cache();
                     Ok(())
                 })?;
             }

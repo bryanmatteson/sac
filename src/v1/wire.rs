@@ -323,6 +323,7 @@ pub fn frame_span(header: &[u8]) -> Result<usize> {
 /// the writer; canonical identity is independent of their physical encoding.
 #[derive(Default)]
 pub struct FrameEncoder {
+    pub(super) preserve_source_encoding: bool,
     frame: Vec<u8>,
     #[cfg(feature = "compression")]
     canonical: Vec<u8>,
@@ -673,16 +674,34 @@ impl FrameEncoder {
         compressed: &[u8],
     ) -> Result<&[u8]> {
         super::schema::validate_core_shape(kind, version, bytes, children.len())?;
-        self.frame.clear();
-        self.frame.resize(FRAME, 0);
-        self.frame.extend_from_slice(compressed);
-        self.finish(
+        self.encode_payload(
             kind,
             8 + children.len() * 32 + bytes.len(),
             children,
             hash,
-            1,
+            super::EncodedPayload {
+                codec: 1,
+                bytes: compressed,
+            },
         )
+    }
+    /// Reframe only the exact payload authenticated for a borrowed source
+    /// visit. Physical locators are regenerated from destination references.
+    pub(super) fn encode_payload(
+        &mut self,
+        kind: u16,
+        canonical_len: usize,
+        children: &[ObjectRef],
+        hash: ObjectHash,
+        encoded: super::EncodedPayload<'_>,
+    ) -> Result<&[u8]> {
+        // EncodedPayload comes only from already authenticated intrinsic parts.
+        // Relocation preserves their ordered child identities; the caller still
+        // checks destination bounds and finish enforces physical frame limits.
+        self.frame.clear();
+        self.frame.resize(FRAME, 0);
+        self.frame.extend_from_slice(encoded.bytes);
+        self.finish(kind, canonical_len, children, hash, encoded.codec)
     }
     // The stored bytes are in the frame. Add the child locators, the padding
     // and the header.

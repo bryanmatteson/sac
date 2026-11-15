@@ -4,6 +4,7 @@ use crate::v1::validate_core_object;
 /// An incremental batch is deliberately small: callers flush between batches.
 const MAX_FILE_BATCH: usize = 512;
 type Edit = (ResourcePath, u64, ObjectRef, Value);
+type FileEdit = (ResourcePath, u64, FileData, Value);
 type Pages = Vec<(Vec<u8>, ObjectRef)>;
 
 // Metadata can encode compactly while owning many Value slots. Account those
@@ -64,6 +65,39 @@ impl<S: ObjectStore + ?Sized> ArchiveBuilder<'_, S> {
     /// change only on success; failed writes can leave unreachable objects in
     /// the append-only store, just like the other incremental editing methods.
     pub fn set_extent_files_batch(&mut self, edits: &[Edit]) -> Result<()> {
+        self.apply_file_batch(edits.iter().map(|(path, length, root, metadata)| {
+            (
+                path,
+                FileContents::Extents {
+                    length: *length,
+                    root: *root,
+                },
+                metadata,
+            )
+        }))
+    }
+
+    /// Apply at most 512 sorted, unique file replacements, mixing inline data
+    /// and shared extent roots. This has the same path, page-reuse, admission,
+    /// operation-limit and failure-atomicity contract as `set_extent_files_batch`.
+    /// Inline values are bounded by `INLINE_LIMIT`; no existing byte object is
+    /// rewritten. The caller validates complete shared extent graphs before
+    /// publication. Only touched directory routes are fetched and rewritten.
+    pub fn set_files_batch(
+        &mut self,
+        edits: &[(ResourcePath, FileContents<'_>, Value)],
+    ) -> Result<()> {
+        self.apply_file_batch(
+            edits
+                .iter()
+                .map(|(path, contents, metadata)| (path, *contents, metadata)),
+        )
+    }
+
+    fn apply_file_batch<'e>(
+        &mut self,
+        edits: impl ExactSizeIterator<Item = (&'e ResourcePath, FileContents<'e>, &'e Value)>,
+    ) -> Result<()> {
         #[cfg(feature = "native")]
         if self.bulk.is_some() {
             return Err(Error::Unsupported(
@@ -73,32 +107,46 @@ impl<S: ObjectStore + ?Sized> ArchiveBuilder<'_, S> {
         if edits.len() > MAX_FILE_BATCH {
             return Err(Error::Limit("file batch entries"));
         }
-        if edits.is_empty() {
+        if edits.len() == 0 {
             return Ok(());
         }
         let mut budget = Budget::new(self.limits.clone());
         budget.directory_write_limit = self.page_limit;
         let mut retained = 0usize;
+        let mut prepared = Vec::with_capacity(edits.len());
         let mut next_entries = self.entries;
         let mut next_logical = self.logical;
-        for (i, (path, length, extent, metadata)) in edits.iter().enumerate() {
+        let mut previous: Option<&ResourcePath> = None;
+        for (path, contents, metadata) in edits {
+            let length = match contents {
+                FileContents::Inline(bytes) => {
+                    if bytes.len() > INLINE_LIMIT {
+                        return Err(Error::Limit("inline file bytes"));
+                    }
+                    bytes.len() as u64
+                }
+                FileContents::Extents { length, .. } => {
+                    if length == 0 {
+                        return Err(corrupt("extent file must be nonempty"));
+                    }
+                    length
+                }
+            };
             validate_path(path, &self.limits)?;
-            if i > 0 && (edits[i - 1].0 >= *path || path.starts_with(&edits[i - 1].0)) {
+            if previous.is_some_and(|prior| prior >= path || path.starts_with(prior)) {
                 return Err(corrupt(
                     "file batch paths must be sorted, unique and nonoverlapping",
                 ));
             }
-            if *length == 0 {
-                return Err(corrupt("extent file must be nonempty"));
-            }
+            previous = Some(path);
             next_entries = next_entries
                 .checked_add(1)
                 .ok_or(Error::Limit("input entries"))?;
             next_logical = next_logical
-                .checked_add(*length)
+                .checked_add(length)
                 .ok_or(Error::Limit("logical input bytes"))?;
             if next_entries > self.limits.max_entries
-                || *length > self.limits.max_file_bytes
+                || length > self.limits.max_file_bytes
                 || next_logical > self.limits.max_logical_bytes
             {
                 return Err(Error::Limit("logical input bytes"));
@@ -116,17 +164,32 @@ impl<S: ObjectStore + ?Sized> ArchiveBuilder<'_, S> {
                 )
                 .ok_or(Error::Limit("resident memory"))?;
             budget.memory(retained)?;
-            let object = batch_get(self.store, *extent, &mut budget, retained)?;
-            if object.version != 1 || !matches!(object.kind, 5 | 6) {
-                return Err(corrupt("expected extent tree"));
-            }
-            validate_core_object(&object)?;
+            let data = match contents {
+                FileContents::Inline(bytes) => {
+                    retained = retained
+                        .checked_add(bytes.len().saturating_mul(3))
+                        .ok_or(Error::Limit("resident memory"))?;
+                    budget.memory(retained)?;
+                    if declared_digests(metadata).next().is_some() {
+                        check_declared_digest(metadata, blake3::hash(bytes).as_bytes())?;
+                    }
+                    FileData::Inline(bytes.to_vec())
+                }
+                FileContents::Extents { root, .. } => {
+                    let object = batch_get(self.store, root, &mut budget, retained)?;
+                    if object.version != 1 || !matches!(object.kind, 5 | 6) {
+                        return Err(corrupt("expected extent tree"));
+                    }
+                    validate_core_object(&object)?;
+                    FileData::Extents(root)
+                }
+            };
             let entry = Entry {
                 name: path.last().unwrap().clone(),
                 metadata: metadata.clone(),
                 data: EntryData::File {
-                    length: *length,
-                    data: FileData::Extents(*extent),
+                    length,
+                    data: data.clone(),
                 },
             };
             let (value, children) = encode_leaf(&[entry]);
@@ -146,11 +209,79 @@ impl<S: ObjectStore + ?Sized> ArchiveBuilder<'_, S> {
                 .and_then(|n| n.checked_add(path.iter().map(|p| p.len() + 32).sum::<usize>()))
                 .ok_or(Error::Limit("resident memory"))?;
             budget.memory(retained)?;
+            prepared.push((path.clone(), length, data, metadata.clone()));
         }
-        let root = batch_directory(self.store, self.root, edits, 0, &mut budget, retained)?;
+        let root = batch_directory(self.store, self.root, &prepared, 0, &mut budget, retained)?;
         self.root = Some(root);
         self.entries = next_entries;
         self.logical = next_logical;
+        Ok(())
+    }
+
+    /// Flat, sorted file replacements for the native memtable. Build file
+    /// descriptors first, then rewrite each touched directory page once.
+    #[cfg(feature = "native")]
+    pub(crate) fn set_root_files_batch(&mut self, edits: &[(&[u8], &[u8])]) -> Result<()> {
+        if edits.is_empty() {
+            return Ok(());
+        }
+        if edits.len() > MAX_FILE_BATCH {
+            return Err(Error::Limit("file batch entries"));
+        }
+        let mut budget = Budget::new(self.limits.clone());
+        budget.directory_write_limit = self.page_limit;
+        let mut retained = 0usize;
+        let mut logical = self.logical;
+        let entries = self
+            .entries
+            .checked_add(edits.len() as u64)
+            .ok_or(Error::Limit("input entries"))?;
+        if entries > self.limits.max_entries {
+            return Err(Error::Limit("input entries"));
+        }
+        for (i, (name, bytes)) in edits.iter().enumerate() {
+            check_key(name)?;
+            if i > 0 && edits[i - 1].0 >= *name {
+                return Err(corrupt("file batch keys must be sorted and unique"));
+            }
+            if bytes.len() as u64 > self.limits.max_file_bytes {
+                return Err(Error::Limit("file bytes"));
+            }
+            logical = logical
+                .checked_add(bytes.len() as u64)
+                .ok_or(Error::Limit("logical input bytes"))?;
+            if logical > self.limits.max_logical_bytes {
+                return Err(Error::Limit("logical input bytes"));
+            }
+            retained = retained
+                .checked_add(bytes.len().saturating_mul(4))
+                .and_then(|n| n.checked_add(name.len().saturating_mul(4)))
+                .and_then(|n| n.checked_add(2048))
+                .ok_or(Error::Limit("file batch memory"))?;
+            budget.memory(retained)?;
+        }
+        let mut prepared = Vec::with_capacity(edits.len());
+        for (name, bytes) in edits {
+            let data = if bytes.len() <= self.inline_limit() {
+                FileData::Inline(bytes.to_vec())
+            } else {
+                let mut extents = ExtentAccumulator::new();
+                for chunk in bytes.chunks(self.chunk_size) {
+                    extents.push_data(self.store, chunk)?;
+                }
+                FileData::Extents(extents.finish(self.store)?.unwrap())
+            };
+            prepared.push((
+                vec![name.to_vec()],
+                bytes.len() as u64,
+                data,
+                empty_metadata(),
+            ));
+        }
+        let root = batch_directory(self.store, self.root, &prepared, 0, &mut budget, retained)?;
+        self.root = Some(root);
+        self.entries = entries;
+        self.logical = logical;
         Ok(())
     }
 }
@@ -174,7 +305,7 @@ fn batch_get<S: ObjectStore + ?Sized>(
 fn batch_directory<S: ObjectStore + ?Sized>(
     store: &mut S,
     root: Option<ObjectRef>,
-    edits: &[Edit],
+    edits: &[FileEdit],
     at: usize,
     budget: &mut Budget,
     retained: usize,
@@ -198,7 +329,7 @@ fn batch_directory<S: ObjectStore + ?Sized>(
 fn batch_page<S: ObjectStore + ?Sized>(
     store: &mut S,
     root: Option<ObjectRef>,
-    edits: &[Edit],
+    edits: &[FileEdit],
     at: usize,
     expected: Option<u64>,
     lower: Option<&[u8]>,
@@ -246,13 +377,13 @@ fn batch_page<S: ObjectStore + ?Sized>(
                 }
                 let found = entries.binary_search_by(|e| e.name.cmp(name));
                 let entry = if edits[start].0.len() == at + 1 {
-                    let (_, length, extent, metadata) = &edits[start];
+                    let (_, length, data, metadata) = &edits[start];
                     Entry {
                         name: name.clone(),
                         metadata: metadata.clone(),
                         data: EntryData::File {
                             length: *length,
-                            data: FileData::Extents(*extent),
+                            data: data.clone(),
                         },
                     }
                 } else {

@@ -629,13 +629,8 @@ mod writer {
         };
         base.as_file_mut().seek(SeekFrom::Start(0))?;
         std::io::copy(&mut base.as_file_mut().take(len - 160), &mut out)?;
-        let mut writer = SealedWriter {
-            output: out,
-            end: len - 160,
-            last: None,
-            compression_level: 0,
-            encoder: crate::v1::wire::FrameEncoder::default(),
-        };
+        let mut writer = SealedWriter::after_prefix(out, len - 160);
+        writer.set_compression_level(0);
         let count = info.record_bytes.div_ceil(SEGMENT_BYTES as u64);
         if count > limits.recovery.max_stripes
             || count.saturating_mul(64).saturating_add(5 << 20) > limits.recovery.max_memory_bytes

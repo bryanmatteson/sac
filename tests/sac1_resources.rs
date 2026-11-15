@@ -172,9 +172,9 @@ fn sealed_export_does_not_reload_childless_objects_for_postorder() {
     };
     let snapshot = source.source.reader().snapshot().unwrap();
     let exported = sac::pack_snapshot(&source, snapshot, Vec::new()).unwrap();
-    // One read checks the extent edge. A second authenticated read supplies
-    // the bytes to the destination without a third read in postorder.
-    assert_eq!(source.payload_reads.get(), 2);
+    // One authenticated read checks the extent role and supplies the bytes
+    // to the destination, without an eager role read or postorder reload.
+    assert_eq!(source.payload_reads.get(), 1);
     let store = PositionalStore::open(exported).unwrap();
     let root = store.reader().snapshot().unwrap();
     assert_eq!(root.hash, snapshot.hash);
@@ -282,6 +282,114 @@ fn combined_export_checks_extent_geometry_and_deferred_byte_roles() {
     }
 }
 
+#[test]
+fn extent_ranges_and_combined_export_use_borrowed_pages_and_payloads() {
+    use sac::cbor::{Value::*, encode};
+
+    struct BorrowedExtents<'a>(&'a MemoryStore);
+    impl ObjectStore for BorrowedExtents<'_> {
+        fn get(&self, reference: sac::ObjectRef) -> sac::Result<sac::CanonicalObject> {
+            let object = self.0.get(reference)?;
+            assert!(
+                !matches!(object.kind, 5..=7),
+                "extent requested an owned object"
+            );
+            Ok(object)
+        }
+        fn visit_verified(
+            &self,
+            reference: sac::ObjectRef,
+            visitor: &mut dyn FnMut(sac::ObjectView<'_>) -> sac::Result<()>,
+        ) -> sac::Result<()> {
+            self.0.visit_verified(reference, visitor)
+        }
+        fn put(
+            &mut self,
+            _: u16,
+            _: u16,
+            _: &[u8],
+            _: &[sac::ObjectRef],
+        ) -> sac::Result<sac::ObjectRef> {
+            unreachable!("read-only source")
+        }
+    }
+    let mut source = MemoryStore::sealed();
+    let bytes = source.put(7, 1, b"data", &[]).unwrap();
+    let mut leaves = Vec::new();
+    for rows in [
+        vec![Array(vec![Uint(4), Uint(0)]), Array(vec![Uint(2), Null])],
+        vec![Array(vec![Uint(2), Null]), Array(vec![Uint(4), Uint(0)])],
+    ] {
+        leaves.push(source.put(5, 1, &encode(&Array(rows)), &[bytes]).unwrap());
+    }
+    let extent = source
+        .put(
+            6,
+            1,
+            &encode(&Array(vec![
+                Uint(1),
+                Array(vec![
+                    Array(vec![Uint(6), Uint(0)]),
+                    Array(vec![Uint(12), Uint(1)]),
+                ]),
+            ])),
+            &leaves,
+        )
+        .unwrap();
+    let directory = source
+        .put(
+            3,
+            1,
+            &encode(&Array(vec![Array(vec![
+                Bytes(b"file".to_vec()),
+                Uint(0),
+                Map(vec![]),
+                Array(vec![Uint(12), Uint(1), Uint(0)]),
+            ])])),
+            &[extent],
+        )
+        .unwrap();
+    let snapshot = sac::resources::snapshot(&mut source, directory, vec![], vec![]).unwrap();
+    let commit = sac::resources::commit(&mut source, snapshot, None, None).unwrap();
+    let borrowed = BorrowedExtents(&source);
+    let archive = ArchiveReader::open(&borrowed, snapshot, Limits::default()).unwrap();
+    let expected = b"data\0\0\0\0data";
+    assert_eq!(archive.read_range(&path("file"), 0, 12).unwrap(), expected);
+    assert_eq!(
+        archive.read_range(&path("file"), 3, 7).unwrap(),
+        expected[3..10]
+    );
+    let shallow = ArchiveReader::open(
+        &borrowed,
+        snapshot,
+        Limits {
+            max_depth: 0,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        shallow.read_range(&path("file"), 0, 12),
+        Err(sac::Error::Limit("path depth"))
+    ));
+    #[cfg(feature = "native")]
+    {
+        let seal = archive
+            .pack_verified_commit(commit, Vec::new(), Limits::default().max_temp_bytes)
+            .unwrap();
+        let sealed = PositionalStore::open(seal).unwrap();
+        let archive = ArchiveReader::open(
+            &sealed,
+            sealed.reader().snapshot().unwrap(),
+            Limits::default(),
+        )
+        .unwrap();
+        archive.verify().unwrap();
+        assert_eq!(archive.read_range(&path("file"), 0, 12).unwrap(), expected);
+    }
+    #[cfg(not(feature = "native"))]
+    let _ = commit;
+}
 #[test]
 fn split_pages_nested_raw_names_cross_chunk_and_sparse_ranges() {
     let mut store = MemoryStore::sealed();
@@ -771,4 +879,46 @@ fn salvage_spills_long_profile_history_without_namespace_depth_limit() {
     assert_eq!(recovered.snapshot.hash, root.hash);
     let reader = ArchiveReader::open(&destination, recovered.snapshot, limits).unwrap();
     assert!(reader.verify().unwrap().core_checked);
+}
+
+#[test]
+fn borrowed_file_storage_descriptors_preserve_inline_and_extent_identity() {
+    use sac::resources::FileContents;
+    let mut store = MemoryStore::sealed();
+    let mut builder = ArchiveBuilder::new(&mut store);
+    builder.add_file(&path("inline"), b"bytes").unwrap();
+    builder.add_file(&path("large"), &[5; 65536]).unwrap();
+    builder.add_symlink(&path("link"), b"inline").unwrap();
+    let snapshot = builder.finish().unwrap();
+    let reader = ArchiveReader::open(&store, snapshot, Limits::default()).unwrap();
+    reader.verify().unwrap();
+    let inline = reader.lookup_shared(&path("inline")).unwrap().unwrap();
+    assert!(matches!(
+        inline.file_contents().unwrap(),
+        Some(FileContents::Inline(b"bytes"))
+    ));
+    let extent = reader.lookup_shared(&path("large")).unwrap().unwrap();
+    let Some(FileContents::Extents { length, root }) = extent.file_contents().unwrap() else {
+        panic!()
+    };
+    assert_eq!(length, 65536);
+    assert_eq!(store.get_verified_shared(root).unwrap().kind, 5);
+    let link = reader.lookup_shared(&path("link")).unwrap().unwrap();
+    assert!(link.file_contents().unwrap().is_none());
+    drop(reader);
+    let mut builder = ArchiveBuilder::new(&mut store);
+    builder
+        .set_files_batch(&[(
+            path("copy"),
+            FileContents::Extents { length, root },
+            sac::cbor::Value::Map(vec![]),
+        )])
+        .unwrap();
+    let copied = builder.finish().unwrap();
+    let reader = ArchiveReader::open(&store, copied, Limits::default()).unwrap();
+    reader.verify().unwrap();
+    let view = reader.lookup_shared(&path("copy")).unwrap().unwrap();
+    assert!(
+        matches!(view.file_contents().unwrap(),Some(FileContents::Extents{root:r,..}) if r==root)
+    );
 }

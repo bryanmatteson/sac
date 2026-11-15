@@ -228,6 +228,10 @@ recoverable independently of an unsupported profile.
 The optional [generic metadata profile](02-generic-metadata-v1.md) provides
 container-wide namespaced values using the existing profile and resource kinds.
 
+The optional native [memtable profile and local WAL](04-memtable-v1.md) provide
+a bounded key/value overlay with synchronous WAL acknowledgement and periodic
+durable checkpoints, using the existing snapshot, profile and resource kinds.
+
 ## Extension ownership, dependencies and identity
 
 Core kinds 1–9 are allocated here; numeric kinds 10–65535 are reserved for future
@@ -288,8 +292,23 @@ belong to full resource validation. `put` appends canonical objects with explici
 ordered dependencies. `MemoryStore` is for bounded
 in-memory workloads, not an unbounded-file transport.
 
+`ArchiveBuilder::set_files_batch` accepts up to 512 sorted, unique,
+nonoverlapping `(ResourcePath, FileContents, metadata)` replacements.
+`FileContents::Inline` supplies at most 48 KiB of bytes;
+`FileContents::Extents { length, root }` shares an existing nonempty extent tree.
+The writer authenticates touched routes and extent roots, enforces input, page,
+work and memory limits, retains untouched references, and changes its root and
+accounting only after the batch succeeds. The caller validates the starting
+directory and complete shared extent graphs before publication, as for
+`set_extent_files_batch`. Grouping can change on splits. This API changes no
+canonical schema, object identity rules or durable publication barriers.
+
 `ArchiveReader::lookup_shared` returns a page-pinned entry with borrowed name
 and metadata; `None` is an unvalidated route miss, not certified absence.
+`ResourceView::file_contents` returns borrowed inline bytes or the exact
+`FileContents::Extents` length/root descriptor, and `None` for nonfiles. It does
+not traverse the extent graph; full validation is required before sharing that
+reference into a new snapshot.
 `open_file` retains an authenticated descriptor for repeated caller-buffer
 `read_into` operations. `read_range_into` resolves and reads into caller storage;
 `read_to` streams to a writer. Range bounds, extent geometry and dependency
@@ -311,7 +330,15 @@ within the decoded-cache budget so a parent can synchronously check a child.
 Borrowed verified writes preserve the complete ordered child identity sequence
 and authenticate destination occurrences under the destination's ordinary
 policy. Neither borrowing nor relocation authenticates an outgoing closure;
-canonical sealing retains its configured compression parameters.
+ordinary sealing retains its configured compression parameters.
+`ObjectStore::visit_verified_encoded` may additionally borrow the exact payload
+whose decode authenticated those canonical parts. `SealingOptions` explicitly
+opts into retaining that source encoding; raw frames remain raw and compressed
+frames retain their original codec stream. Physical child locators are rebuilt,
+and unavailable encodings use the configured compression level. This policy
+does not assert matching compressor provenance or prescribe a normal form for
+Zstandard bytes. Authentication, ordered child identities, intrinsic and role
+checks, operation charges and final physical validation retain their scope.
 Direct role checks may reuse the intrinsic schema admission supplied by an
 authenticated visit or frame decode. The public untrusted-fetch checker still
 validates parent and child shapes; role kinds, branch heights, profile bindings
@@ -323,9 +350,10 @@ roles in that same operation. It authenticates no other occurrence or outgoing
 closure. Profile root bindings still compare the actual authenticated fields.
 Logical role-visit, source-byte and decoded-byte charges remain in force even
 when role checks share authentication with the child's ordinary graph visit.
-Namespace validation may borrow admitted directory rows instead of building
-owned CBOR trees. Inherited fences and heights, shared-route expansion, resource
-counts, file geometry and operation limits still apply to every namespace route.
+Namespace validation and range reads may borrow admitted directory rows, extent
+pages and byte leaves instead of building owned objects. Inherited fences and
+heights, shared-route expansion, resource counts, file geometry and operation
+limits still apply to every namespace route.
 
 Checked persistent-tree mutations may obtain `ObjectStore::rewrite_source(parent)`
 and pass its opaque `RewriteSource` to `rewrite`. Generic stores return no source

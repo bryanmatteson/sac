@@ -6,7 +6,9 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 fn command() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sac"))
+    Command::new(
+        std::env::var_os("SAC_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_sac").into()),
+    )
 }
 fn success(output: Output) -> Output {
     assert!(

@@ -704,3 +704,128 @@ fn smaller_writer_edits_wide_inherited_pages_and_keeps_inline_descriptors() {
         assert!(found);
     }
 }
+
+fn mixed_name(n: usize) -> ResourcePath {
+    path_from_str(&format!("key-{n:08}")).unwrap()
+}
+
+#[test]
+fn mixed_file_batches_preserve_shared_extents_and_match_single_edits() {
+    use sac::resources::FileContents;
+    let mut store = Counted::new();
+    let data = extent(&mut store, &[9; 65536]);
+    let base = {
+        let mut builder = ArchiveBuilder::new(&mut store);
+        builder
+            .add_file(&path_from_str("kept/file").unwrap(), b"kept")
+            .unwrap();
+        builder.finish_directory().unwrap()
+    };
+    let edits = vec![
+        (
+            path_from_str("a/empty").unwrap(),
+            FileContents::Inline(b""),
+            metadata(),
+        ),
+        (
+            path_from_str("a/inline").unwrap(),
+            FileContents::Inline(b"inline"),
+            metadata(),
+        ),
+        (
+            path_from_str("a/shared").unwrap(),
+            FileContents::Extents {
+                length: 65536,
+                root: data,
+            },
+            metadata(),
+        ),
+    ];
+    let mut single = ArchiveBuilder::from_directory(&mut store, base, Limits::default());
+    for (path, contents, meta) in &edits {
+        match contents {
+            FileContents::Inline(bytes) => single.set_file(path, bytes, meta.clone()).unwrap(),
+            FileContents::Extents { length, root } => single
+                .set_extent_file(path, *length, *root, meta.clone())
+                .unwrap(),
+        }
+    }
+    let expected = single.finish().unwrap();
+    store.reset();
+    let mut batch = ArchiveBuilder::from_directory(&mut store, base, Limits::default());
+    batch.set_files_batch(&edits).unwrap();
+    let actual = batch.finish().unwrap();
+    assert_eq!(actual.hash, expected.hash);
+    assert_eq!(store.leaves, 2); // parent + a, with all three edits in a single leaf
+    assert_eq!(store.branches, 0);
+    let reader = ArchiveReader::open(&store, actual, Limits::default()).unwrap();
+    assert_eq!(reader.verify().unwrap().files, 4);
+    assert_eq!(
+        reader
+            .read_file_bounded(&path_from_str("a/shared").unwrap(), 65536)
+            .unwrap()
+            .unwrap()
+            .1,
+        [9; 65536]
+    );
+}
+
+#[test]
+fn mixed_file_batches_reject_bad_descriptors_order_and_limits_atomically() {
+    use sac::resources::FileContents;
+    let mut store = Counted::new();
+    let blob = store.put(7, 1, b"bad root role", &[]).unwrap();
+    let base = ArchiveBuilder::new(&mut store).finish_directory().unwrap();
+    let too_large = vec![7; sac::resources::INLINE_LIMIT + 1];
+    let cases = vec![
+        vec![(mixed_name(1), FileContents::Inline(&too_large), metadata())],
+        vec![(
+            mixed_name(1),
+            FileContents::Extents {
+                length: 0,
+                root: blob,
+            },
+            metadata(),
+        )],
+        vec![(
+            mixed_name(1),
+            FileContents::Extents {
+                length: 5,
+                root: blob,
+            },
+            metadata(),
+        )],
+        vec![
+            (mixed_name(2), FileContents::Inline(b"2"), metadata()),
+            (mixed_name(1), FileContents::Inline(b"1"), metadata()),
+        ],
+        vec![(mixed_name(1), FileContents::Inline(b"1"), metadata()); 2],
+        vec![
+            (
+                path_from_str("a").unwrap(),
+                FileContents::Inline(b"1"),
+                metadata(),
+            ),
+            (
+                path_from_str("a/b").unwrap(),
+                FileContents::Inline(b"2"),
+                metadata(),
+            ),
+        ],
+        vec![(mixed_name(1), FileContents::Inline(b"1"), metadata()); 513],
+    ];
+    for edits in cases {
+        let mut builder = ArchiveBuilder::from_directory(&mut store, base, Limits::default());
+        assert!(builder.set_files_batch(&edits).is_err());
+        assert_eq!(builder.directory_root(), Some(base));
+    }
+    let mut limits = Limits::default();
+    limits.max_logical_bytes = 3;
+    let mut builder = ArchiveBuilder::from_directory(&mut store, base, limits);
+    assert!(
+        builder
+            .set_files_batch(&[(mixed_name(1), FileContents::Inline(b"four"), metadata())])
+            .is_err()
+    );
+    assert_eq!(builder.directory_root(), Some(base));
+}

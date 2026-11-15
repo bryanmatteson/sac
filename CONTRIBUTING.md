@@ -54,6 +54,11 @@ test that closes a store and opens it again can fail with `Busy`. Run that test
 again, or set `RUST_TEST_THREADS=1`.
 Say in your pull request which jobs you ran and on which operating system.
 
+The CLI and privacy integration tests accept `SAC_TEST_BIN` as an override for
+the production executable. Use it to pin an already-built executable with the
+matching feature set when running test binaries directly in a shared checkout;
+concurrent builds with other features can replace the usual `target/debug/sac`.
+
 ## Independent Python reader
 
 The Python reader in `tools/` is a second implementation of the format. A

@@ -16,6 +16,8 @@ integrity does not establish application semantic correctness or publisher trust
 
 - [Generic container metadata profile](02-generic-metadata-v1.md)
 - [Optional recovery records](03-recovery-records-v1.md)
+- [Bounded memtable checkpoint profile and local WAL](04-memtable-v1.md)
+- [Authenticated live flat map](05-live-map-v1.md)
 - [Overview, installation and feature boundaries](../README.md)
 - [Rust API notes](../docs/api-notes.md)
 - [Command-line tools](../docs/sac1-cli.md)

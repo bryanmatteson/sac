@@ -131,12 +131,28 @@ The main types are:
 | `MemoryStore` | Holds an object graph in memory. |
 | `NativeStore` | Owns durable publication to a local file. Needs the `native` feature. |
 | `NativeReader` | Pins one admitted, immutable view of a local file. Needs the `native` feature. |
+| `MemtableStore` | Bounded byte-key/value overlay with synchronous WAL durability and periodic SAC checkpoints. Needs the `native` feature. |
 | `v1::metadata::MetadataReader`, `MetadataEditor` | Read and edit generic container metadata. |
 | `recovery` | Creates, inspects and applies recovery records. |
 
 The public API is in the `v1` module. The crate root also exports the principal
 types. The [Rust API notes](docs/api-notes.md) describe buffering, caches,
 allocation-sensitive reads and compaction.
+
+For frequent small updates, `MemtableStore` coalesces pending values and deletion
+markers in memory. `put`, `delete` and atomic `write_batch` calls synchronize a
+sidecar WAL before acknowledging writes. Reads consult the overlay first. A
+worker publishes immutable tables to SAC while reads and writes continue;
+the configurable timer, combined table-memory limit and WAL
+limits apply backpressure before accepting more data. `open` validates and
+replays the WAL after interruption. Use `close` to observe final checkpoint
+errors; dropping the handle retains acknowledged writes in the WAL.
+
+The store uses a dedicated `sac.memtable.v2` profile and recovers/upgrades v1
+stores. It supports arbitrary binary keys up to 2,047 bytes. See the [usage example](examples/memtable.rs),
+[API notes](docs/api-notes.md#durable-memtable), and
+[checkpoint and WAL contract](specs/04-memtable-v1.md). Keep the SAC file, its
+`.wal` and any `.wal.next` segment together for recovery.
 
 ## Cargo features
 
@@ -188,6 +204,13 @@ sac metadata get portable.sac org.example.title --json
 Edits need a live store. See the
 [CLI guide](docs/sac1-cli.md#generic-container-metadata).
 
+### Authenticated live maps
+
+`LiveMap` provides authenticated flat-map inserts and updates using a bucketed
+trie delta and incremental resource checkpoints. Native `publish` uses the normal
+durable root protocol. See [the API example](examples/live_map.rs) and
+[profile and compatibility rules](specs/05-live-map-v1.md).
+
 ### Independent Python reader
 
 [`tools/sac1_recover.py`](tools/SAC1_RECOVERY.md) reads SAC1 files without this
@@ -225,6 +248,7 @@ A limit error means that the check is incomplete. Read the
 | [Core format and API](specs/01-sac-core-v1.md) | The wire layout, canonical objects, schemas, limits and verification boundaries. |
 | [Generic metadata profile](specs/02-generic-metadata-v1.md) | The `sac.metadata.v1` profile. |
 | [Recovery records](specs/03-recovery-records-v1.md) | The erasure code and the record formats. |
+| [Live map profile](specs/05-live-map-v1.md) | Bucketed authenticated deltas, native publication and plain resource export. |
 | [CLI guide](docs/sac1-cli.md) | Each `sac` command, its limits and its diagnostics. |
 | [Rust API notes](docs/api-notes.md) | Buffering, caches, borrowed reads and compaction. |
 | [Same-file maintenance](docs/same-file-maintenance.md) | In-place compaction, online reclamation and the reader contract. |

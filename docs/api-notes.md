@@ -15,6 +15,109 @@ local publication; `NativeReader` pins an immutable admitted view.
 
 ## Write buffering
 
+### Durable memtable
+
+`MemtableStore` is a native, thread-safe byte-key/value API in front of a
+dedicated live SAC container. Unlike native frame buffering, it defers SAC
+object construction and coalesces repeated changes to each pending key. It
+uses the `sac.memtable.v2` application profile and recovers/upgrades v1 stores.
+It adds no core wire format changes.
+
+```rust,no_run
+use sac::{MemtableOptions, MemtableStore, Mutation};
+use std::{io::Read, time::Duration};
+
+# fn main() -> sac::Result<()> {
+let mut incarnation = [0; 16];
+std::fs::File::open("/dev/urandom")?.read_exact(&mut incarnation)?;
+let store = MemtableStore::create("state.sac", incarnation, MemtableOptions {
+    max_memory_bytes: 16 * 1024 * 1024,
+    max_wal_bytes: 64 * 1024 * 1024,
+    flush_interval: Duration::from_millis(500),
+    ..Default::default()
+})?;
+store.write_batch(&[
+    Mutation::Put { key: b"analysis/function/42", value: b"result" },
+    Mutation::Delete { key: b"analysis/stale" },
+])?; // one full WAL synchronization for the entire atomic batch
+assert_eq!(store.get(b"analysis/function/42")?.as_deref(), Some(&b"result"[..]));
+store.close()?; // final checkpoint, reporting any failure
+
+let reopened = MemtableStore::open("state.sac", MemtableOptions::default())?;
+assert_eq!(reopened.get(b"analysis/stale")?, None);
+reopened.close()?;
+# Ok(())
+# }
+```
+
+On Unix, WAL output gathers up to 64 mutations from the admitted batch into a
+file write using a fixed 4 KiB framing buffer and descriptor array below the
+existing 8 KiB output scratch bound. Prefixes, keys that fit and small values
+(up to 256 bytes) share that buffer. Other payloads are borrowed. Groups retain
+64 mutations even when keys are too large to pack. Partial writes and
+interruptions are completed before the full WAL synchronization; other
+platforms retain bounded buffered output.
+
+Single writes also synchronize the WAL before returning. Use `write_batch` to
+amortize that barrier across up to 1,024 mutations. Keys may be empty or contain
+arbitrary bytes, up to 2,047 bytes; duplicate keys in one batch use the last
+mutation. Value size is configurable up to 8 MiB. Overlay hits and tombstones
+take precedence over the last checkpoint.
+
+`max_memory_bytes` charges key/value bytes and conservative per-entry overhead;
+the active table, one immutable table and incoming batch fit together. The
+worker freezes at seven-eighths occupancy, retaining headroom without repeatedly
+flushing smaller hot sets. It prepares the durable empty successor WAL during
+the dirty interval, before a checkpoint is requested. A write that
+would exceed the combined memory or retained WAL bound waits for background
+retirement before allocation or acknowledgment. An individually
+oversized batch fails before WAL acceptance. A capacity wait during a checkpoint
+does not implicitly schedule another active-table checkpoint; admission is
+retried after retirement. Native caches and bounded
+encoding/recovery scratch have separate budgets; this is not a process RSS cap.
+The worker starts a checkpoint at the oldest pending write's deadline, including
+when callers are idle. Checkpoints build/publish outside the state lock. Reads resolve
+active values/tombstones, then immutable values/tombstones, then a pinned SAC
+checkpoint; WAL sync and base reads also run outside that lock. There is no
+queue of immutable generations. Capacity exhaustion applies bounded backpressure. The interval does not guarantee filesystem completion latency.
+
+`request_flush()` schedules a checkpoint and returns its target sequence;
+`flush()` waits until the worker has durably published and retired records through
+all batches accepted before the call. Later writes can continue and may remain
+in the active table when it returns.
+
+`statistics` exposes combined pending bytes/entries, active/immutable charges,
+immutable entry count, flush activity, admission waits, WAL bytes, accepted/checkpoint
+sequences, recovered batches, discarded incomplete-tail bytes and the first
+failure. Its fixed-size `io` counters attribute cumulative wall time since open
+to WAL encoding/synchronization, write preparation, lock/admission waits,
+successor preparation, and checkpoint construction/publication/retirement.
+`io.native_publication` exposes the native barrier counters shared with the
+checkpoint writer. WAL totals cover successful batches; checkpoint totals cover successfully
+returned work (failed jobs can omit elapsed time), and native barrier counters
+include attempts. Worker and
+foreground durations overlap and must not be summed as process CPU or elapsed
+time. WAL/checkpoint failures poison the handle until reopen. A full invalid
+WAL record is an error; only an incomplete final record may be discarded. A
+failed call can have an indeterminate outcome. Applications requiring request
+deduplication should store their request ID in the same atomic batch.
+
+`open` validates the complete WAL before replay, publishes recovered changes
+under the configured memory limit, and safely retires covered records. It can
+recover an interrupted publication through a private, validated native recovery
+path that preserves damaged SAC input; ordinary writable native admission still
+rejects torn slots. Missing or foreign WALs fail closed. Reducing limits below
+the largest existing batch requires reopening with sufficient limits. Drop
+stops the worker without a silent final checkpoint; `close` reports errors.
+Back up or move the SAC file, `.wal` and any `.wal.next` while quiescent, or
+export a completed SAC snapshot. Retained record bytes plus one header obey
+`max_wal_bytes`; the second segment adds one fixed 64-byte header on disk.
+
+See [the full WAL and profile contract](../specs/04-memtable-v1.md) and
+[`examples/memtable.rs`](../examples/memtable.rs).
+
+### Native frame buffering
+
 Appended frames share a bounded 1 MiB write buffer, packing full writes across
 frame boundaries. Large frame prefixes write directly; only their short tails
 occupy the buffer. A cache miss drains it only when the requested frame includes
@@ -118,6 +221,21 @@ and older leaves remain legal; an edited wide leaf splits lazily. Bulk packing
 retains its dense normalization policy. Grouping changes can change the root
 ID of a newly written tree; existing roots and authenticated pins retain their
 identities. The policy applies to both single-file and batch edits.
+`ArchiveBuilder::set_files_batch` applies up to 512 sorted, unique,
+nonoverlapping path replacements with mixed `FileContents::Inline` byte slices
+and `FileContents::Extents { length, root }` descriptors. It authenticates touched
+directory routes and shared extent roots, retains untouched physical references,
+and rewrites each touched page once per batch (splits may emit several pages).
+Inline data is bounded by `INLINE_LIMIT`; complete extent graphs and the initial
+directory remain the caller's validation responsibility. Failure preserves the
+builder root and input accounting; append-only stores can retain unreachable
+objects from an interrupted operation. The existing extent-only batch API shares
+this path and retains its contract. No wire format or publication policy changes.
+`ResourceView::file_contents` borrows inline bytes or returns an exact shared
+extent descriptor without materializing file contents. It returns `None` for
+nonfiles. Validate the complete extent graph before sharing the descriptor into
+a new snapshot; descriptor access alone is not full-file verification.
+
 Raw frame views borrow input without moving the payload;
 compressed views borrow the decoder's reusable output. Native writers compute
 canonical identity from the caller's bytes before allocating a new object.
@@ -251,6 +369,57 @@ editing uses this visit when parsing a directory page, preserving the same
 frame, decoded-byte and resident-memory charges without requiring an owned
 payload copy. Callers needing a pin can still request a shared owned object.
 
+`visit_verified_encoded` can also provide a callback-scoped capability for the
+exact raw or Zstandard payload authenticated by decoding. Native readers reuse
+bounded frame/decoder workspace. Ordinary role reads and existing decoded entries keep
+a full-frame BLAKE3 digest alongside their canonical parts, within
+the same byte budget. A later encoded visit checks that digest against the exact
+newly read frame before reusing its canonical parts, avoiding another decode and
+canonical hash. The proof binds the codec, header and source child locators too;
+a decoded cache hit alone never authorizes new encoded bytes. Encoded
+visits never force owned cache admission, and no second payload cache is kept.
+Proof hashing is lazy: a fully decoded one-pass encoded visit with no matching
+resident entry does not compute a digest that would immediately be discarded.
+Borrowed cache admission computes the proof only after its payload fits; later certified
+hits still hash the newly read complete frame before granting the capability.
+
+Extent namespace checks and range reads also borrow authenticated pages and byte
+leaves. They preserve inherited length/height checks, sparse range behavior and
+the same frame, source, decoded-byte and edge charges. Callers needing an owned
+pin can still request one through the ordinary object API.
+
+Resource closure copies defer extent byte-leaf kind/length checks to the leaf's
+ordinary authenticated copy visit. Exact physical completion records retain a
+three-byte byte-length fact, so deduplicated occurrences still check later role
+requirements. Every declared role retains its ordinary frame, source and
+decoded-byte quota charge; invalid roles fail before their leaf is exported.
+Content remapping uses 32-byte identity keys, while completion keeps the full
+44-byte source reference. Disposable spill records retain only these facts and
+pending references, never payloads or ancestor bodies. Output ordering and
+default/preserve-source encoding policies are unchanged.
+The transient active marker shares a bit with the mapped frame span, whose
+valid range leaves that bit unused. Pending and completed byte lengths fit in
+three bytes under the existing 8 MiB object bound. These compact records change
+only disposable workspace, keeping ordinary cycle detection and exact locators.
+Physical validation stores a four-byte direct-role fact: schema-1 kind and
+bounded body length/branch height, or an opaque marker that rejects every typed
+role. The fact remains keyed by the full expected identity, offset and span.
+Incoming extent length requirements remain 64-bit and must match exactly.
+Header inventory uses six bytes for the independently bounded frame span and
+decoded length. These widths follow admitted wire bounds, and full-width
+incoming spans are compared without truncation.
+Small physical read windows recycle an evicted buffer under cache pressure;
+new bytes still pass the full frame decoder before they gain authority. The CLI
+uses a 4 MiB source cache for encoded copies and releases optional source
+caches after copying and before output validation.
+A generic adapter supplies no encoding and falls back to ordinary encoding. `SealedWriter::set_preserve_source_encoding(true)` and
+`SealingOptions::preserve_source_encoding` explicitly opt into this policy;
+`pack_commit_with_options` and `pack_verified_commit_with_options` carry it
+through full graph and namespace verification. The default still encodes at
+the configured level. Preserved encodings can differ from that default for a
+source written at another level; canonical IDs, child-role checks and quotas
+remain unchanged.
+
 `put_unretained` is a strict write with deferred decoded-cache admission. Native
 stores still compute identity, validate the schema and authenticate every child,
 but retain only exact type/provenance metadata for a newly appended object.
@@ -329,3 +498,30 @@ Application extensions use namespaced kind-8 envelopes and declare portable
 dependencies through strong child edges. Allocation budgets are operational
 limits. Repacking preserves canonical graph identity; rebuilding the same file
 bytes under different chunking or metadata may produce a different snapshot.
+
+## Live flat maps
+
+`LiveMap` and `LiveMapReader` expose the bucketed authenticated delta as a
+supported library API. Native callers retain an editor across small updates:
+
+```rust,no_run
+# fn example(store: &mut sac::NativeStore) -> sac::Result<()> {
+let mut map = store.live_map()?;
+map.set(store, b"record-1", b"new bytes")?;
+map.publish(store)?; // ordinary native durability barriers
+assert_eq!(map.reader(store)?.get(b"record-1")?, Some(b"new bytes".to_vec()));
+let exported = map.checkpoint(store)?; // incremental merge, ordinary resource snapshot
+// Publish exported explicitly when switching the selected view to ordinary resources.
+# Ok(()) }
+```
+
+Opening authenticates the complete bounded view. Keep the editor instead of
+reopening per edit. Checkpoint and publication cadence are application choices;
+`set` alone does not acknowledge durability. A reader holds an immutable view;
+use a native pin when the backing generation may be replaced. Reopen the
+editor with `store.live_map()` after native compaction or another physical
+relocation; the old editor holds references into its original backing store. See
+[the live-map profile](../specs/05-live-map-v1.md) for limits and compatibility,
+and [the runnable example](../examples/live_map.rs) for native publication,
+old-generation pins and ordinary resource export. The separate `MemtableStore`
+API retains its own WAL, checkpoint profile, and concurrency semantics.

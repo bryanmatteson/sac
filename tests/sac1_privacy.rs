@@ -302,9 +302,9 @@ fn production_cli_pack_wrap_open_verify_and_read() {
     let d = dir.path();
     let (recipient, key) = identity(d, "external.key");
     fs::write(d.join("notes.txt"), b"portable saved note").unwrap();
-    let cli = env!("CARGO_BIN_EXE_sac");
+    let cli = std::env::var_os("SAC_TEST_BIN").unwrap_or_else(|| env!("CARGO_BIN_EXE_sac").into());
     let run = |args: Vec<std::ffi::OsString>| {
-        let output = Command::new(cli).args(args).output().unwrap();
+        let output = Command::new(&cli).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "{}",

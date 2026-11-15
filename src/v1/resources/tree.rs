@@ -20,6 +20,15 @@ pub enum SparseSegment {
     Hole(u64),
 }
 
+/// File storage supplied to a persistent batch without copying existing extents.
+/// Extent graphs must be validated by the caller before publication, just as for
+/// `ArchiveBuilder::set_extent_file`. Inline bytes are copied into the new page.
+#[derive(Clone, Copy, Debug)]
+pub enum FileContents<'a> {
+    Inline(&'a [u8]),
+    Extents { length: u64, root: ObjectRef },
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum FileData {
     Inline(Vec<u8>),
@@ -251,7 +260,10 @@ type Pages = Vec<(Vec<u8>, ObjectRef)>;
 // individual inline value/metadata row or the portable admission limits.
 const DIRECTORY_WRITE_ROWS: usize = 192;
 #[cfg(test)]
-static SPLICE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+std::thread_local! {
+    // A comparison in one test must not disable another test or its worker.
+    static SPLICE_DISABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 /// Put one entry into a leaf page from the encoded rows of the page. The new
 /// page has the bytes that decoding every entry and encoding the changed list
 /// gives: a validated page holds deterministic CBOR, so an unchanged row keeps
@@ -268,7 +280,7 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
 ) -> Result<Option<Pages>> {
     use crate::v1::cbor_view;
     #[cfg(test)]
-    if SPLICE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+    if SPLICE_DISABLED.get() {
         return Ok(None);
     }
     if object.version != 1
@@ -1263,7 +1275,7 @@ fn insert_page<S: ObjectStore + ?Sized>(
     let splice_branches = {
         #[cfg(test)]
         {
-            !SPLICE_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+            !SPLICE_DISABLED.get()
         }
         #[cfg(not(test))]
         {
@@ -1989,12 +2001,11 @@ mod extent_sizing_tests {
 mod splice_tests {
     use super::*;
     use crate::v1::{MemoryStore, ObjectHash};
-    use std::sync::atomic::Ordering;
 
     // Apply one sequence of edits and return each directory root and each
     // edit result.
     fn edit(spliced: bool) -> Vec<(ObjectHash, bool)> {
-        SPLICE_DISABLED.store(!spliced, Ordering::Relaxed);
+        SPLICE_DISABLED.set(!spliced);
         let mut store = MemoryStore::sealed();
         let mut root = None;
         let mut seed = 7u64;
@@ -2042,7 +2053,7 @@ mod splice_tests {
             results.push((next.hash, result.is_ok()));
             root = Some(next);
         }
-        SPLICE_DISABLED.store(false, Ordering::Relaxed);
+        SPLICE_DISABLED.set(false);
         results
     }
     #[test]
@@ -2101,7 +2112,7 @@ mod splice_tests {
     #[test]
     fn borrowed_branch_edits_match_decoded_multilevel_splits_and_resizes() {
         fn run(spliced: bool) -> Vec<ObjectHash> {
-            SPLICE_DISABLED.store(!spliced, Ordering::Relaxed);
+            SPLICE_DISABLED.set(!spliced);
             let mut store = MemoryStore::sealed();
             let mut builder = ArchiveBuilder::new(&mut store);
             builder.set_page_limit(1024).unwrap();
@@ -2131,7 +2142,7 @@ mod splice_tests {
                 root = builder.finish_directory().unwrap();
                 hashes.push(root.hash);
             }
-            SPLICE_DISABLED.store(false, Ordering::Relaxed);
+            SPLICE_DISABLED.set(false);
             hashes
         }
         assert_eq!(run(true), run(false));

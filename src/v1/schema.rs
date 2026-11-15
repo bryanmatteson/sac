@@ -386,15 +386,6 @@ pub(crate) struct CoreShape<'a> {
     pub child_count: usize,
 }
 
-pub(crate) fn validate_core_edges_with(
-    parent: super::ObjectView<'_>,
-    fetch: impl FnMut(super::ObjectRef, &mut dyn FnMut(CoreShape<'_>) -> Result<()>) -> Result<()>,
-) -> Result<()> {
-    // Both the parent and fetched child parts must already have passed intrinsic
-    // validation, as required by ObjectStore::visit_verified and FrameDecoder.
-    validate_core_edges_impl::<false>(parent, fetch)
-}
-
 fn validate_core_edges_impl<const VALIDATE_SHAPES: bool>(
     parent: super::ObjectView<'_>,
     mut fetch: impl FnMut(super::ObjectRef, &mut dyn FnMut(CoreShape<'_>) -> Result<()>) -> Result<()>,
