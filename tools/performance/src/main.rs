@@ -67,6 +67,52 @@ fn main() {
     let mut output = vec![0; 512];
     let mut operation_hash = None;
     let result = match case.as_str() {
+        "live-map-updates" | "live-map-updates-raw" => {
+            if case == "live-map-updates-raw" {
+                store.set_compression_level(0);
+            }
+            let mut directory = archive.directory_root();
+            let mut ordinal = 0u64;
+            let iterations = std::env::var("SAC_MAP_ITERATIONS")
+                .map(|value| {
+                    value
+                        .parse::<usize>()
+                        .expect("SAC_MAP_ITERATIONS must be an integer")
+                })
+                .unwrap_or(1024);
+            assert!((1..=100_000).contains(&iterations));
+            let result = sample(
+                || {
+                    let mut builder =
+                        ArchiveBuilder::from_directory(&mut store, directory, Limits::default());
+                    builder
+                        .set_file(
+                            &path,
+                            &ordinal.to_le_bytes(),
+                            sac::cbor::Value::Map(Vec::new()),
+                        )
+                        .unwrap();
+                    ordinal += 1;
+                    directory = builder.finish_directory().unwrap();
+                    black_box(directory);
+                },
+                iterations,
+            );
+            let next = ArchiveBuilder::from_directory(&mut store, directory, Limits::default())
+                .finish()
+                .unwrap();
+            let published = store.publish(next).unwrap();
+            let pin = store.pin().unwrap();
+            let current = ArchiveReader::open(&pin, next, Limits::default()).unwrap();
+            assert_eq!(
+                current.read_file_bounded(&path, 8).unwrap().unwrap().1,
+                (ordinal - 1).to_le_bytes()
+            );
+            current.verify().unwrap();
+            assert_eq!(store.root(), Some(published));
+            operation_hash = Some(next.hash);
+            result
+        }
         "extent-build" => {
             let references: Vec<_> = (0..2048u64)
                 .map(|i| store.put(7, 1, &i.to_le_bytes(), &[]).unwrap())
@@ -161,9 +207,13 @@ fn main() {
                 64,
             )
         }
-        "duplicate-write" => {
+        "duplicate-write" | "duplicate-uncached-write" => {
             let existing = store.put(7, 1, &object.bytes, &[]).unwrap();
+            if case == "duplicate-uncached-write" {
+                store.set_decoded_cache_budget(0);
+            }
             let end = store.file_len();
+            let reads = store.physical_statistics();
             let result = sample(
                 || {
                     assert_eq!(
@@ -174,10 +224,12 @@ fn main() {
                 1024,
             );
             assert_eq!(store.file_len(), end);
+            assert_eq!(store.physical_statistics(), reads);
             operation_hash = Some(existing.hash);
             result
         }
         "append-steady"
+        | "append-raw-steady"
         | "append-cached-steady"
         | "authenticate-steady"
         | "rewrite-layout-steady" => {
@@ -187,6 +239,9 @@ fn main() {
             store
                 .set_append_index_memory_budget(512 + 256 * 2048)
                 .unwrap();
+            if case == "append-raw-steady" {
+                store.set_compression_level(0);
+            }
             let child = store.put(7, 1, &[9; 16 * 1024], &[]).unwrap();
             let mut body = [0; 16 * 1024];
             let use_cache = case == "append-cached-steady";
@@ -298,11 +353,47 @@ fn main() {
             assert_eq!(store.temporary_bytes().unwrap(), scratch);
             result
         }
-        "append-cache-churn" => {
+        "append-map-steady" | "append-map-raw" => {
+            store
+                .set_append_index_memory_budget(512 + 256 * 2048)
+                .unwrap();
+            if case == "append-map-raw" {
+                store.set_compression_level(0);
+            }
+            // Synthetic extension pages: 512 body bytes and 16 distinct
+            // child occurrences. Exercise ordinary strict puts, including
+            // full child checks, with a warmed cache and spilled append index.
+            let children: Vec<_> = (0..16u64)
+                .map(|ordinal| store.put(7, 1, &ordinal.to_le_bytes(), &[]).unwrap())
+                .collect();
+            let mut body = [0x40; 512];
+            for ordinal in 0..8500u64 {
+                body[..8].copy_from_slice(&ordinal.to_le_bytes());
+                store.put(4096, 1, &body, &children).unwrap();
+            }
+            let scratch = store.temporary_bytes().unwrap();
+            let mut ordinal = 8500u64;
+            let result = sample(
+                || {
+                    body[..8].copy_from_slice(&ordinal.to_le_bytes());
+                    ordinal += 1;
+                    let saved = store.put(4096, 1, black_box(&body), &children).unwrap();
+                    operation_hash = Some(saved.hash);
+                    black_box(saved);
+                },
+                1024,
+            );
+            assert_eq!(store.temporary_bytes().unwrap(), scratch);
+            result
+        }
+        "append-cache-churn" | "append-small-raw" => {
             store
                 .set_append_index_memory_budget(512 + 256 * 2048)
                 .unwrap();
             store.set_decoded_cache_budget(4096);
+            if case == "append-small-raw" {
+                store.set_compression_level(0);
+            }
             let mut body = [0x73; 32];
             for i in 0..3200u64 {
                 body[..8].copy_from_slice(&i.to_le_bytes());
@@ -445,10 +536,14 @@ fn main() {
             | "decode-view"
             | "compressed-decode-view"
             | "append-steady"
+            | "append-raw-steady"
             | "append-cached-steady"
             | "append-final-page-steady"
             | "append-extent-leaf-steady"
             | "append-cache-churn"
+            | "append-small-raw"
+            | "append-map-steady"
+            | "append-map-raw"
             | "authenticate-steady"
             | "rewrite-layout-steady"
     ) {

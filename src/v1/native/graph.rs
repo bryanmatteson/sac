@@ -1,9 +1,9 @@
 //! Resource closure scratch state. Physical admission and content remapping
 //! have different keys; both tables and the frontier share one disk quota.
-use super::spill::{DiskStack, decode_ref, encode_ref};
-use super::temporary::{Budget as TemporaryBudget, GraphTable};
+use super::spill::{DiskStack, encode_ref};
+use super::temporary::{Budget as TemporaryBudget, ValueGraphTable};
 use crate::v1::resources::Budget;
-use crate::v1::{ObjectHash, ObjectRef, Result};
+use crate::v1::{ChunkAddress, ObjectHash, ObjectRef, Result};
 
 // Two fixed prefixes (256 records each), their B-tree/key/value allocation
 // overhead, the 256-frame stack window, and rehash/I/O scratch. Disk growth
@@ -12,10 +12,11 @@ const RESIDENT_BYTES: usize = 384 * 1024;
 const PREFIX_ENTRIES: usize = 256;
 
 pub(crate) struct Workspace {
-    // A 32-byte hash is active/inactive (1/0); a 44-byte physical reference
-    // is completed (2). Key length separates the two namespaces exactly.
-    states: GraphTable,
-    copied: GraphTable,
+    // One logical record holds the relocated address and active flag together.
+    // Reentering another occurrence preserves an already copied address.
+    states: ValueGraphTable<13>,
+    // Exact physical completion remains separate from content deduplication.
+    completed: ValueGraphTable<0>,
     pending: DiskStack,
     #[cfg(test)]
     disk: TemporaryBudget,
@@ -25,8 +26,8 @@ impl Workspace {
         budget.reserve_memory(RESIDENT_BYTES)?;
         let disk = TemporaryBudget::new(budget.limits.max_temp_bytes);
         Ok(Self {
-            states: GraphTable::with_budget(PREFIX_ENTRIES, disk.clone()),
-            copied: GraphTable::with_budget(PREFIX_ENTRIES, disk.clone()),
+            states: ValueGraphTable::with_budget(PREFIX_ENTRIES, disk.clone()),
+            completed: ValueGraphTable::with_budget(PREFIX_ENTRIES, disk.clone()),
             pending: DiskStack::with_budget(256, disk.clone())?,
             #[cfg(test)]
             disk,
@@ -40,42 +41,61 @@ impl Workspace {
         self.pending.pop()
     }
     pub(crate) fn completed(&self, r: ObjectRef) -> Result<bool> {
-        Ok(self.states.get(&encode_ref(r))?.is_some())
+        Ok(self.completed.get(&encode_ref(r))?.is_some())
     }
     pub(crate) fn enter(&mut self, r: ObjectRef, budget: &Budget) -> Result<()> {
-        if self.states.get(&r.hash.0)?.as_deref() == Some(&[1]) {
+        let mut state = self.state(r.hash)?;
+        if state[12] != 0 {
             return Err(super::corrupt("object graph cycle"));
         }
+        state[12] = 1;
         let result = self
             .states
-            .insert_cancellable(&r.hash.0, &[1], &|| budget.time().is_err());
+            .insert_cancellable(&r.hash.0, &state, &|| budget.time().is_err());
         budget.time()?;
         result
     }
     pub(crate) fn complete(&mut self, r: ObjectRef, budget: &Budget) -> Result<()> {
+        let mut state = self.state(r.hash)?;
+        state[12] = 0;
         let cancelled = || budget.time().is_err();
         let result = self
             .states
-            .insert_cancellable(&r.hash.0, &[0], &cancelled)
+            .insert_cancellable(&r.hash.0, &state, &cancelled)
             .and_then(|()| {
-                self.states
-                    .insert_cancellable(&encode_ref(r), &[2], &cancelled)
+                self.completed
+                    .insert_cancellable(&encode_ref(r), &[], &cancelled)
             });
         budget.time()?;
         result
     }
     pub(crate) fn mapped(&self, hash: ObjectHash) -> Result<Option<ObjectRef>> {
-        self.copied
-            .get(&hash.0)?
-            .map(|bytes| decode_ref(&bytes))
-            .transpose()
+        let state = self.state(hash)?;
+        let length = u32::from_le_bytes(state[8..12].try_into().unwrap());
+        Ok((length != 0).then(|| ObjectRef {
+            hash,
+            address: ChunkAddress {
+                offset: u64::from_le_bytes(state[..8].try_into().unwrap()),
+                length,
+            },
+        }))
     }
     pub(crate) fn map(&mut self, r: ObjectRef, budget: &Budget) -> Result<()> {
+        let mut state = self.state(r.hash)?;
+        state[..8].copy_from_slice(&r.address.offset.to_le_bytes());
+        state[8..12].copy_from_slice(&r.address.length.to_le_bytes());
         let result = self
-            .copied
-            .insert_cancellable(&r.hash.0, &encode_ref(r), &|| budget.time().is_err());
+            .states
+            .insert_cancellable(&r.hash.0, &state, &|| budget.time().is_err());
         budget.time()?;
         result
+    }
+    fn state(&self, hash: ObjectHash) -> Result<[u8; 13]> {
+        let mut state = [0; 13];
+        if let Some(value) = self.states.get(&hash.0)? {
+            state.copy_from_slice(&value);
+        }
+        Ok(state)
     }
 }
 
@@ -93,6 +113,35 @@ mod tests {
                 length: 128,
             },
         }
+    }
+    #[test]
+    fn logical_mapping_survives_distinct_occurrences_and_cycle_checks() {
+        let mut budget = Budget::new(Limits::default());
+        let mut graph = Workspace::new(&mut budget).unwrap();
+        let original = reference(1);
+        let relocated = ObjectRef {
+            address: reference(2).address,
+            ..original
+        };
+        graph.enter(original, &budget).unwrap();
+        assert!(graph.mapped(original.hash).unwrap().is_none());
+        graph.complete(original, &budget).unwrap();
+        graph.map(relocated, &budget).unwrap();
+        let other = ObjectRef {
+            address: reference(3).address,
+            ..original
+        };
+        assert!(!graph.completed(other).unwrap());
+        graph.enter(other, &budget).unwrap();
+        assert_eq!(graph.mapped(original.hash).unwrap(), Some(relocated));
+        assert!(matches!(
+            graph.enter(other, &budget),
+            Err(Error::Corrupt(_))
+        ));
+        graph.complete(other, &budget).unwrap();
+        assert!(graph.completed(original).unwrap());
+        assert!(graph.completed(other).unwrap());
+        assert_eq!(graph.mapped(original.hash).unwrap(), Some(relocated));
     }
     #[test]
     fn shared_spill_quota_and_exact_physical_states() {

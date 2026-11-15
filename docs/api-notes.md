@@ -15,7 +15,7 @@ local publication; `NativeReader` pins an immutable admitted view.
 
 ## Write buffering
 
-Appended frames share a bounded 64 KiB write buffer, packing full writes across
+Appended frames share a bounded 1 MiB write buffer, packing full writes across
 frame boundaries. Large frame prefixes write directly; only their short tails
 occupy the buffer. A cache miss drains it only when the requested frame includes
 buffered bytes. Reads of older frames keep pending writes coalesced and bound
@@ -36,6 +36,29 @@ for each object. Publication checks the complete path before its commit write
 and after durability. A replaced or removed file, or a replaced ancestor
 directory, fails publication; previously published pins remain readable.
 `NativeStore::verify_current_path` provides an explicit check at any time.
+
+## Live append latency
+
+`NativeStore::set_compression_level(0)` writes future unique objects as raw
+frames, avoiding Zstandard work for latency-sensitive small records and map
+updates. Negative levels select Zstandard's fast modes; the default remains
+level 1. Raw frames can use more disk space. This is a per-handle setting,
+including prepared writes and future appends after replacement compaction;
+reopening a store uses the default again. Deduplication can reuse an existing
+occurrence regardless of its codec. Canonical identities, child authentication
+and the two durable publication barriers are independent of this setting.
+
+Exact append-index hits reuse the writer's authentication even if the optional
+decoded/type cache is disabled or has evicted the occurrence. A put also keeps
+a bounded table of child indices to avoid authenticating repeated exact edges
+again within that call. Table collisions can repeat work, but every hit compares
+the complete hash, offset and frame span. Losing disposable state falls back to
+ordinary authentication. Small-record benchmarks measure staged appends;
+durable publication remains a separate operation with filesystem barriers.
+Directory leaves containing only inline data and symlinks copy unchanged rows
+as two contiguous byte ranges around an edit. Introducing an extent or child
+directory still builds the correct new child table; page-size overflow uses
+the ordinary split path. This preserves the canonical pages of decoded edits.
 
 ## Parallel encoding
 
@@ -76,7 +99,25 @@ view pins its page outside the store cache's residency budget.
 `v1::wire::FrameEncoder` and `FrameDecoder` provide reusable workspaces and
 native codec contexts. Borrowed CBOR navigation uses each validated value's
 exact boundary for its last child, so a nested final field is not scanned again
-to find its end. Validation still checks the complete value before navigation.
+to find its end. Directory leaf admission consumes the outer arrays and fields
+in one forward pass, retaining deterministic CBOR, shared depth/item limits,
+metadata, ordering and child-index checks. Other schemas validate the complete
+value before navigation.
+Schema-known unsigned integers and byte strings consume their checked header
+once. Empty metadata maps take a direct path after deterministic CBOR admission;
+nonempty maps retain all namespace, type and value checks. Persistent directory
+branch edits borrow existing fence names and directly encode the changed child
+path. Their bounded 2,048-slot child lookup retains the same first-use identity
+order and physical hint selection, including repeated IDs. Oversized results
+use the existing balanced split policy. Page limits and the wire format are
+unchanged.
+Persistent directory writes also bound leaves to 192 rows, preventing thousands
+of small records from sharing one mutable page. This writer grouping policy
+preserves the 128 KiB core admission cap and individual row limits. Dense bulk
+and older leaves remain legal; an edited wide leaf splits lazily. Bulk packing
+retains its dense normalization policy. Grouping changes can change the root
+ID of a newly written tree; existing roots and authenticated pins retain their
+identities. The policy applies to both single-file and batch edits.
 Raw frame views borrow input without moving the payload;
 compressed views borrow the decoder's reusable output. Native writers compute
 canonical identity from the caller's bytes before allocating a new object.
@@ -85,7 +126,17 @@ its existing reusable buffer, hashes that contiguous input, then compresses the
 canonical portion without assembling it again. A matching canonical ID permits
 reuse across relocated child hints; physical locators are always encoded from
 the current references. An unused preparation cannot supply bytes for a different
-ID. Raw writes and control objects retain bounded stack hashing.
+ID. Raw directory writes also assemble this reusable canonical buffer.
+Directory leaves, including raw writes, reuse standard BLAKE3 chaining
+values for 4 KiB subtrees only when their complete canonical input bytes match
+at the same offset. The comparison includes the identity domain, header and
+ordered child IDs. Growth, shrinkage and changed bytes recompute the affected
+subtrees; the result remains the ordinary canonical BLAKE3 hash. This cache
+adds at most 131,084 bytes of comparison storage and 33 chaining values (1,056
+bytes) per encoder, allocated on the first eligible page and included in
+`buffer_capacity()`. Pages up to 4 KiB use ordinary hashing. This optimization
+does not supply schema or child authentication, which still run on each write.
+Other raw writes and control objects retain bounded stack hashing.
 Compressed reads place decoded bytes after the identity domain in the existing
 output buffer and hash the complete contiguous input. Borrowed views exclude
 that domain; owned reads remove it with the canonical header and child IDs.

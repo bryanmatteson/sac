@@ -548,6 +548,20 @@ impl CacheLock {
 }
 
 #[derive(Default)]
+struct BorrowedRead {
+    frame: Vec<u8>,
+    decoder: wire::FrameDecoder,
+    children: Vec<ObjectRef>,
+}
+impl BorrowedRead {
+    fn retained_bytes(&self) -> usize {
+        self.frame.capacity()
+            + self.decoder.retained_bytes()
+            + self.children.capacity() * std::mem::size_of::<ObjectRef>()
+    }
+}
+
+#[derive(Default)]
 struct DecodedCache {
     budget: usize,
     bytes: usize,
@@ -561,6 +575,9 @@ struct DecodedCache {
     window_oldest: BTreeSet<(u64, (u64, u64))>,
     window_bytes: usize,
     decoder:Option<wire::FrameDecoder>,
+    // Two visits permit a parent role check to visit one child without holding
+    // the cache lock. Idle buffers share the ordinary decoded-cache budget.
+    borrowed: [Option<BorrowedRead>; 2],
     // The next entry serial. A clear does not start it again.
     serial: u64,
     // The reader shards of a shared cache, and a spare record of hits.
@@ -588,6 +605,7 @@ impl DecodedCache {
             }
         }
         self.decoder=None;
+        self.borrowed = Default::default();
         self.objects.clear();
         self.verified.clear();
         self.windows.clear();
@@ -772,6 +790,10 @@ impl DecodedCache {
             return true;
         }
         let Some((key, (mut object, size), fronted)) = self.objects.remove_oldest() else {
+            if let Some(read) = self.borrowed.iter_mut().find_map(Option::take) {
+                self.bytes -= read.retained_bytes();
+                return true;
+            }
             // The idle decoder is the last victim. A new codec context for
             // each read costs more than the entries that its bytes displace.
             return match self.decoder.take() {
@@ -925,6 +947,34 @@ impl DecodedCache {
     fn take_decoder(&mut self)->wire::FrameDecoder{
         match self.decoder.take(){Some(decoder)=>{self.bytes-=decoder.retained_bytes();decoder},None=>wire::FrameDecoder::default()}
     }
+    fn take_borrowed(&mut self) -> BorrowedRead {
+        match self.borrowed.iter_mut().find_map(Option::take) {
+            Some(read) => {
+                self.bytes -= read.retained_bytes();
+                read
+            }
+            None => BorrowedRead::default(),
+        }
+    }
+    fn return_borrowed(&mut self, read: BorrowedRead) {
+        let charge = read.retained_bytes();
+        let available = self.budget.saturating_sub(self.pinned_metadata);
+        let idle: usize = self.borrowed.iter().flatten().map(BorrowedRead::retained_bytes).sum();
+        if charge == 0 || idle.saturating_add(charge) > available / 4 {
+            return;
+        }
+        while self.bytes.saturating_add(charge) > available {
+            if !self.evict_oldest() {
+                break;
+            }
+        }
+        if self.bytes.saturating_add(charge) <= available
+            && let Some(slot) = self.borrowed.iter_mut().find(|slot| slot.is_none())
+        {
+            self.bytes += charge;
+            *slot = Some(read);
+        }
+    }
     fn return_decoder(&mut self,decoder:wire::FrameDecoder){
         let charge = decoder.retained_bytes();
         let available = self.budget.saturating_sub(self.pinned_metadata);
@@ -1007,7 +1057,20 @@ impl DecodedCache {
         reference: ObjectRef,
         append: AppendObject<'_>,
     ) -> bool {
-        let available = self.budget.saturating_sub(self.pinned_metadata);
+        self.admit_parts(identity, reference, append, 0)
+    }
+    fn admit_parts(
+        &mut self,
+        identity: u64,
+        reference: ObjectRef,
+        append: AppendObject<'_>,
+        returning_workspace: usize,
+    ) -> bool {
+        // Leave room for the caller's borrowed workspace to return. Otherwise
+        // each visit fills its temporary cache hole with a new allocation, and
+        // returning the workspace evicts a victim too late to recycle it.
+        let available = self.budget.saturating_sub(self.pinned_metadata)
+            .saturating_sub(returning_workspace);
         let (bytes, children) = (append.bytes.len(), append.children.len());
         // Leave room for a type-only admission if the payload is later evicted.
         // The decoded occurrence already authenticates its own type and edges.

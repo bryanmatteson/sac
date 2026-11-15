@@ -201,16 +201,16 @@ impl<const BYTES: usize> Cell<BYTES> {
 
 pub(super) type GraphTable = ValueGraphTable<44>;
 pub(super) type ReferenceTable = ValueGraphTable<12>;
-pub(super) struct ValueGraphTable<const VALUE_BYTES: usize> {
-    resident: HashMap<Cell, Cell<VALUE_BYTES>, TableHash>,
+pub(super) struct ValueGraphTable<const VALUE_BYTES: usize, const KEY_BYTES: usize = 44> {
+    resident: HashMap<Cell<KEY_BYTES>, Cell<VALUE_BYTES>, TableHash>,
     resident_limit: usize,
-    disk: Option<DiskTable<VALUE_BYTES>>,
+    disk: Option<DiskTable<VALUE_BYTES, KEY_BYTES>>,
     // False only in a test of the positional I/O that a host without block
     // reservation uses.
     mapped: bool,
     pub(super) budget: Budget,
 }
-struct DiskTable<const VALUE_BYTES: usize> {
+struct DiskTable<const VALUE_BYTES: usize, const KEY_BYTES: usize = 44> {
     // The slots of `file`, mapped. None on a host or filesystem that cannot
     // reserve blocks: the table then reads and writes each slot in the file.
     mapping: Option<Mapping>,
@@ -222,8 +222,9 @@ struct DiskTable<const VALUE_BYTES: usize> {
     hasher: TableHash,
     _reservation: Reservation,
 }
-impl<const VALUE_BYTES: usize> DiskTable<VALUE_BYTES> {
-    const ROW_BYTES: usize = 48 + VALUE_BYTES;
+impl<const VALUE_BYTES: usize, const KEY_BYTES: usize> DiskTable<VALUE_BYTES, KEY_BYTES> {
+    const VALUE_AT: usize = 4 + KEY_BYTES;
+    const ROW_BYTES: usize = Self::VALUE_AT + VALUE_BYTES;
     fn with_mapping(slots: u64, budget: &Budget, mapped: bool) -> Result<Self> {
         let size = slots
             .checked_mul(Self::ROW_BYTES as u64)
@@ -324,7 +325,7 @@ impl<const VALUE_BYTES: usize> DiskTable<VALUE_BYTES> {
         row[1] = key.len() as u8;
         row[2] = value.len() as u8;
         row[4..4 + key.len()].copy_from_slice(key);
-        row[48..48 + value.len()].copy_from_slice(value);
+        row[Self::VALUE_AT..Self::VALUE_AT + value.len()].copy_from_slice(value);
         self.set_row(index, &row)?;
         self._reservation.budget.wrote(Self::ROW_BYTES as u64);
         if old[0] == 0 {
@@ -333,7 +334,7 @@ impl<const VALUE_BYTES: usize> DiskTable<VALUE_BYTES> {
         Ok(())
     }
 }
-impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
+impl<const VALUE_BYTES: usize, const KEY_BYTES: usize> ValueGraphTable<VALUE_BYTES, KEY_BYTES> {
     pub const RESIDENT_ENTRIES: usize = 2048;
     pub fn new() -> Result<Self> {
         Ok(Self::with_budget(
@@ -342,7 +343,7 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
         ))
     }
     pub fn with_budget(resident_limit: usize, budget: Budget) -> Self {
-        const { assert!(VALUE_BYTES <= 44) };
+        const { assert!(VALUE_BYTES <= 44 && KEY_BYTES <= 44) };
         Self {
             resident: HashMap::default(),
             resident_limit,
@@ -352,7 +353,7 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
         }
     }
     pub fn get(&self, key: &[u8]) -> Result<Option<Cell<VALUE_BYTES>>> {
-        if key.len() > 44 {
+        if key.len() > KEY_BYTES {
             return Err(Error::Limit("temporary key"));
         }
         if let Some(value) = self.resident.get(key) {
@@ -369,7 +370,10 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
             if length > VALUE_BYTES {
                 return Err(corrupt("temporary value length"));
             }
-            Ok(Some(Cell::new(&row[48..48 + length])))
+            Ok(Some(Cell::new(
+                &row[DiskTable::<VALUE_BYTES, KEY_BYTES>::VALUE_AT
+                    ..DiskTable::<VALUE_BYTES, KEY_BYTES>::VALUE_AT + length],
+            )))
         }
     }
     pub fn insert_cancellable(
@@ -381,11 +385,11 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
         if cancelled() {
             return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
         }
-        if key.len() > 44 || value.len() > VALUE_BYTES {
+        if key.len() > KEY_BYTES || value.len() > VALUE_BYTES {
             return Err(Error::Limit("temporary record"));
         }
         if self.disk.is_none() {
-            let cell = Cell::<44>::new(key);
+            let cell = Cell::<KEY_BYTES>::new(key);
             if self.resident.len() < self.resident_limit || self.resident.contains_key(&cell) {
                 self.resident.insert(cell, Cell::new(value));
                 return Ok(());
@@ -406,9 +410,14 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
                     return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
                 }
                 let row = old.row(index)?;
-                self.budget.read(DiskTable::<VALUE_BYTES>::ROW_BYTES as u64);
+                self.budget
+                    .read(DiskTable::<VALUE_BYTES, KEY_BYTES>::ROW_BYTES as u64);
                 if row[0] != 0 {
-                    next.insert(&row[4..4 + row[1] as usize], &row[48..48 + row[2] as usize])?;
+                    next.insert(
+                        &row[4..4 + row[1] as usize],
+                        &row[DiskTable::<VALUE_BYTES, KEY_BYTES>::VALUE_AT
+                            ..DiskTable::<VALUE_BYTES, KEY_BYTES>::VALUE_AT + row[2] as usize],
+                    )?;
                 }
             }
             self.disk = Some(next);
@@ -458,10 +467,9 @@ impl<const VALUE_BYTES: usize> ValueGraphTable<VALUE_BYTES> {
         Ok(())
     }
     pub fn disk_bytes(&self) -> Result<u64> {
-        Ok(self
-            .disk
-            .as_ref()
-            .map_or(0, |d| d.slots * DiskTable::<VALUE_BYTES>::ROW_BYTES as u64))
+        Ok(self.disk.as_ref().map_or(0, |d| {
+            d.slots * DiskTable::<VALUE_BYTES, KEY_BYTES>::ROW_BYTES as u64
+        }))
     }
 }
 pub(super) struct FixedRecordStack<const N: usize> {
@@ -552,6 +560,80 @@ impl<const N: usize> FixedRecordStack<N> {
     }
     pub fn disk_bytes(&self) -> u64 {
         self.capacity * N as u64
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn validation_tables_preserve_empty_and_eight_byte_values_across_spill_and_growth() {
+    fn check<const WIDTH: usize>(mapped: bool) {
+        let budget = Budget::new(2 << 20);
+        let mut table = ValueGraphTable::<WIDTH>::with_budget(8, budget.clone());
+        table.mapped = mapped;
+        for index in 0..3073u64 {
+            let mut key = [0; 44];
+            key[..8].copy_from_slice(&index.to_le_bytes());
+            let key = &key[..if index % 2 == 0 { 8 } else { 44 }];
+            table
+                .insert_cancellable(key, &[index as u8; WIDTH], &|| false)
+                .unwrap();
+        }
+        assert_eq!(table.disk_bytes().unwrap(), 8192 * (48 + WIDTH) as u64);
+        for index in 0..3073u64 {
+            let mut key = [0; 44];
+            key[..8].copy_from_slice(&index.to_le_bytes());
+            let key = &key[..if index % 2 == 0 { 8 } else { 44 }];
+            let value = table
+                .get(key)
+                .unwrap()
+                .expect("present, including empty values");
+            assert_eq!(&*value, &[index as u8; WIDTH]);
+        }
+        assert!(table.get(&[0; 44]).unwrap().is_none());
+        table
+            .insert_cancellable(&[0; 44], &[7; WIDTH], &|| false)
+            .unwrap();
+        assert_eq!(&*table.get(&[0; 44]).unwrap().unwrap(), &[7; WIDTH]);
+        assert_eq!(&*table.get(&[0; 8]).unwrap().unwrap(), &[0; WIDTH]);
+        drop(table);
+        assert_eq!(budget.used(), 0);
+    }
+    for mapped in [false, true] {
+        check::<0>(mapped);
+        check::<8>(mapped);
+        check::<13>(mapped);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn offset_inventory_preserves_narrow_and_empty_keys_across_spill_and_growth() {
+    for mapped in [false, true] {
+        let budget = Budget::new(1 << 20);
+        let mut table = ValueGraphTable::<8, 8>::with_budget(8, budget.clone());
+        table.mapped = mapped;
+        for index in 0..3073u64 {
+            table
+                .insert_cancellable(&index.to_le_bytes(), &index.to_be_bytes(), &|| false)
+                .unwrap();
+        }
+        assert_eq!(table.disk_bytes().unwrap(), 8192 * 20);
+        for index in 0..3073u64 {
+            assert_eq!(
+                &*table.get(&index.to_le_bytes()).unwrap().unwrap(),
+                &index.to_be_bytes()
+            );
+        }
+        table.insert_cancellable(&[], &[], &|| false).unwrap();
+        assert!(table.get(&[]).unwrap().unwrap().is_empty());
+        assert_eq!(&*table.get(&[0; 8]).unwrap().unwrap(), &[0; 8]);
+        assert!(matches!(
+            table.get(&[0; 9]),
+            Err(Error::Limit("temporary key"))
+        ));
+        assert!(table.insert_cancellable(&[0; 9], &[], &|| false).is_err());
+        drop(table);
+        assert_eq!(budget.used(), 0);
     }
 }
 

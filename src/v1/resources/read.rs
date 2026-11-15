@@ -1,4 +1,4 @@
-use super::tree::{self, DirectoryNode, Entry, EntryData, FileData};
+use super::tree::{self, Entry, EntryData, FileData};
 use super::*;
 use std::io::Write;
 
@@ -329,45 +329,116 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     where
         F: FnMut(Entry, &mut Budget) -> Result<()>,
     {
+        self.walk_directory_view(
+            root,
+            expected_height,
+            lower,
+            upper,
+            budget,
+            depth,
+            &mut |entry, budget| visitor(entry.owned()?, budget),
+        )
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "tree traversal carries explicit inherited geometry and one operation budget"
+    )]
+    fn walk_directory_view<F>(
+        &self,
+        root: ObjectRef,
+        expected_height: Option<u64>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        budget: &mut Budget,
+        depth: usize,
+        visitor: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(super::pages::EntryView<'_>, &mut Budget) -> Result<()>,
+    {
         budget.depth(depth)?;
         budget.edge()?;
-        let node = tree::directory(budget.get(self.store, root)?.as_ref())?;
-        match node {
-            DirectoryNode::Leaf(entries) => {
-                if expected_height.is_some_and(|h| h != 0) {
-                    return Err(corrupt("directory height mismatch"));
-                }
-                tree::check_interval(&entries, lower, upper)?;
-                for entry in entries {
-                    visitor(entry, budget)?;
-                }
+        budget.visit_for_copy(self.store, root, None, &mut |object, budget, _| {
+            if object.version != 1 {
+                return Err(Error::Unsupported("directory schema".into()));
             }
-            DirectoryNode::Branch { height, fences } => {
-                if expected_height.is_some_and(|h| h != height) {
-                    return Err(corrupt("directory branch height mismatch"));
+            if object.canonical_len()
+                > if object.kind == 3 {
+                    DIRECTORY_LEAF_LIMIT
+                } else {
+                    PAGE_LIMIT
                 }
-                if upper.is_some_and(|u| fences.last().unwrap().0.as_slice() != u)
-                    || lower.is_some_and(|l| fences[0].0.as_slice() <= l)
-                {
-                    return Err(corrupt("directory branch interval mismatch"));
-                }
-                let mut previous = lower;
-                for (key, reference) in &fences {
-                    budget.check_reference(root, *reference)?;
-                    self.walk_directory(
-                        *reference,
-                        Some(height - 1),
-                        previous,
-                        Some(key),
-                        budget,
-                        depth + 1,
-                        visitor,
-                    )?;
-                    previous = Some(key);
-                }
+            {
+                return Err(Error::Limit("directory page bytes"));
             }
-        }
-        Ok(())
+            let body = crate::v1::cbor_view::admitted(object.bytes)?;
+            match object.kind {
+                3 => {
+                    if expected_height.is_some_and(|height| height != 0) {
+                        return Err(corrupt("directory height mismatch"));
+                    }
+                    if lower.is_some() || upper.is_some() {
+                        let mut rows = body.array()?;
+                        let first = rows.next().ok_or_else(|| corrupt("empty branch child"))??;
+                        let last = rows.last().transpose()?.unwrap_or(first);
+                        let first_key = first.first_field(4)?.bytes()?;
+                        let last_key = last.first_field(4)?.bytes()?;
+                        if lower.is_some_and(|bound| first_key <= bound)
+                            || upper.is_some_and(|bound| last_key != bound)
+                        {
+                            return Err(corrupt("directory leaf interval mismatch"));
+                        }
+                    }
+                    for row in body.array()? {
+                        visitor(super::pages::EntryView { object, row: row? }, budget)?;
+                    }
+                }
+                4 => {
+                    let [height, rows] = body.fields()?;
+                    let height = height.uint()?;
+                    if expected_height.is_some_and(|expected| expected != height) {
+                        return Err(corrupt("directory branch height mismatch"));
+                    }
+                    let mut bounds = rows.array()?;
+                    let first = bounds
+                        .next()
+                        .ok_or_else(|| corrupt("empty branch child"))??;
+                    let last = bounds.last().transpose()?.unwrap_or(first);
+                    let first_key = first.first_field(2)?.bytes()?;
+                    let last_key = last.first_field(2)?.bytes()?;
+                    if upper.is_some_and(|bound| last_key != bound)
+                        || lower.is_some_and(|bound| first_key <= bound)
+                    {
+                        return Err(corrupt("directory branch interval mismatch"));
+                    }
+                    let mut previous = lower;
+                    for row in rows.array()? {
+                        let [key, child] = row?.fields()?;
+                        let key = key.bytes()?;
+                        let child = *object
+                            .children
+                            .get(
+                                usize::try_from(child.uint()?)
+                                    .map_err(|_| corrupt("child index"))?,
+                            )
+                            .ok_or_else(|| corrupt("child index"))?;
+                        budget.check_reference(root, child)?;
+                        self.walk_directory_view(
+                            child,
+                            Some(height - 1),
+                            previous,
+                            Some(key),
+                            budget,
+                            depth + 1,
+                            visitor,
+                        )?;
+                        previous = Some(key);
+                    }
+                }
+                _ => return Err(corrupt("expected directory node")),
+            }
+            Ok(())
+        })
     }
     pub fn read_range(&self, path: &[Vec<u8>], offset: u64, length: usize) -> Result<Vec<u8>> {
         if length > self.limits.max_memory_bytes / 2 {
@@ -619,24 +690,13 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
             root_admitted: true,
             ..Default::default()
         };
-        self.visit_raw_with_budget(budget, true, &mut |_, entry, budget| {
-            report.entries += 1;
-            if let EntryData::File { length, data } = &entry.data {
-                report.files += 1;
-                report.logical_bytes = report
-                    .logical_bytes
-                    .checked_add(*length)
-                    .ok_or(Error::Limit("logical bytes"))?;
-                if !defer_byte_leaves_to_copy {
-                    self.read_entry(&entry, 0, *length, &mut std::io::sink(), budget)?;
-                } else if let FileData::Extents(root) = data {
-                    self.extents::<std::io::Sink>(
-                        *root, *length, None, 0, *length, None, budget, 0,
-                    )?;
-                }
-            }
-            Ok(())
-        })?;
+        self.verify_directory(
+            self.directory,
+            0,
+            budget,
+            defer_byte_leaves_to_copy,
+            &mut report,
+        )?;
         let snapshot = budget.get(self.store, self.snapshot)?;
         let snapshot_body = cbor::decode(&snapshot.bytes)?;
         for declaration in values(&values(&snapshot_body)?[1])? {
@@ -657,6 +717,67 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
             }
         }
         Ok(report)
+    }
+    fn verify_directory(
+        &self,
+        root: ObjectRef,
+        depth: usize,
+        budget: &mut Budget,
+        defer_byte_leaves_to_copy: bool,
+        report: &mut VerificationReport,
+    ) -> Result<()> {
+        budget.depth(depth)?;
+        budget.memory((depth + 1).saturating_mul(DIRECTORY_LEAF_LIMIT * 4))?;
+        self.walk_directory_view(root, None, None, None, budget, 0, &mut |entry, budget| {
+            let [_, kind, _, value] = entry.fields()?;
+            let kind = kind.uint()?;
+            let logical = if kind == 0 {
+                value.fields::<3>()?[0].uint()?
+            } else {
+                0
+            };
+            budget.entry(logical)?;
+            report.entries += 1;
+            match kind {
+                0 => {
+                    report.files += 1;
+                    report.logical_bytes = report
+                        .logical_bytes
+                        .checked_add(logical)
+                        .ok_or(Error::Limit("logical bytes"))?;
+                    let [_, storage, data] = value.fields::<3>()?;
+                    if storage.uint()? == 1 {
+                        let extent = entry.child(data)?;
+                        let mut sink = std::io::sink();
+                        self.extents(
+                            extent,
+                            logical,
+                            None,
+                            0,
+                            logical,
+                            if defer_byte_leaves_to_copy {
+                                None
+                            } else {
+                                Some(&mut sink)
+                            },
+                            budget,
+                            0,
+                        )?;
+                    }
+                    // Inline byte lengths and contents were authenticated by
+                    // the intrinsic directory admission; no owned copy is needed.
+                }
+                1 => self.verify_directory(
+                    entry.child(value)?,
+                    depth + 1,
+                    budget,
+                    defer_byte_leaves_to_copy,
+                    report,
+                )?,
+                _ => {}
+            }
+            Ok(())
+        })
     }
     /// Verify the portable snapshot and export its commit in one graph walk.
     /// The caller is responsible for physical file validation and for staging

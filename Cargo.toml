@@ -33,7 +33,7 @@ privacy-age = ["native", "dep:age"]
 
 [dependencies]
 age                   = { version = "0.12.1", default-features = false, optional = true }
-blake3                = "1"
+blake3                = "1.8.5"
 ed25519-dalek         = { version = "2", optional = true }
 hex                   = "0.4"
 serde                 = { version = "1", features = ["derive"], optional = true }

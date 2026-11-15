@@ -99,6 +99,9 @@ exactly one ordinary Zstandard frame, with declared decoded size and at most
 an 8 MiB history window. It has no external dictionary, concatenated stream or
 skippable frame. The decoder consumes its entire stored span. Writers use raw
 encoding when compression would grow the object. Kinds 1 and 2 are always raw.
+Native writers expose `set_compression_level`: zero selects raw future appends,
+negative levels select Zstandard fast modes, and the default is level 1. This
+per-handle setting changes physical encoding, not canonical IDs or durability.
 Full readers support both codecs; bounded pure-Rust decoding remains available
 without the native/compression writer features.
 
@@ -154,6 +157,9 @@ Reader allocation budgets are operational limits: reaching one means incomplete
 verification, not malformed input. The Rust owned-value decoder uses a
 16 MiB requested-allocation budget; its in-memory layout is not a wire rule.
 Borrowed readers can validate the same items without constructing value trees.
+Coalesced physical reads do not confer authentication on adjacent frames.
+Reader read-ahead remains subject to the operation's source-byte budget; frame,
+canonical identity and child-role validation still apply independently.
 
 `index` means an unsigned in-bounds child-table index. `version` is 1 through
 `2^32−1`. A namespaced `id` is ASCII, 1–128 bytes, matching
@@ -293,6 +299,33 @@ reused decoded output; taking ownership is an explicit copy/transfer operation.
 Encoder/output buffers and native codec contexts may be reused within the
 canonical/frame limits. Native idle decoder state shares the decoded-cache
 budget; live writers own their separate encoder workspace.
+Directory encoders may reuse standard BLAKE3 subtree chaining values after
+comparing the complete input bytes at the same canonical offset. This bounded
+workspace contains at most the 128 KiB directory canonical limit plus the
+identity domain and 33 four-chunk subtree values. The final canonical hash,
+intrinsic schema admission, child authentication and publication barriers are
+unchanged. Directory schema admission may consume fields in one pass while
+preserving deterministic CBOR and the whole-value depth and item limits.
+Native authenticated visits may reuse two idle frame/decoder/child workspaces
+within the decoded-cache budget so a parent can synchronously check a child.
+Borrowed verified writes preserve the complete ordered child identity sequence
+and authenticate destination occurrences under the destination's ordinary
+policy. Neither borrowing nor relocation authenticates an outgoing closure;
+canonical sealing retains its configured compression parameters.
+Direct role checks may reuse the intrinsic schema admission supplied by an
+authenticated visit or frame decode. The public untrusted-fetch checker still
+validates parent and child shapes; role kinds, branch heights, profile bindings
+and exact extent byte lengths apply in either path.
+Within one native physical validation, direct kind, branch-height and byte-length
+requirements may be checked when the child is visited. A disposable fact keyed
+by the complete expected identity, offset and span can satisfy later incoming
+roles in that same operation. It authenticates no other occurrence or outgoing
+closure. Profile root bindings still compare the actual authenticated fields.
+Logical role-visit, source-byte and decoded-byte charges remain in force even
+when role checks share authentication with the child's ordinary graph visit.
+Namespace validation may borrow admitted directory rows instead of building
+owned CBOR trees. Inherited fences and heights, shared-route expansion, resource
+counts, file geometry and operation limits still apply to every namespace route.
 
 Checked persistent-tree mutations may obtain `ObjectStore::rewrite_source(parent)`
 and pass its opaque `RewriteSource` to `rewrite`. Generic stores return no source
@@ -337,7 +370,12 @@ the preamble incarnation, not its source-level lineage field, is persisted.
 `resources::ArchiveBuilder::bulk` externally sorts initial archive entries and
 encodes directory pages once. `with_limits`/`from_directory` perform persistent
 changed-path edits. Builders accept files/readers, directories, symlinks and
-sparse extents; `finish` returns a kind-2 snapshot. `pack_snapshot_with_limits`
+sparse extents. Persistent writes use at most 192 rows per leaf as well as the
+selected byte target; this writer policy does not restrict core admission or
+individual row sizes. A touched dense inherited leaf splits lazily. Bulk
+normalization retains its dense packing policy. Different valid page groupings
+can produce different canonical root identities. `finish` returns a kind-2
+snapshot. `pack_snapshot_with_limits`
 copies its selected closure to a forward-only `Write`. `pack_commit_with_limits`
 also retains attestations and explicitly removes a live-local attachment;
 callers must authorize that removal. Both produce a final sealed trailer.

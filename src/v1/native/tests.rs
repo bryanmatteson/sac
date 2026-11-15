@@ -131,6 +131,168 @@ fn verified_copy_preserves_identity_and_checks_relocated_physical_children() {
     );
 }
 #[test]
+fn borrowed_visits_reuse_bounded_scratch_allow_nested_reads_and_reject_bad_occurrences() {
+    for level in [0, 1] {
+        let (_dir, mut source) = store();
+        source.set_compression_level(level);
+        let bytes = vec![b'x'; 128 << 10];
+        let child = source.put(7, 1, &bytes, &[]).unwrap();
+        let parent = source.put(65002, 1, b"parent", &[child]).unwrap();
+        let root = snapshot(&mut source, b"published bounds");
+        source.publish(root).unwrap();
+        let reader = source.pin().unwrap();
+        reader.clear_decoded_cache();
+        reader.set_decoded_cache_budget(8 << 20);
+        for _ in 0..8 {
+            reader
+                .visit_verified(parent, &mut |object| {
+                    assert_eq!(object.bytes, b"parent");
+                    assert_eq!(object.children, [child]);
+                    reader.visit_verified(child, &mut |object| {
+                        assert_eq!(object.bytes, bytes);
+                        assert!(object.children.is_empty());
+                        Ok(())
+                    })
+                })
+                .unwrap();
+            assert!(reader.cache_usage().decoded_bytes <= 8 << 20);
+        }
+        assert_eq!(
+            reader
+                .cache
+                .lock()
+                .unwrap()
+                .borrowed
+                .iter()
+                .flatten()
+                .count(),
+            2
+        );
+        assert!(matches!(
+            reader.visit_verified(child, &mut |_| Err(Error::Missing)),
+            Err(Error::Missing)
+        ));
+        // A cached payload and idle scratch confer no authority on another
+        // expected identity or a locator outside the pin's readable extent.
+        reader.get_shared(child).unwrap();
+        let mut changed = child;
+        changed.hash.0[0] ^= 1;
+        assert!(
+            reader
+                .visit_verified(changed, &mut |_| panic!("unauthenticated visit"))
+                .is_err()
+        );
+        changed = child;
+        changed.address.offset = reader.reader.trailer_offset();
+        assert!(
+            reader
+                .visit_verified(changed, &mut |_| panic!("out-of-bounds visit"))
+                .is_err()
+        );
+        reader.set_decoded_cache_budget(0);
+        assert_eq!(reader.cache_usage().decoded_bytes, 0);
+        assert!(
+            reader
+                .cache
+                .lock()
+                .unwrap()
+                .borrowed
+                .iter()
+                .all(Option::is_none)
+        );
+        reader
+            .visit_verified(child, &mut |object| {
+                assert_eq!(object.bytes, bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(reader.cache_usage().decoded_bytes, 0);
+    }
+}
+
+#[test]
+fn borrowed_verified_copy_checks_identity_sequence_and_destination_occurrences() {
+    let mut source = MemoryStore::sealed();
+    let child = source.put(7, 1, b"child", &[]).unwrap();
+    let parent = source.put(65002, 1, b"parent", &[child]).unwrap();
+    let verified = source.verified_object(parent).unwrap();
+    let (_dir, mut destination) = store();
+    let copied_child = destination.put(7, 1, b"child", &[]).unwrap();
+    let copied = destination
+        .put_verified_view(&verified.view(), &[copied_child])
+        .unwrap();
+    assert_eq!(copied.hash, parent.hash);
+    assert_eq!(destination.get(copied).unwrap().children, [copied_child]);
+    let other = destination.put(7, 1, b"other", &[]).unwrap();
+    assert!(
+        destination
+            .put_verified_view(&verified.view(), &[other])
+            .is_err()
+    );
+    assert!(
+        destination
+            .put_verified_view(&verified.view(), &[])
+            .is_err()
+    );
+    let invalid = ObjectRef {
+        address: ChunkAddress {
+            offset: u64::MAX - 100,
+            length: 80,
+        },
+        ..copied_child
+    };
+    assert!(
+        destination
+            .put_verified_view(&verified.view(), &[invalid])
+            .is_err()
+    );
+    let mut sealed = SealedWriter::new(Vec::new()).unwrap();
+    let sealed_child = sealed.put(7, 1, b"child", &[]).unwrap();
+    assert!(
+        sealed
+            .put_verified_view(&verified.view(), &[other])
+            .is_err()
+    );
+    assert!(
+        sealed
+            .put_verified_view(&verified.view(), &[invalid])
+            .is_err()
+    );
+    assert_eq!(
+        sealed
+            .put_verified_view(&verified.view(), &[sealed_child])
+            .unwrap()
+            .hash,
+        parent.hash
+    );
+}
+#[test]
+fn public_direct_roles_still_validate_untrusted_child_shapes() {
+    let child = ObjectRef::default();
+    let parent = CanonicalObject {
+        kind: 5,
+        version: 1,
+        bytes: cbor::encode(&cbor::Value::Array(vec![cbor::Value::Array(vec![
+            cbor::Value::Uint(3),
+            cbor::Value::Uint(0),
+        ])])),
+        children: vec![child],
+    };
+    let invalid = Arc::new(CanonicalObject {
+        kind: 7,
+        version: 1,
+        bytes: b"abc".to_vec(),
+        children: vec![child],
+    });
+    assert!(
+        matches!(validate_core_edges(&parent, |_| Ok(invalid.clone())),
+        Err(Error::Corrupt(message)) if message == "byte object children")
+    );
+    let mut invalid_parent = parent;
+    invalid_parent.bytes.push(0);
+    assert!(validate_core_edges(&invalid_parent, |_| panic!("invalid parent fetch")).is_err());
+}
+#[test]
 fn packed_appends_preserve_bytes_across_frame_boundaries_and_failed_flushes() {
     let file = Mutex::new(tempfile::tempfile().unwrap());
     let pending = Mutex::new(AppendBuffer::default());
@@ -779,6 +941,56 @@ fn temporary_quota_is_reserved_before_spill_or_destination_mutation() {
     assert_eq!(copy.disk_bytes().unwrap(), 0);
 }
 #[test]
+fn validation_window_coalesces_reads_and_charges_read_ahead_within_source_limit() {
+    let mut file = tempfile::tempfile().unwrap();
+    let bytes: Vec<_> = (0..3 * ValidationWindow::BYTES).map(|i| i as u8).collect();
+    file.write_all(&bytes).unwrap();
+    let io = PhysicalCounters::default();
+    let mut window = ValidationWindow::default();
+    let mut charged = 56;
+    let end = bytes.len() as u64;
+    let mut header = [0; 56];
+    window
+        .read(&file, &io, 0, end, &mut header, &mut charged, end)
+        .unwrap();
+    assert_eq!(header, bytes[..56]);
+    assert_eq!(charged, ValidationWindow::BYTES as u64);
+    let after = io.snapshot();
+    for offset in [56, 128, 4096, ValidationWindow::BYTES - 56] {
+        charged += 56;
+        window
+            .read(
+                &file,
+                &io,
+                offset as u64,
+                end,
+                &mut header,
+                &mut charged,
+                end,
+            )
+            .unwrap();
+        assert_eq!(header, bytes[offset..offset + 56]);
+    }
+    assert_eq!(io.snapshot().read_operations, after.read_operations);
+
+    // Near the quota the window reads only the charged request and remaining
+    // allowance, instead of issuing an uncharged full speculative read.
+    charged = end - 17;
+    let offset = end - 100;
+    let before = io.snapshot();
+    window
+        .read(&file, &io, offset, end, &mut header, &mut charged, end)
+        .unwrap();
+    assert_eq!(charged, end);
+    assert_eq!(
+        io.snapshot().metadata_bytes - before.metadata_bytes,
+        56 + 17
+    );
+    assert_eq!(header, bytes[offset as usize..offset as usize + 56]);
+    assert!(window.bytes.len() <= ValidationWindow::BYTES);
+}
+
+#[test]
 fn strict_physical_validation_enforces_operation_limits() {
     let (_dir, mut store) = store();
     let root = snapshot(&mut store, b"bounded");
@@ -807,7 +1019,7 @@ fn strict_physical_validation_enforces_operation_limits() {
 }
 
 #[test]
-fn physical_validation_reuses_byte_leaf_authentication_and_keeps_logical_charges() {
+fn physical_validation_authenticates_each_occurrence_once_and_keeps_logical_charges() {
     let dir = tempfile::tempdir().unwrap();
     for embedded in [false, true] {
         let payload = CanonicalObject {
@@ -885,7 +1097,7 @@ fn physical_validation_reuses_byte_leaf_authentication_and_keeps_logical_charges
         assert_eq!(
             physical_bytes,
             u64::from(commit.address.length)
-                + 2 * [snapshot, directory, extent]
+                + [snapshot, directory, extent]
                     .into_iter()
                     .map(|reference| u64::from(reference.address.length))
                     .sum::<u64>()
@@ -900,6 +1112,89 @@ fn physical_validation_reuses_byte_leaf_authentication_and_keeps_logical_charges
             Err(Error::Limit("validation decoded bytes"))
         ));
     }
+}
+
+#[test]
+fn physical_validation_checks_every_incoming_role_on_shared_occurrences() {
+    use cbor::Value::{Array, Bytes, Map, Uint};
+    for duplicate_index in [false, true] {
+        let mut writer = SealedWriter::new(Vec::new()).unwrap();
+        let bytes = writer.put(7, 1, b"abc", &[]).unwrap();
+        let rows = |lengths: &[u64]| {
+            cbor::encode(&Array(
+                lengths
+                    .iter()
+                    .map(|length| Array(vec![Uint(*length), Uint(0)]))
+                    .collect(),
+            ))
+        };
+        let first = writer.put(5, 1, &rows(&[3]), &[bytes]).unwrap();
+        let second = writer
+            .put(
+                5,
+                1,
+                &rows(if duplicate_index { &[3, 4] } else { &[4] }),
+                &[bytes],
+            )
+            .unwrap();
+        let directory = writer
+            .put(
+                3,
+                1,
+                &cbor::encode(&Array(vec![
+                    Array(vec![
+                        Bytes(b"a".to_vec()),
+                        Uint(0),
+                        Map(vec![]),
+                        Array(vec![Uint(3), Uint(1), Uint(0)]),
+                    ]),
+                    Array(vec![
+                        Bytes(b"b".to_vec()),
+                        Uint(0),
+                        Map(vec![]),
+                        Array(vec![
+                            Uint(if duplicate_index { 7 } else { 4 }),
+                            Uint(1),
+                            Uint(1),
+                        ]),
+                    ]),
+                ])),
+                &[first, second],
+            )
+            .unwrap();
+        let snapshot = resources::snapshot(&mut writer, directory, vec![], vec![]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roles.sac");
+        std::fs::write(&path, writer.finish(snapshot).unwrap()).unwrap();
+        assert!(matches!(NativeReader::open(path).unwrap().validate(),
+            Err(Error::Corrupt(message)) if message == "extent byte length"));
+    }
+}
+
+#[test]
+fn physical_validation_checks_deferred_branch_heights() {
+    use cbor::Value::{Array, Bytes, Uint};
+    let mut writer = SealedWriter::new(Vec::new()).unwrap();
+    let leaf = writer
+        .put(3, 1, &cbor::encode(&Array(vec![])), &[])
+        .unwrap();
+    let branch = |height| {
+        cbor::encode(&Array(vec![
+            Uint(height),
+            Array(vec![
+                Array(vec![Bytes(b"a".to_vec()), Uint(0)]),
+                Array(vec![Bytes(b"b".to_vec()), Uint(0)]),
+            ]),
+        ]))
+    };
+    let child = writer.put(4, 1, &branch(1), &[leaf]).unwrap();
+    let root = writer.put(4, 1, &branch(3), &[child]).unwrap();
+    let snapshot = resources::snapshot(&mut writer, root, vec![], vec![]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("height.sac");
+    std::fs::write(&path, writer.finish(snapshot).unwrap()).unwrap();
+    assert!(matches!(NativeReader::open(path).unwrap().validate(),
+        Err(Error::Corrupt(message)) if message == "core branch child height"));
 }
 
 #[test]

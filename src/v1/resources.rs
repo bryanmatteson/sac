@@ -192,62 +192,82 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
     // Retain references and traversal state, never ancestor payloads. Reload a
     // parent after its children; immutable stores can serve that from cache.
     graph.push(root, false, &budget)?;
+    let mut children = Vec::new();
     while let Some((r, expanded)) = graph.pop()? {
         budget.time()?;
-        let object = if expanded {
+        if expanded {
             if graph.mapped(r.hash)?.is_some() {
                 graph.complete(r, &budget)?;
                 continue;
             }
-            budget.get(source, r)?
         } else {
             if graph.completed(r)? {
                 continue;
             }
             graph.enter(r, &budget)?;
-            let object = budget.get_for_copy(source, r, verification.as_mut())?;
-            crate::v1::validate_core_edges(&object, |child| {
-                budget.get_for_copy(source, child, verification.as_mut())
-            })?;
-            for child in &object.children {
-                budget.edge()?;
-                if let Some(verification) = &mut verification {
-                    verification.charge_edge()?;
-                }
-                budget.check_reference(r, *child)?;
-            }
-            // Deduplicate only completed identical physical occurrences. A
-            // different offset/span with the same ID can carry other locators.
-            if !object.children.is_empty() {
-                graph.push(r, true, &budget)?;
-                for child in object.children.iter().rev() {
-                    graph.push(*child, false, &budget)?;
-                }
-                continue;
-            }
-            // Leaves need no postorder reload. The authenticated bytes are
-            // still in hand and there are no destination locators to resolve.
-            object
-        };
-        graph.complete(r, &budget)?;
-        if !expanded && graph.mapped(r.hash)?.is_some() {
-            continue;
         }
-        let children = object
-            .children
-            .iter()
-            .map(|child| graph.mapped(child.hash)?.ok_or(Error::Missing))
-            .collect::<Result<Vec<_>>>()?;
-        let verified = super::VerifiedObject {
-            hash: r.hash,
-            object,
-            compressed: None,
-        };
-        let result = destination.put_verified(&verified, &children)?;
-        if result.hash != r.hash {
-            return Err(corrupt("copy changed canonical identity"));
-        }
-        graph.map(result, &budget)?;
+        budget.visit_for_copy(
+            source,
+            r,
+            if expanded {
+                None
+            } else {
+                verification.as_mut()
+            },
+            &mut |object, budget, mut verification| {
+                if !expanded {
+                    super::schema::validate_core_edges_with(object, |child, check| {
+                        budget.visit_for_copy(
+                            source,
+                            child,
+                            verification.as_deref_mut(),
+                            &mut |child, _, _| {
+                                check(super::schema::CoreShape {
+                                    kind: child.kind,
+                                    version: child.version,
+                                    bytes: child.bytes,
+                                    child_count: child.children.len(),
+                                })
+                            },
+                        )
+                    })?;
+                    for child in object.children {
+                        budget.edge()?;
+                        if let Some(verification) = &mut verification {
+                            verification.charge_edge()?;
+                        }
+                        budget.check_reference(r, *child)?;
+                    }
+                    // Retain only references across descendants, never payloads.
+                    if !object.children.is_empty() {
+                        graph.push(r, true, budget)?;
+                        for child in object.children.iter().rev() {
+                            graph.push(*child, false, budget)?;
+                        }
+                        return Ok(());
+                    }
+                }
+                // Deduplicate only completed identical physical occurrences.
+                // Another offset/span with the same ID can carry other locators.
+                graph.complete(r, budget)?;
+                if !expanded && graph.mapped(r.hash)?.is_some() {
+                    return Ok(());
+                }
+                children.clear();
+                for child in object.children {
+                    children.push(graph.mapped(child.hash)?.ok_or(Error::Missing)?);
+                }
+                let verified = super::VerifiedObjectView {
+                    hash: r.hash,
+                    object,
+                };
+                let result = destination.put_verified_view(&verified, &children)?;
+                if result.hash != r.hash {
+                    return Err(corrupt("copy changed canonical identity"));
+                }
+                graph.map(result, budget)
+            },
+        )?;
     }
     graph.mapped(root.hash)?.ok_or(Error::Missing)
 }
@@ -352,6 +372,8 @@ pub(crate) struct Budget {
     logical: u64,
     resident_overhead: usize,
 }
+type CopyVisitor<'a> =
+    dyn FnMut(ObjectView<'_>, &mut Budget, Option<&mut Budget>) -> Result<()> + 'a;
 impl Budget {
     pub fn new(limits: Limits) -> Self {
         Self {
@@ -461,6 +483,26 @@ impl Budget {
         };
         self.charge_object(&object)?;
         Ok(object)
+    }
+    fn visit_for_copy<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &S,
+        r: ObjectRef,
+        mut verification: Option<&mut Self>,
+        visitor: &mut CopyVisitor<'_>,
+    ) -> Result<()> {
+        self.charge_reference(r)?;
+        self.time()?;
+        if let Some(verification) = &mut verification {
+            verification.charge_reference(r)?;
+        }
+        store.visit_verified(r, &mut |object| {
+            if let Some(verification) = &mut verification {
+                verification.charge_decoded(object.canonical_len())?;
+            }
+            self.charge_decoded(object.canonical_len())?;
+            visitor(object, self, verification.as_deref_mut())
+        })
     }
     fn charge_reference(&mut self, r: ObjectRef) -> Result<()> {
         charge(&mut self.frames, 1, self.limits.max_frames, "frame visits")?;

@@ -329,9 +329,185 @@ pub struct FrameEncoder {
     #[cfg(feature = "compression")]
     canonical_hash: Option<ObjectHash>,
     #[cfg(feature = "compression")]
+    page_hash: PageHash,
+    #[cfg(feature = "compression")]
     compressors: [Option<zstd::zstd_safe::CCtx<'static>>; 2],
     #[cfg(feature = "compression")]
     compression_levels: [Option<i32>; 2],
+}
+
+// Directory rewrites commonly change a few bytes of a large inline page.
+// Reuse only exact equal subtrees at the same canonical input offset. These
+// are ordinary BLAKE3 chaining values, never caller-supplied identity hints.
+#[cfg(feature = "compression")]
+#[derive(Default)]
+struct PageHash {
+    bytes: Vec<u8>,
+    subtrees: Vec<blake3::hazmat::ChainingValue>,
+}
+#[cfg(feature = "compression")]
+impl PageHash {
+    // Four BLAKE3 chunks permit SIMD inside a subtree. A partial subtree is
+    // allowed only at the right edge; every input offset is chunk-aligned.
+    const SUBTREE: usize = 4 * blake3::CHUNK_LEN;
+    const MAX_BYTES: usize = 128 * 1024 + super::OBJECT_HASH_DOMAIN.len();
+    const MAX_SUBTREES: usize = Self::MAX_BYTES.div_ceil(Self::SUBTREE);
+
+    fn hash(&mut self, bytes: &[u8]) -> ObjectHash {
+        use blake3::hazmat::{HasherExt, Mode, merge_subtrees_non_root, merge_subtrees_root};
+        const {
+            assert!(Self::MAX_SUBTREES <= 1 << 6);
+        }
+        if bytes.len() <= Self::SUBTREE || bytes.len() > Self::MAX_BYTES {
+            return ObjectHash::digest(bytes);
+        }
+        if self.bytes.capacity() < Self::MAX_BYTES {
+            self.bytes.reserve_exact(Self::MAX_BYTES - self.bytes.len());
+            self.subtrees
+                .reserve_exact(Self::MAX_SUBTREES - self.subtrees.len());
+        }
+        let count = bytes.len().div_ceil(Self::SUBTREE);
+        for (index, subtree) in bytes.chunks(Self::SUBTREE).enumerate() {
+            let start = index * Self::SUBTREE;
+            let old = self
+                .bytes
+                .get(start..self.bytes.len().min(start + Self::SUBTREE));
+            if index < self.subtrees.len() && old == Some(subtree) {
+                continue;
+            }
+            let cv = blake3::Hasher::new()
+                .set_input_offset(start as u64)
+                .update(subtree)
+                .finalize_non_root();
+            if index < self.subtrees.len() {
+                self.subtrees[index] = cv;
+            } else {
+                self.subtrees.push(cv);
+            }
+        }
+        self.subtrees.truncate(count);
+        self.bytes.clear();
+        self.bytes.extend_from_slice(bytes);
+        // Merge complete left subtrees according to BLAKE3's binary tree.
+        // The last (possibly partial) subtree stays on the right edge. The
+        // final merge uses ROOT; interior merges must not use that flag.
+        let mut stack = [[0; 32]; 6];
+        let mut depth = 0;
+        for (index, cv) in self.subtrees[..count - 1].iter().enumerate() {
+            let mut cv = *cv;
+            let mut total = index + 1;
+            while total & 1 == 0 {
+                depth -= 1;
+                cv = merge_subtrees_non_root(&stack[depth], &cv, Mode::Hash);
+                total >>= 1;
+            }
+            stack[depth] = cv;
+            depth += 1;
+        }
+        let mut right = self.subtrees[count - 1];
+        while depth > 1 {
+            depth -= 1;
+            right = merge_subtrees_non_root(&stack[depth], &right, Mode::Hash);
+        }
+        ObjectHash(*merge_subtrees_root(&stack[0], &right, Mode::Hash).as_bytes())
+    }
+    fn capacity(&self) -> usize {
+        self.bytes.capacity() + self.subtrees.capacity() * 32
+    }
+}
+
+#[cfg(all(test, feature = "compression"))]
+mod page_hash_tests {
+    use super::*;
+
+    #[test]
+    fn cached_subtrees_match_standard_blake3_across_edits_and_tree_shapes() {
+        let mut cache = PageHash::default();
+        let mut lengths = vec![
+            0,
+            1,
+            1023,
+            1024,
+            1025,
+            PageHash::MAX_BYTES,
+            PageHash::MAX_BYTES + 1,
+        ];
+        for subtrees in 1..=PageHash::MAX_SUBTREES {
+            lengths.extend([
+                subtrees * PageHash::SUBTREE - 1,
+                subtrees * PageHash::SUBTREE,
+                subtrees * PageHash::SUBTREE + 1,
+            ]);
+        }
+        let reverse: Vec<_> = lengths.iter().rev().copied().collect();
+        lengths.extend(reverse);
+        for length in lengths {
+            let mut bytes: Vec<_> = (0..length)
+                .map(|i| ((i * 31 + i / 257) % 251) as u8)
+                .collect();
+            assert_eq!(cache.hash(&bytes), ObjectHash::digest(&bytes));
+            for at in [0, 1023, 1024, 4095, 4096, length.saturating_sub(1)] {
+                if at < length {
+                    bytes[at] ^= 0x75;
+                    let expected = ObjectHash::digest(&bytes);
+                    assert_eq!(cache.hash(&bytes), expected, "length={length} edit={at}");
+                    assert_eq!(cache.hash(&bytes), expected);
+                }
+            }
+        }
+        assert!(cache.capacity() <= PageHash::MAX_BYTES + 32 * PageHash::MAX_SUBTREES);
+    }
+
+    #[test]
+    fn directory_encoder_keeps_standard_identity_across_raw_and_compressed_edits() {
+        use crate::v1::cbor::{self, Value as V};
+        let mut encoder = FrameEncoder::default();
+        let mut decoder = FrameDecoder::default();
+        for ordinal in 0..64u64 {
+            let mut rows = Vec::new();
+            for index in 0..128u64 {
+                let mut body = vec![index as u8; 512];
+                if index == ordinal % 128 {
+                    body[..8].copy_from_slice(&ordinal.to_le_bytes());
+                }
+                rows.push(V::Array(vec![
+                    V::Bytes(format!("f{index:04}").into_bytes()),
+                    V::Uint(0),
+                    V::Map(Vec::new()),
+                    V::Array(vec![V::Uint(512), V::Uint(0), V::Bytes(body)]),
+                ]));
+            }
+            let object = CanonicalObject {
+                kind: 3,
+                version: 1,
+                bytes: cbor::encode(&V::Array(rows)),
+                children: Vec::new(),
+            };
+            for level in [1, 0, -3] {
+                let expected = object.hash();
+                let hash = encoder.prepare_hash(3, 1, &object.bytes, &[], level);
+                assert_eq!(hash, expected);
+                let frame = encoder.encode_hashed(&object, level, hash).unwrap();
+                let reference = ObjectRef {
+                    hash,
+                    address: ChunkAddress {
+                        offset: 12288,
+                        length: frame.len() as u32,
+                    },
+                };
+                assert_eq!(
+                    decoder
+                        .decode(reference, frame, 12288, 12288 + frame.len() as u64)
+                        .unwrap()
+                        .body,
+                    object.bytes
+                );
+                // An intervening ordinary write must not turn the cached page
+                // bytes into an authorization to use another object's hash.
+                encoder.prepare_hash(7, 1, &ordinal.to_le_bytes(), &[], level);
+            }
+        }
+    }
 }
 // Cloning a store clones content, never codec state or scratch reservations.
 impl Clone for FrameEncoder {
@@ -350,8 +526,9 @@ impl FrameEncoder {
         );
         self.encode_hashed(object, level, hash)
     }
-    /// Assemble canonical bytes once for both identity and compression. Raw
-    /// frames retain bounded stack hashing without allocating codec scratch.
+    /// Assemble canonical bytes once for identity and compression. Directory
+    /// pages also use this buffer for exact subtree reuse with raw frames;
+    /// other raw frames retain bounded stack hashing.
     pub(crate) fn prepare_hash(
         &mut self,
         kind: u16,
@@ -363,9 +540,13 @@ impl FrameEncoder {
         #[cfg(feature = "compression")]
         {
             self.canonical_hash = None;
-            if !matches!(kind, 1 | 2) && level != 0 {
+            if !matches!(kind, 1 | 2) && (level != 0 || kind == 3) {
                 self.prepare_canonical(kind, version, bytes, children);
-                let hash = ObjectHash::digest(&self.canonical);
+                let hash = if kind == 3 {
+                    self.page_hash.hash(&self.canonical)
+                } else {
+                    ObjectHash::digest(&self.canonical)
+                };
                 self.canonical_hash = Some(hash);
                 return hash;
             }
@@ -384,7 +565,7 @@ impl FrameEncoder {
     pub fn buffer_capacity(&self) -> usize {
         let bytes = self.frame.capacity();
         #[cfg(feature = "compression")]
-        let bytes = bytes + self.canonical.capacity();
+        let bytes = bytes + self.canonical.capacity() + self.page_hash.capacity();
         bytes
     }
     pub(crate) fn encode_hashed(

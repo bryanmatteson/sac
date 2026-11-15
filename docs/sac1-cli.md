@@ -3,8 +3,10 @@
 ## Build
 
 Build the production tools with `cargo build --release --bin sac`. The default
-features include the native file backend and compression. All commands use
-current SAC1 archives. `sac inspect` reports selected-root admission without
+features include the native file backend and compression. The Rust native
+writer also supports `NativeStore::set_compression_level(0)` for raw,
+latency-sensitive live appends; CLI compression defaults remain level 1.
+All commands use current SAC1 archives. `sac inspect` reports selected-root admission without
 claiming complete graph or profile verification.
 
 ## Command summary
@@ -91,6 +93,13 @@ and a fresh nonzero incarnation. Live output requires a named seekable path.
 and its attestation catalogue. For named output, the copy walk verifies the
 portable graph while writing to private staging. Source and staged output both
 receive physical validation, and resource namespace validation still runs.
+Native copy visits reuse bounded decoder and relocation storage. Borrowed
+payloads remain valid only for their visit; direct child roles and destination
+occurrences retain their ordinary checks, and the sealed codec is unchanged.
+Physical validation shares child authentication with direct role checks within
+one walk, while preserving logical validation charges. Namespace validation
+borrows directory rows and still checks inherited fences, heights, file geometry
+and each expanded resource route.
 A commit with a local authority attachment
 requires explicit `--strip-local` for sealed compaction or fresh live recovery.
 That operation removes the local attachment and can change commit identity;
@@ -210,6 +219,9 @@ adapter reserves finite portions for overlapping indexes and
 copy work; a conservative reservation may reject a workload before consuming
 the entire nominal quota. Raising the finite quota permits retry. Native
 commands require at least 48 MiB; lower budgets return `LimitExceeded`.
+Physical validation coalesces adjacent frame headers and padding in a bounded
+64 KiB window. Read-ahead consumes the input-byte allowance; each frame,
+canonical identity and direct child role still receives its ordinary checks.
 Elapsed-time checks are cooperative between I/O operations; a blocked caller
 pipe still follows the host's I/O cancellation behavior. Quota/integrity failures
 do not publish a partial extraction or archive, and cleanup removes only owned

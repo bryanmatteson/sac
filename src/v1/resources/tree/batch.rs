@@ -399,7 +399,9 @@ pub(super) fn emit_leaves<S: ObjectStore + ?Sized>(
         let rows = &entries[range.clone()];
         let fits = {
             let (value, children) = encode_leaf(rows);
-            fits_leaf(&value, &children) && canonical_size(&value, &children) <= write_limit
+            rows.len() <= DIRECTORY_WRITE_ROWS
+                && fits_leaf(&value, &children)
+                && canonical_size(&value, &children) <= write_limit
         };
         if fits {
             result.push(store_leaf_after(store, rows, prior)?);

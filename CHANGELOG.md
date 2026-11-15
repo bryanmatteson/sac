@@ -6,6 +6,27 @@ Replace the earlier prerelease section format with the current SAC1 immutable
 object graph. This is the first format being prepared for stabilization; the
 wire version remains 1 and the Rust package version remains 0.2.0.
 
+- Reuse exact writer provenance for duplicate appends after cache eviction and
+  avoid repeated exact child authentication with a bounded per-put table.
+  Expose native compression levels, including raw appends for low latency,
+  preserving the selected level through prepared writes and compaction swaps.
+- Splice inline-only directory leaves by copying unchanged encoded row ranges,
+  avoiding field-by-field reconstruction during small live record updates while
+  preserving canonical pages and newly introduced child indices.
+- Admit directory leaf fields in one pass and reuse BLAKE3 subtree hashes only
+  for exact equal canonical bytes at the same offset. Small live map edits avoid
+  rehashing unchanged page regions while retaining standard object identities,
+  child authentication and durable publication. Bound and account for the
+  encoder's additional comparison and subtree storage.
+- Parse schema-known directory scalars directly, and rewrite directory branches
+  from borrowed authenticated fences. Preserve first-use child identity order
+  with a bounded lookup table instead of repeated linear scans and owned CBOR
+  reconstruction during many-key inserts and value resizes.
+- Bound persistent directory leaves to 192 rows as well as their selected byte
+  target. Dense bulk and older leaves remain readable and split when edited;
+  individual inline/metadata limits remain unchanged. New persistent tree
+  grouping and snapshot identities can differ, without a wire-format change.
+
 - Pack native append writes across frame boundaries in the existing 64 KiB
   buffer, writing large prefixes directly and preserving exact frame bytes.
 - Check destination identity at staging and publication boundaries rather than
@@ -62,6 +83,20 @@ wire version remains 1 and the Rust package version remains 0.2.0.
   object IDs in the sealed encoder, and buffer staged archive writes.
 - Reuse the physical validation decoder and count extent payloads without
   rereading the exact leaf authenticated by the extent role check.
+- Coalesce physical inventory reads in a bounded, source-quota-charged window,
+  reuse core-parent storage and borrow decoded children for direct role checks.
+  Narrow disposable validation/copy tables to their actual state and locator
+  widths, reducing sealing work and spill without changing sealed bytes.
+- Visit authenticated copy objects through reusable native decoder storage,
+  borrow their direct role checks, and reuse the relocation vector. Borrowed
+  verified writes preserve destination checks and canonical sealed encoding.
+- Reuse intrinsic validation during authenticated role checks and combine copy
+  activity/remapping records while retaining exact physical completion state.
+- Authenticate ordinary physical child occurrences once per validation walk,
+  carrying direct role constraints on the traversal and retaining only exact
+  occurrence facts. Keep logical validation charges and profile binding checks.
+- Verify resource namespaces through borrowed directory rows, avoiding owned
+  CBOR trees and copies of names, metadata and inline file contents.
 - Validate extent geometry before sealed export and authenticate the byte
   leaves during the verified copy.
 - Hash newly inserted objects once, reuse writer frame/compression workspaces,

@@ -17,6 +17,7 @@ mod maintenance;
 mod platform;
 mod spill;
 mod temporary;
+mod validation;
 #[cfg(unix)]
 pub use maintenance::{OnlineReclamation, ReclamationOptions, ReclamationStatistics};
 pub use spill::ClosureCopy;
@@ -471,6 +472,14 @@ impl NativeStore {
     /// and its frame, in addition to the caller's operation memory limit.
     pub fn set_encode_threads(&mut self, threads: usize) {
         self.encode_threads = threads.clamp(1, 64);
+    }
+    /// Select compression for future appends. The default is Zstandard level 1;
+    /// zero writes raw frames and negative levels select Zstandard's fast modes.
+    /// Raw writes avoid compression work for latency-sensitive live updates,
+    /// at the cost of larger frames. Object identities and publication barriers
+    /// are unchanged. Existing objects may still be reused by deduplication.
+    pub fn set_compression_level(&mut self, level: i32) {
+        self.compression_level = level;
     }
     /// Check the destination at the beginning of a staged publication.
     /// Immutable object appends stay private to this open descriptor; checking
@@ -1542,6 +1551,24 @@ impl ObjectStore for NativeStore {
             true,
         )
     }
+    fn put_verified_view(
+        &mut self,
+        source: &VerifiedObjectView<'_>,
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        source.validate_children(children)?;
+        let object = source.object();
+        self.put_checked_edges(
+            object.kind,
+            object.version,
+            object.bytes,
+            children,
+            None,
+            Some(source.hash()),
+            None,
+            true,
+        )
+    }
     fn rewrite_source(&self, parent: ObjectRef) -> Result<Option<RewriteSource>> {
         self.check_writable()?;
         self.begin_staging()?;
@@ -1676,6 +1703,11 @@ impl NativeStore {
     fn admit_duplicate(&mut self, reference: ObjectRef) -> Result<()> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
+        // The writer's exact append provenance authenticates this occurrence
+        // even after decoded/type cache eviction, just as it does for children.
+        if self.recent.get(reference.hash)? == Some(reference) {
+            return Ok(());
+        }
         if self
             .cache
             .lock()
@@ -1771,7 +1803,20 @@ impl NativeStore {
         if !children.is_empty() {
             let cache = Arc::clone(&self.cache);
             let mut cached = None;
-            for child in children {
+            // Remember a bounded set of exact occurrences within this put.
+            // Repeated edges otherwise read/decompress the same child again
+            // when the optional cache is disabled or too small. Store indices
+            // into the caller's slice; collisions only repeat authentication.
+            let mut checked = [usize::MAX; 16];
+            for (index, child) in children.iter().enumerate() {
+                let slot = ((child.address.offset >> 3) ^ (child.address.offset >> 11)) as usize
+                    & (checked.len() - 1);
+                if children.get(checked[slot]) == Some(child) {
+                    continue;
+                }
+                // Every failure below returns immediately, so a later edge
+                // can reuse this slot only after this edge was admitted.
+                checked[slot] = index;
                 wire::validate_address(child.address, self.reader.first_record_offset(), self.end)?;
                 // Inherited exact edges never enter the authentication cache.
                 if source.is_some() && self.rewrite_edges.binary_search(child).is_ok() {
@@ -1981,6 +2026,66 @@ impl Drop for NativeReader {
 impl ObjectStore for NativeReader {
     fn get_verified_shared(&self, r: ObjectRef) -> Result<Arc<CanonicalObject>> {
         self.get_shared(r)
+    }
+    fn visit_verified(
+        &self,
+        reference: ObjectRef,
+        visitor: &mut dyn FnMut(ObjectView<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let first = self.reader.first_record_offset();
+        let end = self.reader.trailer_offset();
+        wire::validate_address(reference.address, first, end)?;
+        let mut read = match self
+            .cache
+            .get_or(self.file_identity, reference, |cache| cache.take_borrowed())
+        {
+            Ok(object) => return visitor(object.as_ref().into()),
+            Err(read) => read,
+        };
+        let result = (|| {
+            read.frame.resize(reference.address.length as usize, 0);
+            let resident = self.cache.lock().unwrap().read_window(
+                self.file_identity,
+                reference.address.offset,
+                &mut read.frame,
+            );
+            if !resident {
+                counted_read_at(
+                    &self.file,
+                    &mut read.frame,
+                    reference.address.offset,
+                    &self.io,
+                    ReadClass::Object,
+                )?;
+            }
+            let returning_workspace = read.retained_bytes();
+            let frame = read.decoder.decode(reference, &read.frame, first, end)?;
+            read.children.clear();
+            read.children
+                .extend((0..frame.child_count()).map(|index| frame.child(index).unwrap()));
+            // Role checks and postorder traversal revisit the same occurrence.
+            // Retain authenticated parts under the ordinary cache budget, reusing
+            // unpinned victims instead of transferring the decoder's allocation.
+            self.cache.lock().unwrap().admit_parts(
+                self.file_identity,
+                reference,
+                AppendObject {
+                    kind: frame.kind,
+                    version: frame.version,
+                    bytes: Cow::Borrowed(frame.body),
+                    children: Cow::Borrowed(&read.children),
+                },
+                returning_workspace,
+            );
+            visitor(ObjectView {
+                kind: frame.kind,
+                version: frame.version,
+                bytes: frame.body,
+                children: &read.children,
+            })
+        })();
+        self.cache.lock().unwrap().return_borrowed(read);
+        result
     }
     fn cached_object_type(&self, reference: ObjectRef) -> Result<Option<(u16, u16)>> {
         let scope = self.physical_read_scope().unwrap();
@@ -2479,6 +2584,64 @@ struct ValidationFrames<'a> {
     end: u64,
     frames: AuthenticationFrames,
 }
+
+// Physical inventory visits densely interleaved headers and padding. Coalesce
+// those tiny reads without retaining archive-sized state. The bytes are still
+// checked independently, and speculative bytes consume the source-read quota.
+#[derive(Default)]
+struct ValidationWindow {
+    bytes: Vec<u8>,
+    start: u64,
+    valid: usize,
+}
+impl ValidationWindow {
+    const BYTES: usize = 64 * 1024;
+
+    #[allow(clippy::too_many_arguments)]
+    fn read(
+        &mut self,
+        file: &File,
+        io: &PhysicalCounters,
+        offset: u64,
+        end: u64,
+        output: &mut [u8],
+        charged_source: &mut u64,
+        max_source: u64,
+    ) -> Result<()> {
+        if let Some(at) = offset
+            .checked_sub(self.start)
+            .and_then(|at| usize::try_from(at).ok())
+            && let Some(bytes) = self
+                .bytes
+                .get(..self.valid)
+                .and_then(|bytes| bytes.get(at..at.checked_add(output.len())?))
+        {
+            output.copy_from_slice(bytes);
+            return Ok(());
+        }
+        if output.len() > Self::BYTES {
+            return counted_read_at(file, output, offset, io, ReadClass::Metadata);
+        }
+        // The requested bytes were charged by the caller. Spend only the
+        // remaining quota on read-ahead; hits retain the ordinary visit charge.
+        let available = max_source.saturating_sub(*charged_source);
+        let length = (end - offset)
+            .min(Self::BYTES as u64)
+            .min((output.len() as u64).saturating_add(available)) as usize;
+        if length < output.len() {
+            return Err(corrupt("physical selected end"));
+        }
+        *charged_source += (length - output.len()) as u64;
+        self.valid = 0;
+        self.bytes.resize(length, 0);
+        counted_read_at(file, &mut self.bytes, offset, io, ReadClass::Metadata)?;
+        self.start = offset;
+        self.valid = length;
+        output.copy_from_slice(&self.bytes[..output.len()]);
+        Ok(())
+    }
+}
+
 impl ValidationFrames<'_> {
     fn get(&mut self, reference: ObjectRef) -> Result<wire::FrameView<'_>> {
         self.frames
@@ -2493,12 +2656,17 @@ fn validate_physical_closure(
 ) -> Result<ValidationReport> {
     let started = Instant::now();
     let budget = temporary::Budget::new(limits.max_temp_bytes);
-    let mut inventory =
-        temporary::GraphTable::with_budget(temporary::GraphTable::RESIDENT_ENTRIES, budget.clone());
+    // Inventory keys are physical offsets; values contain span/decoded length.
+    // The occurrence table below retains only the facts needed by direct roles.
+    let mut inventory = temporary::ValueGraphTable::<8, 8>::with_budget(
+        temporary::GraphTable::RESIDENT_ENTRIES,
+        budget.clone(),
+    );
     let mut offset = reader.first_record_offset();
     let end = reader.committed_end();
     let mut records = 0u64;
     let mut source_bytes = 0u64;
+    let mut window = ValidationWindow::default();
     let charge = |used: &mut u64, amount: u64| -> Result<()> {
         *used = used
             .checked_add(amount)
@@ -2518,7 +2686,15 @@ fn validate_physical_closure(
         }
         let mut header = [0; 56];
         charge(&mut source_bytes, 56)?;
-        counted_read_at(file, &mut header, offset, io, ReadClass::Metadata)?;
+        window.read(
+            file,
+            io,
+            offset,
+            end,
+            &mut header,
+            &mut source_bytes,
+            limits.max_source_bytes,
+        )?;
         let span = if &header[..8] == b"SAC1END\0" {
             charge(&mut source_bytes, 160)?;
             let trailer = read_trailer(file, &reader.header, offset, io)?;
@@ -2543,12 +2719,14 @@ fn validate_physical_closure(
             if pad > 0 {
                 let mut bytes = [0; 7];
                 charge(&mut source_bytes, pad)?;
-                counted_read_at(
+                window.read(
                     file,
-                    &mut bytes[..pad as usize],
-                    offset + used,
                     io,
-                    ReadClass::Metadata,
+                    offset + used,
+                    end,
+                    &mut bytes[..pad as usize],
+                    &mut source_bytes,
+                    limits.max_source_bytes,
                 )?;
                 if bytes[..pad as usize].iter().any(|b| *b != 0) {
                     return Err(corrupt("physical frame padding"));
@@ -2566,11 +2744,14 @@ fn validate_physical_closure(
     if offset != end {
         return Err(corrupt("physical selected end"));
     }
-    let mut seen =
-        temporary::GraphTable::with_budget(temporary::GraphTable::RESIDENT_ENTRIES, budget.clone());
-    let mut stack = DiskStack::with_budget(256, budget)?;
+    drop(window);
+    let mut seen = temporary::ValueGraphTable::<12>::with_budget(
+        temporary::GraphTable::RESIDENT_ENTRIES,
+        budget.clone(),
+    );
+    let mut stack = validation::Pending::new(budget)?;
     if let Some(p) = reader.publication {
-        stack.push(p.root, false)?;
+        stack.push(p.root, validation::Role::ANY)?;
     }
     let mut report = ValidationReport::default();
     let mut edges = 0u64;
@@ -2581,15 +2762,24 @@ fn validate_physical_closure(
         end: reader.trailer_offset(),
         frames: AuthenticationFrames::default(),
     };
-    // In this traversal the stack flag carries authentication of a byte
-    // leaf from its extent role check. Inventory and visit charges still
-    // apply to every distinct physical occurrence.
-    while let Some((r, checked_leaf)) = stack.pop()? {
+    // Only core parents need to outlive a child decode. Reuse their bounded
+    // buffers instead of allocating an object for every parent and role edge.
+    let mut parent = CanonicalObject {
+        kind: 0,
+        version: 0,
+        bytes: Vec::new(),
+        children: Vec::new(),
+    };
+    let mut roles = [validation::Role::ANY; MAX_CHILDREN];
+    while let Some((r, role)) = stack.pop()? {
         if started.elapsed() > limits.max_elapsed {
             return Err(Error::Limit("validation elapsed work"));
         }
         let key = spill::encode_ref(r);
-        if seen.get(&key)?.is_some() {
+        if let Some(fact) = seen.get(&key)? {
+            // Every incoming role still applies to a shared physical child.
+            // The fact is from this operation's full authenticated occurrence.
+            role.check(validation::Fact::decode(&fact))?;
             continue;
         }
         let record = inventory
@@ -2613,27 +2803,35 @@ fn validate_physical_closure(
         if next > limits.max_decoded_bytes {
             return Err(Error::Limit("validation decoded bytes"));
         }
-        seen.insert_cancellable(&key, &[], &|| false)?;
         report.decoded_bytes = next;
         report.objects += 1;
-        if checked_leaf {
-            continue;
-        }
         let frame = frames.get(r)?;
-        let mut push = |child, checked_leaf| {
+        let fact = validation::Fact::from_frame(&frame)?;
+        role.check(fact)?;
+        seen.insert_cancellable(&key, &fact.encode(), &|| false)?;
+        let mut push = |child, role| {
             edges = edges
                 .checked_add(1)
                 .ok_or(Error::Limit("validation graph edges"))?;
             if edges > limits.max_edges {
                 return Err(Error::Limit("validation graph edges"));
             }
-            stack.push(child, checked_leaf)
+            stack.push(child, role)
         };
         if matches!(frame.kind, 1..=6) {
             // Only core parents with role checks need to retain their body
             // while the same decoder authenticates a child.
-            let object = frame.to_owned();
-            validate_core_edges(&object, |child| {
+            parent.kind = frame.kind;
+            parent.version = frame.version;
+            parent.bytes.clear();
+            parent.bytes.extend_from_slice(frame.body);
+            parent.children.clear();
+            parent
+                .children
+                .extend((0..frame.child_count()).map(|index| frame.child(index).unwrap()));
+            roles[..parent.children.len()].fill(validation::Role::ANY);
+            schema::visit_core_roles((&parent).into(), |index, role| {
+                let child = parent.children[index];
                 if started.elapsed() > limits.max_elapsed {
                     return Err(Error::Limit("validation elapsed work"));
                 }
@@ -2644,26 +2842,44 @@ fn validate_physical_closure(
                     return Err(Error::Limit("validation frame visits"));
                 }
                 charge(&mut source_bytes, u64::from(child.address.length))?;
-                let fetched = frames.get(child)?;
-                let canonical_len = 8 + 32 * fetched.child_count() + fetched.body.len();
+                let record = inventory
+                    .get(&child.address.offset.to_le_bytes())?
+                    .ok_or_else(|| corrupt("reachable locator is not a top-level frame"))?;
+                if record[..4] != child.address.length.to_le_bytes() {
+                    return Err(corrupt("reachable locator span"));
+                }
+                let canonical_len = u32::from_le_bytes(record[4..8].try_into().unwrap()) as u64;
                 report.decoded_bytes = report
                     .decoded_bytes
-                    .checked_add(canonical_len as u64)
+                    .checked_add(canonical_len)
                     .ok_or(Error::Limit("validation decoded bytes"))?;
                 if report.decoded_bytes > limits.max_decoded_bytes {
                     return Err(Error::Limit("validation decoded bytes"));
                 }
-                Ok(Arc::new(fetched.to_owned()))
+                // Keep the ordinary logical role-visit charges even though
+                // authentication is shared with the child's graph visit.
+                if let Some(required) = validation::Role::from_core(role) {
+                    return roles[index].merge(required);
+                }
+                // Profile bindings compare variable text fields. Borrow those
+                // actual authenticated bytes rather than retaining payloads or
+                // replacing their comparison with another content identifier.
+                let fetched = frames.get(child)?;
+                role.check::<false>(schema::CoreShape {
+                    kind: fetched.kind,
+                    version: fetched.version,
+                    bytes: fetched.body,
+                    child_count: fetched.child_count(),
+                })?;
+                roles[index]
+                    .merge(validation::Role::from_core(schema::CoreRole::Kinds(8, 8)).unwrap())
             })?;
-            // Every index in an admitted extent leaf is used. Its role
-            // checks authenticate each referenced byte leaf, including length.
-            let checked_children = object.kind == 5;
-            for child in object.children.into_iter().rev() {
-                push(child, checked_children)?;
+            for (index, child) in parent.children.iter().enumerate().rev() {
+                push(*child, roles[index])?;
             }
         } else {
             for index in (0..frame.child_count()).rev() {
-                push(frame.child(index).unwrap(), false)?;
+                push(frame.child(index).unwrap(), validation::Role::ANY)?;
             }
         }
     }
@@ -2881,6 +3097,7 @@ impl NativeStore {
             };
             target.cache = self.cache.clone();
             target.io = self.io.clone();
+            target.compression_level = self.compression_level;
             target.recent = DiskRefs::with_budget(
                 self.recent.0.resident_limit(),
                 target.recent.0.budget.clone(),
@@ -3171,6 +3388,8 @@ impl NativeStore {
         job.target.path = self.path.clone();
         job.target.cache = self.cache.clone();
         job.target.compaction_active = self.compaction_active.clone();
+        // The caller may change append policy while the candidate is copying.
+        job.target.compression_level = self.compression_level;
         *self.generation.next.lock().unwrap() = Some(remap);
         std::mem::swap(self, &mut job.target);
         self.poisoned = false;

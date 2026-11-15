@@ -293,6 +293,31 @@ pub struct VerifiedObject {
     #[cfg_attr(not(feature = "native"), allow(dead_code))]
     compressed: Option<Arc<Vec<u8>>>,
 }
+/// Borrowed canonical bytes authenticated by a source visit. Only their ordered
+/// child identities may be retained when a destination relocates the object.
+pub struct VerifiedObjectView<'a> {
+    hash: ObjectHash,
+    object: ObjectView<'a>,
+}
+impl VerifiedObjectView<'_> {
+    pub fn hash(&self) -> ObjectHash {
+        self.hash
+    }
+    pub fn object(&self) -> ObjectView<'_> {
+        self.object
+    }
+    fn validate_children(&self, children: &[ObjectRef]) -> Result<()> {
+        if children.len() != self.object.children.len()
+            || children
+                .iter()
+                .zip(self.object.children)
+                .any(|(a, b)| a.hash != b.hash)
+        {
+            return Err(corrupt("verified copy changed child identities"));
+        }
+        Ok(())
+    }
+}
 /// One object without children that a store encoded before its put. Only a
 /// store makes this value, so its identity is the hash of its own bytes.
 pub struct PreparedObject {
@@ -317,16 +342,14 @@ impl VerifiedObject {
     pub fn object(&self) -> &CanonicalObject {
         &self.object
     }
-    fn validate_children(&self, children: &[ObjectRef]) -> Result<()> {
-        if children.len() != self.object.children.len()
-            || children
-                .iter()
-                .zip(&self.object.children)
-                .any(|(a, b)| a.hash != b.hash)
-        {
-            return Err(corrupt("verified copy changed child identities"));
+    pub fn view(&self) -> VerifiedObjectView<'_> {
+        VerifiedObjectView {
+            hash: self.hash,
+            object: self.object.as_ref().into(),
         }
-        Ok(())
+    }
+    fn validate_children(&self, children: &[ObjectRef]) -> Result<()> {
+        self.view().validate_children(children)
     }
     pub fn relocated(&self, children: &[ObjectRef]) -> Result<CanonicalObject> {
         self.validate_children(children)?;
@@ -472,6 +495,18 @@ pub trait ObjectStore {
         source.validate_children(children)?;
         let object = source.object();
         self.put(object.kind, object.version, &object.bytes, children)
+    }
+    /// Copy authenticated borrowed parts without allocating an owned object.
+    /// The default retains strict put; overrides must preserve child identities
+    /// and admit destination occurrences just as `put_verified` does.
+    fn put_verified_view(
+        &mut self,
+        source: &VerifiedObjectView<'_>,
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        source.validate_children(children)?;
+        let object = source.object();
+        self.put(object.kind, object.version, object.bytes, children)
     }
     /// Obtain a bounded, source-bound prior parent for a checked tree update.
     /// None means use ordinary put. Native stores may also bind pages appended
@@ -1416,6 +1451,13 @@ impl<W: Write> ObjectStore for SealedWriter<W> {
         source: &VerifiedObject,
         children: &[ObjectRef],
     ) -> Result<ObjectRef> {
+        self.put_verified_view(&source.view(), children)
+    }
+    fn put_verified_view(
+        &mut self,
+        source: &VerifiedObjectView<'_>,
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
         source.validate_children(children)?;
         let object = source.object();
         // Keep the configured sealed codec and level. The source encoding may
@@ -1423,7 +1465,7 @@ impl<W: Write> ObjectStore for SealedWriter<W> {
         self.write_object(
             object.kind,
             object.version,
-            &object.bytes,
+            object.bytes,
             children,
             source.hash,
         )

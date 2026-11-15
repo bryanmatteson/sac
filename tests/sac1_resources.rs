@@ -52,6 +52,95 @@ fn tiny_sealed_archive_and_verified_absence() {
 }
 
 #[test]
+fn borrowed_namespace_verification_counts_shared_routes_and_enforces_limits() {
+    use sac::cbor::{Value::*, encode};
+    let mut store = MemoryStore::sealed();
+    let leaf = store
+        .put(
+            3,
+            1,
+            &encode(&Array(vec![Array(vec![
+                Bytes(b"file".to_vec()),
+                Uint(0),
+                sac::cbor::text_map(vec![
+                    ("mode", Uint(0o644)),
+                    (
+                        "org.example.data",
+                        Array(vec![Text("metadata".into()), Uint(42)]),
+                    ),
+                ]),
+                Array(vec![Uint(3), Uint(0), Bytes(b"abc".to_vec())]),
+            ])])),
+            &[],
+        )
+        .unwrap();
+    let directory = store
+        .put(
+            3,
+            1,
+            &encode(&Array(vec![
+                Array(vec![Bytes(b"a".to_vec()), Uint(1), Map(vec![]), Uint(0)]),
+                Array(vec![Bytes(b"b".to_vec()), Uint(1), Map(vec![]), Uint(0)]),
+                Array(vec![
+                    Bytes(b"link".to_vec()),
+                    Uint(2),
+                    Map(vec![]),
+                    Bytes(b"a/file".to_vec()),
+                ]),
+            ])),
+            &[leaf],
+        )
+        .unwrap();
+    let snapshot = sac::v1::resources::snapshot(&mut store, directory, vec![], vec![]).unwrap();
+    store.publish(snapshot).unwrap();
+    let reader = ArchiveReader::open(&store, snapshot, Limits::default()).unwrap();
+    let report = reader.verify().unwrap();
+    assert_eq!(
+        (report.entries, report.files, report.logical_bytes),
+        (5, 2, 6)
+    );
+    let mut names = Vec::new();
+    reader
+        .visit_entries(&mut |entry| {
+            names.push(entry.path);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        names,
+        [
+            path("a"),
+            path("a/file"),
+            path("b"),
+            path("b/file"),
+            path("link")
+        ]
+    );
+    assert_eq!(reader.read_range(&path("b/file"), 0, 3).unwrap(), b"abc");
+    for limits in [
+        Limits {
+            max_entries: 4,
+            ..Limits::default()
+        },
+        Limits {
+            max_logical_bytes: 5,
+            ..Limits::default()
+        },
+        Limits {
+            max_depth: 0,
+            ..Limits::default()
+        },
+    ] {
+        assert!(matches!(
+            ArchiveReader::open(&store, snapshot, limits)
+                .unwrap()
+                .verify(),
+            Err(sac::Error::Limit(_))
+        ));
+    }
+}
+
+#[test]
 fn sealed_export_does_not_reload_childless_objects_for_postorder() {
     struct Counted<'a> {
         source: PositionalStore<&'a [u8]>,

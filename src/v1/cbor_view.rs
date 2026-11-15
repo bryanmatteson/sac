@@ -15,6 +15,92 @@ pub fn view(bytes: &[u8]) -> Result<Item<'_>> {
     }
     admitted(bytes)
 }
+
+/// Validate a schema's outer arrays and their fields in one forward pass.
+/// Each field still receives the full deterministic-CBOR checks. Sharing the
+/// item allowance and supplying its actual depth preserves whole-value limits.
+pub(crate) struct CheckedCursor<'a> {
+    bytes: &'a [u8],
+    remaining: usize,
+}
+impl<'a> CheckedCursor<'a> {
+    #[inline]
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            bytes,
+            remaining: MAX_ITEMS,
+        }
+    }
+    #[inline]
+    pub(crate) fn array(&mut self, depth: usize) -> Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or(Error::Limit("CBOR items"))?;
+        let (major, count, head) = header(self.bytes)?;
+        if major != 4 {
+            return Err(corrupt("expected CBOR array"));
+        }
+        if depth >= MAX_DEPTH {
+            return Err(Error::Limit("CBOR nesting"));
+        }
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count <= self.remaining)
+            .ok_or(Error::Limit("CBOR items"))?;
+        self.bytes = &self.bytes[head..];
+        Ok(count)
+    }
+    #[inline]
+    pub(crate) fn item(&mut self, depth: usize) -> Result<Item<'a>> {
+        let length = scan(self.bytes, depth, &mut self.remaining, true)?;
+        let (bytes, rest) = self.bytes.split_at(length);
+        self.bytes = rest;
+        admitted(bytes)
+    }
+    // Schema-known scalar fields need one canonical header check rather than
+    // a recursive scan followed by two more header parses for navigation.
+    #[inline]
+    fn scalar(&mut self, expected: u8) -> Result<(u64, usize)> {
+        self.remaining = self
+            .remaining
+            .checked_sub(1)
+            .ok_or(Error::Limit("CBOR items"))?;
+        let (major, argument, head) = header(self.bytes)?;
+        if major != expected {
+            return Err(corrupt("CBOR field type"));
+        }
+        Ok((argument, head))
+    }
+    #[inline]
+    pub(crate) fn uint(&mut self) -> Result<u64> {
+        let (value, head) = self.scalar(0)?;
+        self.bytes = &self.bytes[head..];
+        Ok(value)
+    }
+    #[inline]
+    pub(crate) fn bytes(&mut self) -> Result<&'a [u8]> {
+        let (length, head) = self.scalar(2)?;
+        let end = usize::try_from(length)
+            .ok()
+            .and_then(|length| head.checked_add(length))
+            .ok_or(Error::Limit("CBOR string"))?;
+        let value = self
+            .bytes
+            .get(head..end)
+            .ok_or_else(|| corrupt("truncated CBOR string"))?;
+        self.bytes = &self.bytes[end..];
+        Ok(value)
+    }
+    #[inline]
+    pub(crate) fn finish(self) -> Result<()> {
+        if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            Err(corrupt("trailing CBOR items"))
+        }
+    }
+}
 /// The header of a well-formed item, for navigation. `None` means that
 /// `header` gives the reason; this function makes no error value.
 #[inline(always)]

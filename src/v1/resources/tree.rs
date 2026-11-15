@@ -1,4 +1,5 @@
 use super::*;
+use crate::v1::MAX_CHILDREN;
 use std::io::Read;
 mod batch;
 #[cfg(feature = "native")]
@@ -245,6 +246,10 @@ fn write_entry_row(entry: &Entry, children: &mut Vec<ObjectRef>, out: &mut Vec<u
 }
 // The last key and the reference of each page that replaces one page.
 type Pages = Vec<(Vec<u8>, ObjectRef)>;
+// A byte limit alone permits thousands of small rows in one mutable page.
+// Bound persistent leaf fanout as well, without reducing the legal size of an
+// individual inline value/metadata row or the portable admission limits.
+const DIRECTORY_WRITE_ROWS: usize = 192;
 #[cfg(test)]
 static SPLICE_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Put one entry into a leaf page from the encoded rows of the page. The new
@@ -275,6 +280,9 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
     let rows = cbor_view::admitted(&object.bytes)?
         .array()?
         .collect::<Result<Vec<_>>>()?;
+    if rows.len() > DIRECTORY_WRITE_ROWS {
+        return Ok(None);
+    }
     let key = |row: &cbor_view::Item<'_>| row.first_field(4)?.bytes().map(<[u8]>::to_vec);
     let mut failure = None;
     let found = rows.binary_search_by(|row| match row.first_field(4).and_then(|k| k.bytes()) {
@@ -301,50 +309,71 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
         Err(position) => (position, false),
     };
     let mut children = Vec::with_capacity(object.children.len() + 1);
+    if rows.len() + usize::from(!replaced) > DIRECTORY_WRITE_ROWS {
+        return Ok(None);
+    }
     let mut body = Vec::with_capacity(object.bytes.len() + 4096);
     cbor::write_head(4, (rows.len() + usize::from(!replaced)) as u64, &mut body);
     let new_row = |body: &mut Vec<u8>, children: &mut Vec<ObjectRef>| {
         write_entry_row(entry, children, body);
     };
-    for (index, row) in rows.iter().enumerate() {
-        if index == position {
-            new_row(&mut body, &mut children);
-            if replaced {
+    if object.children.is_empty() {
+        // A validated leaf without children has no indices to remap in its
+        // unchanged rows. Copy those rows as two contiguous ranges instead of
+        // reparsing every field for each small inline-record update. The new
+        // row may introduce children; it owns their entire new index table.
+        let encoded_rows: usize = rows.iter().map(|row| row.encoded().len()).sum();
+        let header = object.bytes.len() - encoded_rows;
+        let before: usize = rows[..position].iter().map(|row| row.encoded().len()).sum();
+        let removed = if replaced {
+            rows[position].encoded().len()
+        } else {
+            0
+        };
+        body.extend_from_slice(&object.bytes[header..header + before]);
+        new_row(&mut body, &mut children);
+        body.extend_from_slice(&object.bytes[header + before + removed..]);
+    } else {
+        for (index, row) in rows.iter().enumerate() {
+            if index == position {
+                new_row(&mut body, &mut children);
+                if replaced {
+                    continue;
+                }
+            }
+            let [_, kind, _, value] = row.fields()?;
+            // The item that holds a child index, and the row bytes before it.
+            let reference = match kind.uint()? {
+                0 => {
+                    let [_, storage, data] = value.fields()?;
+                    (storage.uint()? == 1).then_some(data)
+                }
+                1 => Some(value),
+                2 => None,
+                _ => return Err(corrupt("unknown directory entry type")),
+            };
+            let Some(reference) = reference else {
+                body.extend_from_slice(row.encoded());
+                continue;
+            };
+            let old = reference.uint()?;
+            let child = *usize::try_from(old)
+                .ok()
+                .and_then(|old| object.children.get(old))
+                .ok_or_else(|| corrupt("child index"))?;
+            let new = child_index(&mut children, child);
+            if new == old {
+                body.extend_from_slice(row.encoded());
                 continue;
             }
+            // The index is the last item of the row.
+            let prefix = row.encoded().len() - reference.encoded().len();
+            body.extend_from_slice(&row.encoded()[..prefix]);
+            cbor::write_head(0, new, &mut body);
         }
-        let [_, kind, _, value] = row.fields()?;
-        // The item that holds a child index, and the row bytes before it.
-        let reference = match kind.uint()? {
-            0 => {
-                let [_, storage, data] = value.fields()?;
-                (storage.uint()? == 1).then_some(data)
-            }
-            1 => Some(value),
-            2 => None,
-            _ => return Err(corrupt("unknown directory entry type")),
-        };
-        let Some(reference) = reference else {
-            body.extend_from_slice(row.encoded());
-            continue;
-        };
-        let old = reference.uint()?;
-        let child = *usize::try_from(old)
-            .ok()
-            .and_then(|old| object.children.get(old))
-            .ok_or_else(|| corrupt("child index"))?;
-        let new = child_index(&mut children, child);
-        if new == old {
-            body.extend_from_slice(row.encoded());
-            continue;
+        if position == rows.len() {
+            new_row(&mut body, &mut children);
         }
-        // The index is the last item of the row.
-        let prefix = row.encoded().len() - reference.encoded().len();
-        body.extend_from_slice(&row.encoded()[..prefix]);
-        cbor::write_head(0, new, &mut body);
-    }
-    if position == rows.len() {
-        new_row(&mut body, &mut children);
     }
     let size = 8 + children.len() * 32 + body.len();
     if children.len() > 1024 || size > DIRECTORY_LEAF_LIMIT || size > budget.directory_write_limit {
@@ -1231,6 +1260,19 @@ fn insert_page<S: ObjectStore + ?Sized>(
     {
         return Ok(pages);
     }
+    let splice_branches = {
+        #[cfg(test)]
+        {
+            !SPLICE_DISABLED.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(test))]
+        {
+            true
+        }
+    };
+    if object.kind == 4 && splice_branches {
+        return splice_branch(store, root, &object, entry, replace, budget, depth);
+    }
     match directory(&object)? {
         DirectoryNode::Leaf(mut entries) => {
             let write_limit = if object.canonical_len() > budget.directory_write_limit {
@@ -1254,7 +1296,10 @@ fn insert_page<S: ObjectStore + ?Sized>(
                 Err(i) => entries.insert(i, entry),
             }
             let (v, c) = encode_leaf(&entries);
-            if fits_leaf(&v, &c) && canonical_size(&v, &c) <= budget.directory_write_limit {
+            if entries.len() <= DIRECTORY_WRITE_ROWS
+                && fits_leaf(&v, &c)
+                && canonical_size(&v, &c) <= budget.directory_write_limit
+            {
                 let reference = put_tree_value(store, Some(root), 3, v, &c)?;
                 return Ok(vec![(
                     entries.last().map(|e| e.name.clone()).unwrap_or_default(),
@@ -1280,6 +1325,114 @@ fn insert_page<S: ObjectStore + ?Sized>(
             batch::emit_branches(store, height, &fences, budget, Some(root))
         }
     }
+}
+
+// Keep branch fences borrowed from their authenticated page while changing
+// one child path. The common case no longer allocates owned names and CBOR
+// trees for every sibling, or encodes those trees again merely to size them.
+fn splice_branch<S: ObjectStore + ?Sized>(
+    store: &mut S,
+    root: ObjectRef,
+    object: &CanonicalObject,
+    entry: Entry,
+    replace: bool,
+    budget: &mut Budget,
+    depth: usize,
+) -> Result<Pages> {
+    use crate::v1::cbor_view;
+    if object.version != 1 || object.canonical_len() > PAGE_LIMIT {
+        return Err(corrupt("directory branch schema or size"));
+    }
+    let [height, rows] = cbor_view::admitted(&object.bytes)?.fields()?;
+    let height = height.uint()?;
+    if !(1..=16).contains(&height) {
+        return Err(corrupt("directory branch height"));
+    }
+    let mut fences = Vec::with_capacity(rows.array()?.len());
+    for row in rows.array()? {
+        let [name, index] = row?.fields()?;
+        let name = name.bytes()?;
+        check_key(name)?;
+        if fences
+            .last()
+            .is_some_and(|(prior, _): &(&[u8], ObjectRef)| *prior >= name)
+        {
+            return Err(corrupt("directory fence ordering"));
+        }
+        let child = usize::try_from(index.uint()?)
+            .ok()
+            .and_then(|i| object.children.get(i))
+            .copied()
+            .ok_or_else(|| corrupt("child index out of bounds"))?;
+        fences.push((name, child));
+    }
+    if fences.len() < 2 {
+        return Err(corrupt("single-child directory branch"));
+    }
+    let position = fences
+        .partition_point(|(key, _)| *key < entry.name.as_slice())
+        .min(fences.len() - 1);
+    let changes = insert_page(store, fences[position].1, entry, replace, budget, depth + 1)?;
+    fences.splice(
+        position..position + 1,
+        changes.iter().map(|(key, child)| (key.as_slice(), *child)),
+    );
+    let (body, children) = encode_borrowed_branch(height, &fences);
+    let size = 8 + 32 * children.len() + body.len();
+    if children.len() <= MAX_CHILDREN && size <= PAGE_LIMIT && size <= budget.directory_write_limit
+    {
+        let reference = match store.rewrite_source(root)? {
+            Some(source) => store.rewrite(&source, 4, 1, &body, &children)?,
+            None => store.put(4, 1, &body, &children)?,
+        };
+        return Ok(vec![(fences.last().unwrap().0.to_vec(), reference)]);
+    }
+    let fences = fences
+        .into_iter()
+        .map(|(key, child)| (key.to_vec(), child))
+        .collect::<Vec<_>>();
+    batch::emit_branches(store, height, &fences, budget, Some(root))
+}
+
+fn encode_borrowed_branch(height: u64, fences: &[(&[u8], ObjectRef)]) -> (Vec<u8>, Vec<ObjectRef>) {
+    let mut body =
+        Vec::with_capacity(fences.iter().map(|(key, _)| key.len() + 8).sum::<usize>() + 16);
+    let mut children = Vec::<ObjectRef>::with_capacity(fences.len().min(MAX_CHILDREN));
+    // Preserve first-use child identity order, including the first physical
+    // occurrence when equal IDs have different hints. A bounded table avoids
+    // the old quadratic scan as resize workloads add hundreds of leaf pages.
+    let mut slots = [0u16; 2 * MAX_CHILDREN];
+    cbor::write_head(4, 2, &mut body);
+    cbor::write_head(0, height, &mut body);
+    cbor::write_head(4, fences.len() as u64, &mut body);
+    for (key, child) in fences {
+        let index = if children.len() >= MAX_CHILDREN {
+            // An overflowing branch is split by the caller. Keep exact
+            // encoding semantics while constructing its temporary body.
+            child_index(&mut children, *child)
+        } else {
+            let mut slot = u64::from_le_bytes(child.hash.0[..8].try_into().unwrap()) as usize
+                & (slots.len() - 1);
+            loop {
+                let stored = slots[slot];
+                if stored == 0 {
+                    children.push(*child);
+                    slots[slot] = children.len() as u16;
+                    break (children.len() - 1) as u64;
+                }
+                let index = usize::from(stored - 1);
+                if children[index].hash == child.hash {
+                    break index as u64;
+                }
+                slot = (slot + 1) & (slots.len() - 1);
+            }
+        };
+        cbor::write_head(4, 2, &mut body);
+        cbor::write_head(2, key.len() as u64, &mut body);
+        body.extend_from_slice(key);
+        cbor::write_head(0, index, &mut body);
+    }
+    (body, children)
 }
 fn split_branch(height: u64, fences: &[(Vec<u8>, ObjectRef)], page_limit: usize) -> Result<usize> {
     let limit = page_limit.min(PAGE_LIMIT);
@@ -1906,5 +2059,149 @@ mod splice_tests {
                 .count()
                 > 300
         );
+    }
+
+    #[test]
+    fn borrowed_branch_encoding_matches_owned_encoding_and_first_occurrence_order() {
+        for count in [0, 1, 2, 23, 24, 25, 255, 256, 1024, 1025] {
+            for repeated in [false, true] {
+                let fences: Vec<_> = (0..count)
+                    .map(|index| {
+                        // Force collisions in the bounded lookup table while keeping
+                        // distinct complete identities, then repeat IDs with new hints.
+                        let mut hash = [0; 32];
+                        hash[24..].copy_from_slice(
+                            &((if repeated { index / 2 } else { index }) as u64).to_le_bytes(),
+                        );
+                        (
+                            format!("key-{index:04}").into_bytes(),
+                            ObjectRef {
+                                hash: ObjectHash(hash),
+                                address: crate::v1::ChunkAddress {
+                                    offset: 12288 + index as u64 * 64,
+                                    length: 64,
+                                },
+                            },
+                        )
+                    })
+                    .collect();
+                let borrowed: Vec<_> = fences
+                    .iter()
+                    .map(|(key, child)| (key.as_slice(), *child))
+                    .collect();
+                let (expected, children) = encode_branch(2, &fences);
+                assert_eq!(
+                    encode_borrowed_branch(2, &borrowed),
+                    (cbor::encode(&expected), children)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrowed_branch_edits_match_decoded_multilevel_splits_and_resizes() {
+        fn run(spliced: bool) -> Vec<ObjectHash> {
+            SPLICE_DISABLED.store(!spliced, Ordering::Relaxed);
+            let mut store = MemoryStore::sealed();
+            let mut builder = ArchiveBuilder::new(&mut store);
+            builder.set_page_limit(1024).unwrap();
+            for index in 0..320 {
+                builder
+                    .add_file(&[format!("key-{:04}", index * 2).into_bytes()], &[7; 64])
+                    .unwrap();
+            }
+            let mut root = builder.finish_directory().unwrap();
+            let mut hashes = vec![root.hash];
+            assert!(directory_height(&store.get(root).unwrap()).unwrap() >= 2);
+            for ordinal in 0..240 {
+                let key = (ordinal * 197) % 640;
+                let size = [0, 8, 64, 768, 65536][ordinal % 5];
+                let mut builder =
+                    ArchiveBuilder::from_directory(&mut store, root, Limits::default());
+                builder
+                    .set_page_limit(if ordinal < 160 { 1024 } else { 4096 })
+                    .unwrap();
+                builder
+                    .set_file(
+                        &[format!("key-{key:04}").into_bytes()],
+                        &vec![ordinal as u8; size],
+                        empty_metadata(),
+                    )
+                    .unwrap();
+                root = builder.finish_directory().unwrap();
+                hashes.push(root.hash);
+            }
+            SPLICE_DISABLED.store(false, Ordering::Relaxed);
+            hashes
+        }
+        assert_eq!(run(true), run(false));
+    }
+
+    #[test]
+    fn inline_leaf_range_edits_preserve_rows_and_new_child_indices() {
+        for count in [0, 1, 23, 24, 25, 128] {
+            let mut store = MemoryStore::sealed();
+            let entries: Vec<_> = (0..count)
+                .map(|index| Entry {
+                    name: format!("key-{:04}", index * 2 + 1).into_bytes(),
+                    metadata: cbor::text_map(vec![("mode", Value::Uint(0o644))]),
+                    data: EntryData::File {
+                        length: 8,
+                        data: FileData::Inline((index as u64).to_le_bytes().to_vec()),
+                    },
+                })
+                .collect();
+            let (body, children) = encode_leaf(&entries);
+            assert!(children.is_empty());
+            let root = store.put(3, 1, &cbor::encode(&body), &children).unwrap();
+            let object = store.get(root).unwrap();
+            let mut extents = ExtentAccumulator::new();
+            extents.push_data(&mut store, b"xyz").unwrap();
+            let extent = extents.finish(&mut store).unwrap().unwrap();
+            for position in [0, count / 2, count] {
+                for replace in [false, true] {
+                    if replace && position == count {
+                        continue;
+                    }
+                    for child in [false, true] {
+                        let entry = Entry {
+                            name: format!("key-{:04}", position * 2 + usize::from(replace))
+                                .into_bytes(),
+                            metadata: empty_metadata(),
+                            data: EntryData::File {
+                                length: 3,
+                                data: if child {
+                                    FileData::Extents(extent)
+                                } else {
+                                    FileData::Inline(b"new".to_vec())
+                                },
+                            },
+                        };
+                        let mut expected = entries.clone();
+                        if replace {
+                            expected[position] = entry.clone();
+                        } else {
+                            expected.insert(position, entry.clone());
+                        }
+                        let (body, children) = encode_leaf(&expected);
+                        let result = splice_leaf(
+                            &mut store,
+                            root,
+                            &object,
+                            &entry,
+                            replace,
+                            &Budget::new(Limits::default()),
+                        )
+                        .unwrap()
+                        .unwrap();
+                        assert_eq!(result.len(), 1);
+                        assert_eq!(result[0].0, expected.last().unwrap().name);
+                        let actual = store.get(result[0].1).unwrap();
+                        assert_eq!(actual.bytes, cbor::encode(&body));
+                        assert_eq!(actual.children, children);
+                    }
+                }
+            }
+        }
     }
 }

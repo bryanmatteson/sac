@@ -204,9 +204,9 @@ impl DiskRefs {
             .transpose()
     }
 }
-pub(super) struct DiskStack {
-    entries: Option<FixedRecordStack<45>>,
-    resident: Vec<[u8; 45]>,
+pub(super) struct DiskStack<const BYTES: usize = 45> {
+    entries: Option<FixedRecordStack<BYTES>>,
+    resident: Vec<[u8; BYTES]>,
     resident_limit: u64,
     len: u64,
     budget: temporary::Budget,
@@ -216,7 +216,7 @@ pub(super) struct DiskStack {
     refill_batches: u64,
 }
 const RESIDENT_STACK_FRAMES: u64 = 256;
-impl DiskStack {
+impl<const BYTES: usize> DiskStack<BYTES> {
     pub(super) fn with_budget(resident_limit: u64, budget: temporary::Budget) -> Result<Self> {
         if resident_limit > RESIDENT_STACK_FRAMES
             || (resident_limit != 0 && (resident_limit < 4 || !resident_limit.is_power_of_two()))
@@ -235,14 +235,11 @@ impl DiskStack {
             refill_batches: 0,
         })
     }
-    pub(super) fn push(&mut self, r: ObjectRef, expanded: bool) -> Result<()> {
+    pub(super) fn push_record(&mut self, bytes: [u8; BYTES]) -> Result<()> {
         let next = self
             .len
             .checked_add(1)
             .ok_or(Error::Limit("closure traversal depth"))?;
-        let mut bytes = [0; 45];
-        bytes[..44].copy_from_slice(&encode_ref(r));
-        bytes[44] = expanded as u8;
         if self.resident_limit != 0 {
             // Keep a hot top with room on both sides of the spill boundary.
             // Moving the entire window makes a push/pop pair repeatedly
@@ -274,7 +271,7 @@ impl DiskStack {
         self.len = next;
         Ok(())
     }
-    pub(super) fn pop(&mut self) -> Result<Option<(ObjectRef, bool)>> {
+    pub(super) fn pop_record(&mut self) -> Result<Option<[u8; BYTES]>> {
         if self.len == 0 {
             return Ok(None);
         }
@@ -286,7 +283,7 @@ impl DiskStack {
                     .entries
                     .as_mut()
                     .ok_or_else(|| corrupt("temporary spilled traversal stack"))?;
-                self.resident.resize(count, [0; 45]);
+                self.resident.resize(count, [0; BYTES]);
                 let result = entries.pop_many(&mut self.resident);
                 if let Err(error) = result {
                     self.resident.clear();
@@ -308,17 +305,11 @@ impl DiskStack {
                 .pop()?
                 .ok_or_else(|| corrupt("temporary traversal stack"))?
         };
-        let expanded = match bytes[44] {
-            0 => false,
-            1 => true,
-            _ => return Err(corrupt("temporary traversal record flag")),
-        };
-        let reference = decode_ref(&bytes[..44])?;
         if self.resident_limit != 0 {
             self.resident.pop();
         }
         self.len = next;
-        Ok(Some((reference, expanded)))
+        Ok(Some(bytes))
     }
     fn disk_bytes(&self) -> Result<u64> {
         Ok(self
@@ -326,6 +317,26 @@ impl DiskStack {
             .as_ref()
             .map(FixedRecordStack::disk_bytes)
             .unwrap_or(0))
+    }
+}
+impl DiskStack {
+    pub(super) fn push(&mut self, r: ObjectRef, expanded: bool) -> Result<()> {
+        let mut bytes = [0; 45];
+        bytes[..44].copy_from_slice(&encode_ref(r));
+        bytes[44] = expanded as u8;
+        self.push_record(bytes)
+    }
+    pub(super) fn pop(&mut self) -> Result<Option<(ObjectRef, bool)>> {
+        self.pop_record()?
+            .map(|bytes| {
+                let expanded = match bytes[44] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(corrupt("temporary traversal record flag")),
+                };
+                Ok((decode_ref(&bytes[..44])?, expanded))
+            })
+            .transpose()
     }
 }
 

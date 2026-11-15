@@ -19,6 +19,32 @@ impl SharedEntry {
             .ok_or_else(|| corrupt("child index"))
     }
     pub fn owned(&self) -> Result<Entry> {
+        EntryView {
+            object: self.object.as_ref().into(),
+            row: cbor_view::admitted(&self.object.bytes[self.row.clone()])?,
+        }
+        .owned()
+    }
+}
+
+/// One already admitted directory row, borrowing its page only for a visit.
+#[derive(Clone, Copy)]
+pub(crate) struct EntryView<'a> {
+    pub object: ObjectView<'a>,
+    pub row: Item<'a>,
+}
+impl<'a> EntryView<'a> {
+    pub fn fields(self) -> Result<[Item<'a>; 4]> {
+        self.row.fields()
+    }
+    pub fn child(self, item: Item<'_>) -> Result<ObjectRef> {
+        self.object
+            .children
+            .get(usize::try_from(item.uint()?).map_err(|_| corrupt("child index"))?)
+            .copied()
+            .ok_or_else(|| corrupt("child index"))
+    }
+    pub fn owned(self) -> Result<Entry> {
         let [n, k, m, v] = self.fields()?;
         let data = match k.uint()? {
             0 => {
