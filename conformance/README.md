@@ -10,6 +10,12 @@ bytes, corrupt trailer checksums, nonzero preamble reserved bytes with a valid
 digest, a truncated magic-only file, and discarded prerelease signatures/layouts
 including the former eight-byte signature. Valid files use exactly four ASCII
 magic bytes `SAC1` followed by four reserved zero bytes.
+Two immutable negative controls are complete historical archives. The May Koda
+prototype writer at `42499d45c` emitted `koda-sac-prototype-256.sac` using its
+original two-section test fixture. `sac-0.1.1-section-128.sac` is the minimal
+archive from SAC `f7a1c0955:conformance/sac/valid/minimal/fixture.sac`. Both
+original readers accepted their respective files. Rust and Python reject them
+at the current preamble. The generator checks their fixed SHA-256 digests.
 Extension vectors cover opaque profile closures, unsupported schemas of known
 core kinds beneath a profile, unknown optional core capabilities, and required
 core versus profile capabilities. Generic core recovery does not claim profile

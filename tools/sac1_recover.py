@@ -298,10 +298,10 @@ class Archive:
     def _admit(self):
         pre = self.read(0, 128)
         require(pre[:4] == MAGIC, "not a SAC1 file", "unsupported_schema")
-        require(pre[8] in (0, 1), "unsupported locator policy", "unsupported_schema")
-        self.policy = pre[8]
         require(pre[4:8] == bytes(4) and pre[9:16] == bytes(7) and pre[32:96] == bytes(64),
                 "nonzero preamble reserved bytes")
+        require(pre[8] in (0, 1), "unsupported locator policy", "unsupported_schema")
+        self.policy = pre[8]
         require((pre[16:32] != bytes(16)) == bool(self.policy), "invalid incarnation")
         self.preamble_digest = digest("SAC1/preamble", pre[:96])
         require(pre[96:] == self.preamble_digest, "preamble digest mismatch", "integrity_failure")

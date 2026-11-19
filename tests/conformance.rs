@@ -96,6 +96,12 @@ fn independent_sac1_vectors_agree_on_admission_snapshot_and_content() {
                     "{name}: {result:?}"
                 );
             }
+            if vector["error_class"] == "corrupt" {
+                assert!(
+                    matches!(result, Err(sac::Error::Corrupt(_))),
+                    "{name}: {result:?}"
+                );
+            }
             assert!(result.is_err(), "{name} must reject");
         }
     }

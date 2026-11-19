@@ -8,6 +8,12 @@ from pathlib import Path
 
 from test_sac1_recover import Builder, h
 
+# Original artifacts. Regeneration must preserve their independently recorded bytes.
+HISTORICAL = {
+    "koda-sac-prototype-256": "5e3c8585441802d1985c77ed41301909be789c5fbfc944112ee1e5819e1364c9",
+    "sac-0.1.1-section-128": "a3bd424023aaf8b9a35d2add038eb8959261708a3d4d6156512d74bf8de20f1f",
+}
+
 
 def vectors():
     cases = {}
@@ -67,12 +73,20 @@ def main():
     root = Path(__file__).resolve().parent.parent / "conformance"
     outputs = {}
     rows = []
-    for name, (data, valid, snapshot, content) in sorted(vectors().items()):
+    cases = vectors()
+    for name, digest in HISTORICAL.items():
+        data = (root / "invalid" / f"{name}.sac").read_bytes()
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise SystemExit(f"historical fixture digest mismatch: {name}")
+        cases[name] = (data, False, None, None)
+    for name, (data, valid, snapshot, content) in sorted(cases.items()):
         relative = f"{'valid' if valid else 'invalid'}/{name}.sac"
-        outputs[relative] = data
+        if name not in HISTORICAL:
+            outputs[relative] = data
         rows.append({"file": relative, "valid": valid, "sha256": hashlib.sha256(data).hexdigest(),
                      "snapshot": snapshot, "content_hex": content,
-                     "error_class": "unsupported" if name in ("reserved-core-schema-in-profile", "required-core-capability") else None})
+                     "error_class": "corrupt" if name in HISTORICAL else
+                     "unsupported" if name in ("reserved-core-schema-in-profile", "required-core-capability") else None})
     outputs["manifest.json"] = (json.dumps({"format": "SAC1", "vectors": rows}, indent=2) + "\n").encode()
     if args.check:
         mismatches = [name for name, data in outputs.items()

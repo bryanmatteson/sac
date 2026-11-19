@@ -18,6 +18,14 @@
       "error_class": null
     },
     {
+      "file": "invalid/koda-sac-prototype-256.sac",
+      "valid": false,
+      "sha256": "5e3c8585441802d1985c77ed41301909be789c5fbfc944112ee1e5819e1364c9",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": "corrupt"
+    },
+    {
       "file": "valid/live.sac",
       "valid": true,
       "sha256": "952d3e6fe781b52990b11813f79ae4e0df420980879f35350fbf67debdee4008",
@@ -72,6 +80,14 @@
       "snapshot": null,
       "content_hex": null,
       "error_class": "unsupported"
+    },
+    {
+      "file": "invalid/sac-0.1.1-section-128.sac",
+      "valid": false,
+      "sha256": "a3bd424023aaf8b9a35d2add038eb8959261708a3d4d6156512d74bf8de20f1f",
+      "snapshot": null,
+      "content_hex": null,
+      "error_class": "corrupt"
     },
     {
       "file": "valid/sealed.sac",

@@ -136,6 +136,8 @@ class RecoveryTests(unittest.TestCase):
                     error = self.error(path)
                     if vector.get("error_class") == "unsupported":
                         self.assertIn(error.category, ("unsupported_schema", "unsupported_capability"))
+                    if vector.get("error_class") == "corrupt":
+                        self.assertEqual(error.category, "malformed_input")
                     continue
                 with sac.Archive(path) as archive:
                     self.assertEqual(archive.verify()["core"], "validated")
