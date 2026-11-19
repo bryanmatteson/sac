@@ -41,36 +41,14 @@ pub struct ArchiveReader<'a, S: ObjectStore + ?Sized> {
 }
 impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     pub fn open(store: &'a S, snapshot: ObjectRef, limits: Limits) -> Result<Self> {
-        let mut budget = Budget::new(limits.clone());
-        let object = budget.get(store, snapshot)?;
-        if object.kind != 2 || object.version != 1 {
-            return Err(corrupt("expected snapshot schema 1"));
-        }
-        let body = cbor::decode(&object.bytes)?;
-        let fields = values(&body)?;
-        if fields.len() != 3 {
-            return Err(corrupt("snapshot arity"));
-        }
-        let directory = child(&object, &fields[0])?;
-        budget.check_reference(snapshot, directory)?;
-        for feature in values(&fields[2])? {
-            let f = values(feature)?;
-            if f.len() != 4 {
-                return Err(corrupt("capability arity"));
-            }
-            if f[0] == Value::Null && f[3] == Value::Bool(true) {
-                return Err(Error::Unsupported(format!(
-                    "required core capability {:?}",
-                    f[1]
-                )));
-            }
-        }
+        let parts = crate::profiles::SnapshotProfiles::discover(store, snapshot, &limits)?;
+        parts.require_core_support()?;
         Ok(Self {
             store,
             snapshot,
-            directory,
+            directory: parts.directory(),
+            has_profiles: !parts.profiles().is_empty(),
             limits,
-            has_profiles: !values(&fields[1])?.is_empty(),
             rows: Default::default(),
         })
     }

@@ -6,8 +6,18 @@ Build the production tools with `cargo build --release --bin sac`. The default
 features include the native file backend and compression. The Rust native
 writer also supports `NativeStore::set_compression_level(0)` for raw,
 latency-sensitive live appends; CLI compression defaults remain level 1.
-All commands use current SAC1 archives. `sac inspect` reports selected-root admission without
-claiming complete graph or profile verification.
+All commands use current SAC1 archives. `sac inspect archive.sac` reports selected-root
+admission, the snapshot’s profile declarations (ID, version and root hash) and its
+feature declarations (scope, ID, version and required flag). By default each profile
+reports `unchecked`. Discovery reads the snapshot without following profile roots.
+
+`sac inspect archive.sac --validate-profiles` additionally runs the built-in
+`sac.metadata.v1` validator. Each supported declaration reports `valid` or
+`invalid`. A known profile with an unsupported version or required feature
+reports `unsupported`. Other owners’ declarations stay `unchecked`. An invalid
+profile produces the report on stdout and exit status 1. Unsupported or unchecked
+profiles are informational. Limit and I/O errors fail the operation. Full core
+verification is available through `sac verify`.
 
 The Rust `MemtableStore` API provides a WAL-backed key/value overlay with
 periodic checkpoints; see [the API notes](api-notes.md#durable-memtable).

@@ -62,6 +62,7 @@ The minimum supported Rust version is 1.90.
 ```sh
 sac pack ./files portable.sac
 sac inspect portable.sac
+sac inspect portable.sac --validate-profiles
 sac verify portable.sac
 sac list portable.sac
 sac read portable.sac images/program.bin --offset 4096 --length 512 > range.bin

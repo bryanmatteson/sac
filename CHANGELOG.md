@@ -2,6 +2,11 @@
 
 ## Unreleased — 0.2.0 prerelease
 
+- Add typed snapshot profile discovery, authenticated profile-root access and
+  caller-supplied semantic validators. `sac inspect` lists profiles and capabilities,
+  and `--validate-profiles` checks generic metadata. Add two complete historical
+  section archives to the rejection corpus.
+
 - Added the public authenticated `LiveMap` editor and native live-map entry point,
   with a bucketed trie delta, incremental checkpoints, durable native publication,
   explicit ordinary-resource export and experimental bucket snapshot import.

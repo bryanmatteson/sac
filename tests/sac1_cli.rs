@@ -37,6 +37,99 @@ fn snapshot(archive: &Path) -> String {
 }
 
 #[test]
+fn inspect_reports_discovery_and_explicit_owner_validation() {
+    use sac::cbor::{self, Value};
+    use sac::resources::{self, Limits, Profile};
+    use sac::v1::metadata::{MetadataEditor, PROFILE_ID};
+    use sac::{MemoryStore, ObjectStore};
+
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("conformance/valid");
+    let opaque = fixtures.join("required-profile-capability.sac");
+    let inspect = |path: &Path, validate: bool| {
+        let mut cmd = command();
+        cmd.arg("inspect").arg(path);
+        if validate {
+            cmd.arg("--validate-profiles");
+        }
+        let output = cmd.output().unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.success(), report)
+    };
+    for validate in [false, true] {
+        let (ok, result) = inspect(&opaque, validate);
+        assert!(ok);
+        let p = &result["profiles"][0];
+        assert_eq!(p["id"], "example.profile");
+        assert_eq!(p["version"], 1);
+        assert_eq!(p["root"].as_str().unwrap().len(), 64);
+        assert_eq!(p["validation"], "unchecked");
+        assert_eq!(result["features"][0]["scope"], "example.profile");
+        assert_eq!(result["features"][0]["required"], true);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("profile.sac");
+    let mut store = MemoryStore::sealed();
+    let directory = store.put(3, 1, &[0x80], &[]).unwrap();
+    let base = resources::snapshot(&mut store, directory, vec![], vec![]).unwrap();
+    let mut edit = MetadataEditor::open(&mut store, base, Limits::default()).unwrap();
+    edit.set("example.title", &Value::text("title")).unwrap();
+    let selected = edit.finish().unwrap();
+    fs::write(
+        &file,
+        sac::pack_snapshot(&store, selected, Vec::new()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        inspect(&file, false).1["profiles"][0]["validation"],
+        "unchecked"
+    );
+    let (ok, result) = inspect(&file, true);
+    assert!(ok);
+    assert_eq!(result["profiles"][0]["validation"], "valid");
+
+    let mut builder = resources::ArchiveBuilder::new(&mut store);
+    builder
+        .add_file(&[b"example.title".to_vec()], &[0x18, 0x00])
+        .unwrap();
+    let invalid_values = builder.finish_directory().unwrap();
+    let root_payload = &[0x81, 0x00][..];
+    for (version, payload, child, state, success) in [
+        (1, b"bad root".as_slice(), directory, "invalid", false),
+        (1, root_payload, invalid_values, "invalid", false),
+        (2, root_payload, directory, "unsupported", true),
+    ] {
+        let body = cbor::encode(&Value::Array(vec![
+            Value::text(PROFILE_ID),
+            Value::text("root"),
+            Value::Uint(version.into()),
+            Value::bytes(payload),
+        ]));
+        let root = store.put(8, 1, &body, &[child]).unwrap();
+        let selected = resources::snapshot(
+            &mut store,
+            directory,
+            vec![Profile {
+                id: PROFILE_ID.into(),
+                version,
+                root,
+            }],
+            vec![],
+        )
+        .unwrap();
+        fs::write(
+            &file,
+            sac::pack_snapshot(&store, selected, Vec::new()).unwrap(),
+        )
+        .unwrap();
+        assert!(inspect(&file, false).0);
+        let (ok, result) = inspect(&file, true);
+        assert_eq!(ok, success);
+        assert_eq!(result["profiles"][0]["validation"], state);
+        assert!(result["profiles"][0]["detail"].is_string());
+    }
+}
+
+#[test]
 fn recovery_records_repair_real_sealed_and_live_archives_without_overwriting() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("input.bin");

@@ -4,10 +4,11 @@
 //! Directory paths and unchanged values are shared between snapshots. Unknown
 //! keys, nested fields, profiles and feature declarations are never normalized.
 use super::cbor::{self, Value};
+use super::profiles::{ProfileRoot, ProfileValidator, SnapshotProfiles};
 use super::resources::{
-    self, ArchiveBuilder, ArchiveReader, DirectoryValidated, EntryKind, Feature, Limits, Profile,
+    self, ArchiveBuilder, ArchiveReader, Budget, DirectoryValidated, EntryKind, Limits, Profile,
 };
-use super::{CanonicalObject, Error, ObjectRef, ObjectStore, Result, cbor_view, corrupt, schema};
+use super::{Error, ObjectRef, ObjectStore, Result, cbor_view, corrupt, schema};
 use std::sync::OnceLock;
 
 pub const PROFILE_ID: &str = "sac.metadata.v1";
@@ -31,110 +32,46 @@ fn check_value(bytes: &[u8], limits: &Limits) -> Result<()> {
     cbor_view::view(bytes)?;
     Ok(())
 }
-fn value_fields(value: &Value) -> Result<&[Value]> {
-    match value {
-        Value::Array(fields) => Ok(fields),
-        _ => Err(corrupt("metadata array")),
-    }
-}
-fn text(value: &Value) -> Result<&str> {
-    match value {
-        Value::Text(text) => Ok(text),
-        _ => Err(corrupt("metadata text")),
-    }
-}
-fn integer(value: &Value) -> Result<u64> {
-    schema::uint(value)
-}
-fn child(object: &CanonicalObject, index: &Value) -> Result<ObjectRef> {
-    object
-        .children
-        .get(usize::try_from(integer(index)?).map_err(|_| corrupt("metadata child index"))?)
-        .copied()
-        .ok_or_else(|| corrupt("metadata child index"))
-}
-struct Snapshot {
-    directory: ObjectRef,
-    profiles: Vec<Profile>,
-    features: Vec<Feature>,
-}
-fn snapshot_parts<S: ObjectStore + ?Sized>(
+fn profile_directory<S: ObjectStore + ?Sized>(
     store: &S,
-    snapshot: ObjectRef,
+    root: &ProfileRoot,
     limits: &Limits,
-) -> Result<Snapshot> {
-    // Core capability admission and source/memory bounds stay in the owning reader.
-    ArchiveReader::open(store, snapshot, limits.clone())?;
-    let object = store.get(snapshot)?;
-    super::validate_core_object(&object)?;
-    let value = cbor::decode(&object.bytes)?;
-    let fields = value_fields(&value)?;
-    let mut profiles = Vec::new();
-    for profile in value_fields(&fields[1])? {
-        let p = value_fields(profile)?;
-        profiles.push(Profile {
-            id: text(&p[0])?.into(),
-            version: integer(&p[1])? as u32,
-            root: child(&object, &p[2])?,
-        });
-    }
-    let mut features = Vec::new();
-    for feature in value_fields(&fields[2])? {
-        let f = value_fields(feature)?;
-        let scope = match &f[0] {
-            Value::Null => None,
-            value => Some(text(value)?.to_owned()),
-        };
-        let required = f[3] == Value::Bool(true);
-        if required && scope.as_deref() == Some(PROFILE_ID) {
-            return Err(Error::Unsupported(format!(
-                "required metadata capability {}",
-                text(&f[1])?
-            )));
-        }
-        features.push(Feature {
-            scope,
-            id: text(&f[1])?.into(),
-            version: integer(&f[2])? as u32,
-            required,
-        });
-    }
-    Ok(Snapshot {
-        directory: child(&object, &fields[0])?,
-        profiles,
-        features,
-    })
-}
-fn profile_directory<S: ObjectStore + ?Sized>(store: &S, profile: &Profile) -> Result<ObjectRef> {
-    if profile.version != VERSION {
-        return Err(Error::Unsupported(format!(
-            "metadata profile version {}",
-            profile.version
-        )));
-    }
-    let object = store.get(profile.root)?;
-    super::validate_core_edges(&object, |reference| store.get_shared(reference))?;
-    let value = cbor::decode(&object.bytes)?;
-    let fields = value_fields(&value)?;
-    if object.kind != 8
-        || object.version != 1
-        || fields.len() != 4
-        || fields[0] != Value::text(PROFILE_ID)
-        || fields[1] != Value::text("root")
-        || fields[2] != Value::Uint(1)
-        || fields[3] != Value::bytes([0x81, 0x00])
-        || object.children.len() != 1
-    {
+) -> Result<ObjectRef> {
+    let [directory] = root.children() else {
+        return Err(corrupt("metadata root shape"));
+    };
+    if root.payload() != [0x81, 0x00] {
         return Err(corrupt("metadata root shape"));
     }
-    let directory = object.children[0];
-    let target = store.get(directory)?;
+    let target = Budget::new(limits.clone()).get(store, *directory)?;
     if !matches!(target.kind, 3 | 4) || target.version != 1 {
         return Err(corrupt("metadata directory kind"));
     }
-    super::validate_core_object(&target)?;
-    Ok(directory)
+    Ok(*directory)
 }
+
+/// Validates the metadata directory and every value for profile-aware tools.
+pub struct MetadataValidator;
+impl<S: ObjectStore + ?Sized> ProfileValidator<S> for MetadataValidator {
+    fn id(&self) -> &str {
+        PROFILE_ID
+    }
+    fn version(&self) -> u32 {
+        VERSION
+    }
+    fn validate(
+        &self,
+        store: &S,
+        snapshot: &SnapshotProfiles,
+        root: &ProfileRoot,
+        limits: &Limits,
+    ) -> Result<()> {
+        let directory = profile_directory(store, root, limits)?;
+        MetadataReader::from_directory(store, snapshot.snapshot(), directory, limits.clone())
+            .verify()
+    }
+}
+
 fn directory_reader<S: ObjectStore + ?Sized>(
     store: &S,
     snapshot: ObjectRef,
@@ -166,16 +103,14 @@ pub struct MetadataReader<'a, S: ObjectStore + ?Sized> {
 impl<'a, S: ObjectStore + ?Sized> MetadataReader<'a, S> {
     /// Open only the profile root and directory header, without hydrating values.
     pub fn open(store: &'a S, snapshot: ObjectRef, limits: Limits) -> Result<Option<Self>> {
-        let parts = snapshot_parts(store, snapshot, &limits)?;
-        parts
-            .profiles
-            .iter()
-            .find(|p| p.id == PROFILE_ID)
-            .map(|profile| {
-                let directory = profile_directory(store, profile)?;
-                Ok(Self::from_directory(store, snapshot, directory, limits))
-            })
-            .transpose()
+        let parts = SnapshotProfiles::discover(store, snapshot, &limits)?;
+        let Some(root) = parts.open_root(store, PROFILE_ID, VERSION, &limits, |_| false)? else {
+            return Ok(None);
+        };
+        let directory = profile_directory(store, &root, &limits)?;
+        Ok(Some(Self::from_directory(
+            store, snapshot, directory, limits,
+        )))
     }
     fn from_directory(
         store: &'a S,
@@ -261,7 +196,7 @@ impl<'a, S: ObjectStore + ?Sized> MetadataReader<'a, S> {
 pub struct MetadataEditor<'a, S: ObjectStore> {
     store: &'a mut S,
     original: ObjectRef,
-    parts: Snapshot,
+    parts: SnapshotProfiles,
     directory: Option<ObjectRef>,
     limits: Limits,
     changed: bool,
@@ -269,12 +204,10 @@ pub struct MetadataEditor<'a, S: ObjectStore> {
 }
 impl<'a, S: ObjectStore> MetadataEditor<'a, S> {
     pub fn open(store: &'a mut S, snapshot: ObjectRef, limits: Limits) -> Result<Self> {
-        let parts = snapshot_parts(store, snapshot, &limits)?;
+        let parts = SnapshotProfiles::discover(store, snapshot, &limits)?;
         let directory = parts
-            .profiles
-            .iter()
-            .find(|p| p.id == PROFILE_ID)
-            .map(|p| profile_directory(store, p))
+            .open_root(store, PROFILE_ID, VERSION, &limits, |_| false)?
+            .map(|root| profile_directory(store, &root, &limits))
             .transpose()?;
         Ok(Self {
             store,

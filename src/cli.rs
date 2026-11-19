@@ -37,7 +37,7 @@ usage:
   sac metadata set <live-archive> <key> <value-file|-> [--json] [--strip-local]
   sac metadata remove <live-archive> <key> [--strip-local]
   sac metadata export <archive|-> <new-directory>
-  sac inspect <archive>
+  sac inspect <archive> [--validate-profiles]
   sac privacy-wrap <sealed-archive> <new-wrapper> --recipient age1... [--recipient ...]
   sac privacy-open <wrapper> <new-sealed-archive> --identity <key-file> [--identity ...]
 
@@ -79,6 +79,7 @@ struct Args {
     live: bool,
     preserve: bool,
     metadata_json: bool,
+    validate_profiles: bool,
     no_punch: bool,
     strip_local: bool,
     preserve_encoding: bool,
@@ -129,6 +130,7 @@ impl Args {
             live: false,
             preserve: false,
             metadata_json: false,
+            validate_profiles: false,
             no_punch: false,
             strip_local: false,
             preserve_encoding: false,
@@ -187,6 +189,10 @@ impl Args {
             }
             if !literal && argument == "--" {
                 literal = true;
+                continue;
+            }
+            if !literal && argument == "--validate-profiles" && out.command == "inspect" {
+                out.validate_profiles = true;
                 continue;
             }
             if !literal && argument == "--no-punch" && out.command == "reclaim" {
@@ -1534,11 +1540,74 @@ fn resource_path(path: &OsStr) -> Result<Vec<Vec<u8>>> {
 }
 
 fn inspect(args: &Args) -> Result<()> {
+    use sac::profiles::{Profile, ProfileValidation, SnapshotProfiles};
+    fn row(profile: &Profile, validation: ProfileValidation) -> Json {
+        let (state, detail) = match validation {
+            ProfileValidation::Unchecked => ("unchecked", None),
+            ProfileValidation::Valid => ("valid", None),
+            ProfileValidation::Unsupported(reason) => ("unsupported", Some(reason)),
+            ProfileValidation::Invalid(reason) => ("invalid", Some(reason)),
+        };
+        let mut result = json!({"id":profile.id, "version":profile.version,
+            "root":profile.root.hash.to_string(), "validation":state});
+        if let Some(detail) = detail {
+            result["detail"] = Json::String(detail);
+        }
+        result
+    }
     let input = Input::open(&args.paths[0], args)?;
+    let mut limits = limits(args);
+    if input._scratch.is_some() {
+        limits.max_temp_bytes = available_temp(args, input.file.metadata()?.len())?;
+    }
     let reader = sac::v1::NativeReader::open_file(input.file)?;
-    emit(
-        &json!({"schema":"sac.inspection.v1","snapshot":reader.reader().snapshot().map(|r|r.hash.to_string()),"generation":reader.root().map(|p|p.generation.to_string()),"admission":"root-integrity-only","recovery_diagnostics":reader.reader().recovery_diagnostics}),
-    )
+    let snapshot = reader.reader().snapshot();
+    let mut profiles = Vec::new();
+    let mut features = Vec::new();
+    let mut invalid = false;
+    if let Some(snapshot) = snapshot {
+        let declarations = SnapshotProfiles::discover(&reader, snapshot, &limits)?;
+        if args.validate_profiles {
+            let reports = declarations.validate(
+                &reader,
+                &[&sac::v1::metadata::MetadataValidator],
+                &limits,
+            )?;
+            for report in reports {
+                invalid |= matches!(report.validation, ProfileValidation::Invalid(_));
+                profiles.push(row(report.profile, report.validation));
+            }
+        } else {
+            profiles.extend(
+                declarations
+                    .profiles()
+                    .iter()
+                    .map(|p| row(p, ProfileValidation::Unchecked)),
+            );
+        }
+        features.extend(declarations.features().iter().map(
+            |f| json!({"scope":f.scope, "id":f.id, "version":f.version, "required":f.required}),
+        ));
+    }
+    let report = json!({"schema":"sac.inspection.v1","snapshot":snapshot.map(|r|r.hash.to_string()),
+        "generation":reader.root().map(|p|p.generation.to_string()),"admission":"root-integrity-only",
+        "profiles":profiles,"features":features,"recovery_diagnostics":reader.reader().recovery_diagnostics});
+    let mut output = serde_json::to_vec(&report)?;
+    output.push(b'\n');
+    if output.len() as u64 > args.max_output {
+        return Err(failure(
+            "LimitExceeded",
+            "inspection output exceeds byte limit",
+        ));
+    }
+    io::stdout().lock().write_all(&output)?;
+    if invalid {
+        return Err(failure(
+            "Integrity",
+            "application profile validation failed",
+        ));
+    }
+    Ok(())
 }
 
 struct RawInput(std::sync::Mutex<File>);

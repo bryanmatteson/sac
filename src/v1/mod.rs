@@ -9,6 +9,7 @@ pub mod metadata;
 pub mod native;
 #[cfg(feature = "privacy-age")]
 pub mod privacy;
+pub mod profiles;
 pub mod recovery;
 pub mod resources;
 mod schema;

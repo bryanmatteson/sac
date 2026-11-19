@@ -277,6 +277,15 @@ core does not mandate one packing policy or unique physical encoding.
 
 ## API and verification boundaries
 
+The typed `SnapshotProfiles` API reads declarations from one authenticated
+snapshot. Structural discovery can display every scoped capability. Content
+operations require supported core capabilities. Opening a profile checks its
+version, required scoped capabilities and the binding of its kind-8 root before
+returning the payload. A caller-supplied profile validator owns the semantic
+verdict for that declaration. An unclaimed profile is unchecked. A limit or I/O
+error leaves verification incomplete. These API operations use the existing
+snapshot and profile record schemas.
+
 `ReadAt` supplies checked `len()` and exact positional reads. `Reader::open_at`
 admits the bounded selected commit/snapshot control region. `PositionalStore`
 implements read-only `ObjectStore` over a `ReadAt`. Native file users use

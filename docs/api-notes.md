@@ -13,6 +13,27 @@ portable byte-name trees, and `resources::ArchiveReader` reads bounded ranges,
 streams entries and performs confined extraction. `NativeStore` owns durable
 local publication; `NativeReader` pins an immutable admitted view.
 
+## Application profile discovery and validation
+
+`sac::profiles::SnapshotProfiles::discover(store, snapshot, &limits)` authenticates
+one schema-1 snapshot. `profiles()` and `features()` preserve canonical declaration
+order. `profile(id)` looks up an owner and `directory()` returns the resource
+root. Each declared profile has its exact version and an `ObjectRef`. Discovery
+also works on a snapshot with an unknown required core capability.
+
+`open_root(store, id, version, &limits, supports_feature)` returns an authenticated
+root or `None` for an absent profile. It checks required core and scoped capabilities
+and the root's kind, namespace, record type and version before exposing its payload
+and strong children. The owner interprets those bytes and validates its dependencies.
+
+Call `validate(store, validators, &limits)` with a slice of caller-selected
+`ProfileValidator` implementations for independent per-profile reports. A matching
+owner receives the bound root. An unknown owner stays unchecked, and an unsupported
+version or required feature is reported separately from an invalid payload.
+Resource limits and I/O failures return an operation error. The built-in
+`sac::v1::metadata::MetadataValidator` checks the flat key directory and every CBOR
+value. Profile reports apply to this snapshot and do not establish publisher trust.
+
 ## Write buffering
 
 ### Durable memtable

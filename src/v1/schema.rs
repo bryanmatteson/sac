@@ -427,10 +427,7 @@ impl CoreRole<'_> {
         match self {
             Self::Kinds(..) => {}
             Self::Profile { namespace, version } => {
-                let [n, t, v, _] = cbor_view::admitted(child.bytes)?.fields()?;
-                if n.text()? != namespace || t.text()? != "root" || v.uint()? != version {
-                    return Err(corrupt("profile declaration root binding mismatch"));
-                }
+                profile_root_payload(child.bytes, namespace, version)?;
             }
             Self::Branch { height, .. } => {
                 if cbor_view::admitted(child.bytes)?.fields::<2>()?[0].uint()? != height {
@@ -445,6 +442,18 @@ impl CoreRole<'_> {
         }
         Ok(())
     }
+}
+
+pub(crate) fn profile_root_payload<'a>(
+    bytes: &'a [u8],
+    namespace: &str,
+    version: u64,
+) -> Result<&'a [u8]> {
+    let [n, t, v, payload] = cbor_view::admitted(bytes)?.fields()?;
+    if n.text()? != namespace || t.text()? != "root" || v.uint()? != version {
+        return Err(corrupt("profile declaration root binding mismatch"));
+    }
+    payload.bytes()
 }
 
 pub(crate) fn visit_core_roles(
