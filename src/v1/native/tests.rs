@@ -2396,10 +2396,13 @@ fn appended_payload_copies_read_back_without_io() {
         (text.len() + std::mem::size_of::<ObjectRef>() + compressed.len() + DECODED_ENTRY_METADATA)
             as u64
     );
+    // The destination compresses at another level, so equal bytes on reread
+    // are the source's frame stored again rather than a fresh encoding. A
+    // level-0 destination keeps every object raw and drops them.
     let other_dir = tempfile::tempdir().unwrap();
     let mut destination =
         NativeStore::create_live(other_dir.path().join("db.sac"), [3; 16]).unwrap();
-    destination.set_compression_level(0);
+    destination.set_compression_level(crate::BULK_COMPRESSION_LEVEL);
     let leaf_copy = destination
         .put_verified(&store.verified_object(leaf).unwrap(), &[])
         .unwrap();

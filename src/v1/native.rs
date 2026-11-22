@@ -1843,10 +1843,14 @@ impl NativeStore {
         bytes: usize,
         hash: ObjectHash,
     ) -> Option<ObjectRef> {
+        #[cfg(unix)]
+        let has_free_frames = self.free_frames.is_some();
+        #[cfg(not(unix))]
+        let has_free_frames = false;
         if kind != 7
             || version != 1
             || bytes < 64 * 1024
-            || self.free_frames.is_some()
+            || has_free_frames
             || self.reused_unpublished
         {
             return None;
