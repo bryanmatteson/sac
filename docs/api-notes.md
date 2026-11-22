@@ -371,7 +371,21 @@ extent leaves and byte leaves, it caches authentication metadata and admits thei
 decoded payloads on read. Directory and ordered-map pages, extent branches and
 publication controls retain immediate read-after-write caching. The first deferred
 payload read decompresses it normally, then caches it under the existing byte budget. This keeps streams of newly written
-data from displacing decoded tree pages. A child with an authenticated occurrence
+data from displacing decoded tree pages. A writer that reads its new objects back,
+as a projection of each flush does, can keep decoded copies of its most
+recent payload appends apart from that cache with
+`NativeStore::set_appended_payload_budget`. Such a read takes no shared cache
+lock, file read, decompression or hash check: the writer framed each object
+under the hash that authenticated its content. The copies name exact
+occurrences in one file and outlive publications; the budget evicts the oldest
+first, payloads over 64 KiB are not copied, and a new file, frame reuse and
+`discard_disposable_caches` clear them. The default budget is zero. A closure
+copy from the writer reads its sources with `verified_object`, which the copies
+serve as well: a copy of an object of 4 KiB or more keeps its frame's
+compressed bytes, so a destination that stores frames stores them again, and a
+smaller object is encoded again, as after a decoded cache hit.
+`writer_read_statistics` counts reads served by the copies, by the shared cache
+and by the file. A child with an authenticated occurrence
 in the cache needs no read. The append index also authenticates children the writer
 appended when the hash, offset and length all match. The writer reads and
 authenticates every other child with a borrowed frame decoder. This records

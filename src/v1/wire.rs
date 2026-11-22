@@ -660,6 +660,26 @@ impl FrameEncoder {
             codec,
         )
     }
+    /// Encode an authenticated object with verified child identities and
+    /// destination locators. Retain its compressed payload when available.
+    pub fn encode_verified(
+        &mut self,
+        source: &super::VerifiedObject,
+        children: &[ObjectRef],
+    ) -> Result<&[u8]> {
+        source.validate_children(children)?;
+        let object = source.object();
+        match &source.compressed {
+            Some(compressed) => self.encode_payload(
+                object.kind,
+                object.canonical_len(),
+                children,
+                source.hash(),
+                super::EncodedPayload { codec: 1, bytes: compressed },
+            ),
+            None => self.encode_parts(object.kind, object.version, &object.bytes, children, 0, source.hash()),
+        }
+    }
     /// A frame from the Zstandard bytes of another frame. A
     /// decoder authenticated those bytes as the canonical bytes of this
     /// object; only the child locators differ.
@@ -845,6 +865,18 @@ pub fn decode_frame_owned(
     end: u64,
 ) -> Result<CanonicalObject> {
     FrameDecoder::default().decode_owned(reference, bytes, first, end)
+}
+
+/// Authenticate a frame from a detached content-addressed store. Every child
+/// is looked up by its verified identity within that store's own namespace.
+pub fn decode_detached_frame(expected: ObjectHash, frame: &[u8]) -> Result<CanonicalObject> {
+    let length = u32::try_from(frame.len()).map_err(|_| corrupt("detached frame size"))?;
+    let reference = ObjectRef { hash: expected, address: ChunkAddress { offset: 0, length } };
+    let object = decode_frame_inner(reference, frame, None)?;
+    if object.children.iter().any(|child| child.address != ChunkAddress::default()) {
+        return Err(corrupt("physical locator in detached frame"));
+    }
+    Ok(object)
 }
 
 /// Verify canonical content independently of damaged physical hints.

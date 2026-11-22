@@ -73,6 +73,7 @@ impl Workspace {
         bytes[45..].copy_from_slice(&byte_length.to_le_bytes()[..3]);
         self.pending.push_record(bytes)
     }
+    #[cfg(test)]
     pub(crate) fn pop(&mut self) -> Result<Option<(ObjectRef, bool)>> {
         Ok(self.pop_for_copy()?.map(|(r, expanded, _)| (r, expanded)))
     }
@@ -93,6 +94,7 @@ impl Workspace {
             })
             .transpose()
     }
+    #[cfg(test)]
     pub(crate) fn completed(&self, r: ObjectRef) -> Result<bool> {
         Ok(self.completed.get(&encode_ref(r))?.is_some())
     }

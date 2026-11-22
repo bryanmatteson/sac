@@ -62,6 +62,33 @@ fn save_has_two_barriers_and_durable_noop_has_none() {
 }
 
 #[test]
+fn verified_cold_capture_leaf_is_reused_after_detaching_its_source() {
+    let (dir, mut writer) = store();
+    let bytes = vec![0x7a; 64 * 1024];
+    let leaf = writer.put(7, 1, &bytes, &[]).unwrap();
+    let root = snapshot(&mut writer, &bytes);
+    writer.publish(root).unwrap();
+    drop(writer);
+
+    let mut writer = NativeStore::open(dir.path().join("db.sac"), true).unwrap();
+    let pin = writer.pin().unwrap();
+    let detached = pin.verified_object(leaf).unwrap();
+    drop(pin);
+    let before = writer.file_len();
+    assert_eq!(writer.put_verified(&detached, &[]).unwrap(), leaf);
+    assert_eq!(writer.file_len(), before);
+    writer.set_encode_threads(2);
+    let other = vec![0x7b; bytes.len()];
+    let mut batch = writer.prepare(7, 1, &[&bytes, &other]).unwrap().unwrap();
+    assert_eq!(writer.put_prepared(batch.remove(0)).unwrap(), leaf);
+    assert_eq!(writer.file_len(), before);
+    writer.discard_disposable_caches();
+    let reappended = writer.put_verified(&detached, &[]).unwrap();
+    assert_ne!(reappended.address, leaf.address);
+    assert_eq!(reappended.hash, leaf.hash);
+}
+
+#[test]
 fn prepared_duplicates_reuse_the_destination_or_encode_on_an_index_miss() {
     let (_source_dir, mut source) = store();
     let (_destination_dir, mut destination) = store();
@@ -86,6 +113,55 @@ fn prepared_duplicates_reuse_the_destination_or_encode_on_an_index_miss() {
     assert_eq!(transferred.hash, original.hash);
     assert_eq!(destination.get(transferred).unwrap().bytes, bytes);
 }
+#[test]
+fn closure_copy_reports_only_completed_subtrees_in_the_destination() {
+    let (_dir, mut source) = store();
+    let child = source.put(7, 1, b"observed child", &[]).unwrap();
+    let root = source.put(65000, 1, b"parent", &[child]).unwrap();
+    let mut destination = MemoryStore::sealed();
+    destination.put(7, 1, b"distinct placement", &[]).unwrap();
+    let mut copy = ClosureCopy::new().unwrap();
+    let mut completed = Vec::new();
+    let result = copy.copy_root_observing(
+        &source, &mut destination, root, |_, _| Ok(None),
+        |store, found| { store.validate_reference(found).unwrap(); completed.push(found); },
+        &|| false,
+    ).unwrap();
+    assert_eq!(completed, vec![destination.get(result).unwrap().children[0], result]);
+    assert_eq!(completed[0].hash, child.hash);
+    let mut reported = false;
+    let bad = ObjectRef { address: ChunkAddress { offset: u64::MAX, length: 64 }, ..root };
+    assert!(copy.copy_root_observing(&source, &mut destination, bad, |_, _| Ok(None),
+        |_, _| reported = true, &|| false).is_err());
+    assert!(!reported);
+}
+#[cfg(feature = "compression")]
+#[test]
+fn retained_compressed_frames_authenticate_detached_child_ids() {
+    let (_dir, mut source) = store();
+    source.set_compression_level(3);
+    let child = source.put(7, 1, b"child", &[]).unwrap();
+    let body = vec![0x55; 128 * 1024];
+    let parent = source.put(65002, 1, &body, &[child]).unwrap();
+    let verified = source.verified_object(parent).unwrap();
+    let detached = ObjectRef { hash: child.hash, address: ChunkAddress::default() };
+    let mut encoder = wire::FrameEncoder::default();
+    let frame = encoder.encode_verified(&verified, &[detached]).unwrap();
+    assert!(frame.len() < body.len() / 8);
+    let restored = wire::decode_detached_frame(parent.hash, frame).unwrap();
+    assert_eq!(restored.children, [detached]);
+    assert_eq!(restored.bytes, body);
+    assert!(wire::decode_detached_frame(child.hash, frame).is_err());
+    assert!(encoder.encode_verified(&verified, &[]).is_err());
+    let physical = encoder.encode_verified(&verified, &[child]).unwrap();
+    assert!(wire::decode_detached_frame(parent.hash, physical).is_err());
+    let mut memory = MemoryStore::sealed();
+    let raw = memory.put(7, 1, b"raw canonical bytes", &[]).unwrap();
+    let frame = encoder.encode_verified(&memory.verified_object(raw).unwrap(), &[]).unwrap();
+    assert_eq!(wire::decode_detached_frame(raw.hash, frame).unwrap(), memory.get(raw).unwrap());
+
+}
+
 #[test]
 fn verified_copy_preserves_identity_and_checks_relocated_physical_children() {
     let mut source = MemoryStore::sealed();
@@ -637,6 +713,22 @@ fn small_frame_appends_coalesce_and_cache_misses_drain_before_reading() {
     reader.validate().unwrap();
 }
 #[test]
+fn reader_identity_distinguishes_a_file_copy_from_a_second_descriptor() {
+    let (directory, mut store) = store();
+    let root = snapshot(&mut store, b"original");
+    store.publish(root).unwrap();
+    let original = store.pin().unwrap();
+    let path = directory.path().join("db.sac");
+    let hard_link = directory.path().join("alias.sac");
+    let copy = directory.path().join("copy.sac");
+    std::fs::hard_link(&path, &hard_link).unwrap();
+    std::fs::copy(&path, &copy).unwrap();
+    assert!(original.shares_backing_file(&store.pin().unwrap()).unwrap());
+    assert!(original.shares_backing_file(&NativeReader::open(&hard_link).unwrap()).unwrap());
+    assert!(!original.shares_backing_file(&NativeReader::open(&copy).unwrap()).unwrap());
+}
+
+#[test]
 fn complete_cache_visible_slot_is_stabilized_on_writable_reopen() {
     let (dir, mut store) = store();
     let s = snapshot(&mut store, b"first");
@@ -651,6 +743,8 @@ fn complete_cache_visible_slot_is_stabilized_on_writable_reopen() {
     let before = reopened.publication_statistics();
     assert_eq!(before.chunk_barriers, 1);
     assert_eq!(before.slot_syncs, 1);
+    assert_eq!(before.slot_writes, 0);
+    assert_eq!(before.appended_bytes, 0);
     reopened.publish(next).unwrap();
     assert_eq!(reopened.publication_statistics(), before);
 }
@@ -676,6 +770,25 @@ fn torn_slots_preserve_source_and_require_explicit_recovery() {
         assert_eq!(std::fs::read(&file).unwrap(), before);
     }
 }
+#[test]
+fn clean_writer_close_releases_only_its_unpublished_append_extent() {
+    let (dir, mut store) = store();
+    let selected = snapshot(&mut store, b"selected");
+    store.publish(selected).unwrap();
+    let end = store.reader().committed_end();
+    let incarnation = store.reader().header.incarnation;
+    let path = dir.path().join("db.sac");
+    let _orphan = snapshot(&mut store, b"unfinished");
+    let pin = store.pin().unwrap();
+    assert!(std::fs::metadata(&path).unwrap().len() > end);
+    drop(store);
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), end);
+    let reopened = NativeStore::open(&path, true).unwrap();
+    assert!(reopened.preserved_recovery_input().is_none());
+    assert_eq!(reopened.reader().header.incarnation, incarnation);
+    assert_eq!(pin.reader().snapshot().unwrap().hash, selected.hash);
+}
+
 #[test]
 fn append_barrier_failure_does_not_promote_orphan_or_delete_suffix() {
     let (dir, mut store) = store();
@@ -2219,4 +2332,124 @@ fn inherited_cache_miss_keeps_pending_appends_coalesced() {
         .unwrap()
         .validate()
         .unwrap();
+}
+
+#[test]
+fn appended_payload_copies_read_back_without_io() {
+    let (_dir, mut store) = store();
+    // Off by default: reading a payload append back is physical.
+    let cold = store.put(65000, 1, b"cold payload", &[]).unwrap();
+    let before = store.physical_statistics();
+    assert_eq!(store.get(cold).unwrap().bytes, b"cold payload");
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    assert_eq!(store.writer_read_statistics().copies_kept, 0);
+
+    store.set_appended_payload_budget(1 << 20);
+    let leaf = store.put(7, 1, b"byte leaf", &[]).unwrap();
+    let payload = store.put(65000, 2, b"warm payload", &[leaf]).unwrap();
+    let before = store.physical_statistics();
+    let reads = store.writer_read_statistics();
+    let object = store.get_verified_shared(payload).unwrap();
+    assert_eq!((object.kind, object.version), (65000, 2));
+    assert_eq!(object.bytes, b"warm payload");
+    assert_eq!(object.children, [leaf]);
+    assert!(Arc::ptr_eq(
+        &object,
+        &store.get_verified_shared(payload).unwrap()
+    ));
+    assert_eq!(store.get(leaf).unwrap().bytes, b"byte leaf");
+    assert_eq!(store.cached_object_type(payload).unwrap(), Some((65000, 2)));
+    store.validate_reference(payload).unwrap();
+    assert_eq!(store.physical_statistics(), before);
+    let counted = store.writer_read_statistics();
+    assert_eq!(counted.copy_hits - reads.copy_hits, 3);
+    assert_eq!(counted.file_reads, reads.file_reads);
+    assert_eq!(counted.copies_kept, 2);
+    // Only the exact occurrence, and the shared cache holds no payload copy.
+    let mut other = payload;
+    other.address.length -= 8;
+    assert_eq!(store.cached_object_type(other).unwrap(), None);
+    assert!(store.cache.get(store.file_identity, payload).is_none());
+    // A caller keeping frames is served by the copy. A small object's copy
+    // has no compressed bytes, so a frame-keeping destination encodes it.
+    let verified = store.verified_object(payload).unwrap();
+    assert!(Arc::ptr_eq(&verified.object, &object));
+    assert!(verified.compressed.is_none());
+    assert_eq!(store.physical_statistics(), before);
+    assert_eq!(
+        store.writer_read_statistics().file_reads,
+        counted.file_reads
+    );
+    // A large object's copy keeps the frame's compressed bytes, charged to
+    // the budget; a native destination stores them again.
+    let text = b"a large compressible payload ".repeat(200);
+    let kept = store.writer_read_statistics().copy_bytes;
+    let large_payload = store.put(65000, 6, &text, &[leaf]).unwrap();
+    let before = store.physical_statistics();
+    let verified = store.verified_object(large_payload).unwrap();
+    assert_eq!(store.physical_statistics(), before);
+    assert_eq!(verified.object().bytes, text);
+    let compressed = verified.compressed.clone().unwrap();
+    assert!(compressed.len() < text.len() / 4);
+    assert_eq!(
+        store.writer_read_statistics().copy_bytes - kept,
+        (text.len() + std::mem::size_of::<ObjectRef>() + compressed.len() + DECODED_ENTRY_METADATA)
+            as u64
+    );
+    let other_dir = tempfile::tempdir().unwrap();
+    let mut destination =
+        NativeStore::create_live(other_dir.path().join("db.sac"), [3; 16]).unwrap();
+    destination.set_compression_level(0);
+    let leaf_copy = destination
+        .put_verified(&store.verified_object(leaf).unwrap(), &[])
+        .unwrap();
+    let copied = destination.put_verified(&verified, &[leaf_copy]).unwrap();
+    destination.discard_disposable_caches();
+    let reread = destination.verified_object(copied).unwrap();
+    assert_eq!(reread.object().bytes, text);
+    assert_eq!(reread.compressed, Some(compressed.clone()));
+    // A closure copy of the writer's new objects reads none of them back.
+    let mut portable = MemoryStore::sealed();
+    let copied = ClosureCopy::new()
+        .unwrap()
+        .copy_root(&store, &mut portable, large_payload)
+        .unwrap();
+    assert_eq!(store.physical_statistics(), before);
+    assert_eq!(portable.get(copied).unwrap().bytes, text);
+
+    // Payloads over 64 KiB are read back from the file.
+    let large = vec![5; 70 * 1024];
+    let big = store.put(65000, 5, &large, &[]).unwrap();
+    assert_eq!(store.writer_read_statistics().copies_skipped, 1);
+    let before = store.physical_statistics();
+    assert_eq!(store.get(big).unwrap().bytes, large);
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+
+    // The budget evicts the oldest copies and refuses no append.
+    store.set_appended_payload_budget(DECODED_ENTRY_METADATA + 64);
+    let first = store.put(65000, 3, b"first", &[]).unwrap();
+    let second = store.put(65000, 3, b"second", &[]).unwrap();
+    assert!(store.writer_read_statistics().copies_evicted >= 2);
+    let before = store.physical_statistics();
+    assert_eq!(store.get(second).unwrap().bytes, b"second");
+    assert_eq!(store.physical_statistics(), before);
+    assert_eq!(store.get(first).unwrap().bytes, b"first");
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+
+    // Copies outlive a publication; discarding disposable caches ends them.
+    store.set_appended_payload_budget(1 << 20);
+    let late = store.put(65000, 4, b"late", &[]).unwrap();
+    let root = snapshot(&mut store, b"published");
+    store.publish(root).unwrap();
+    let before = store.physical_statistics();
+    assert_eq!(store.get(late).unwrap().bytes, b"late");
+    assert_eq!(store.physical_statistics(), before);
+    store.discard_disposable_caches();
+    assert_eq!(store.get(late).unwrap().bytes, b"late");
+    assert!(store.physical_statistics().read_bytes > before.read_bytes);
+    // The large copy kept the same compressed bytes as its frame in the file.
+    let file = store.verified_object(large_payload).unwrap();
+    assert_eq!(file.object().bytes, text);
+    assert_eq!(file.compressed, Some(compressed));
+    store.validate().unwrap();
 }

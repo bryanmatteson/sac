@@ -564,7 +564,22 @@ impl ClosureCopy {
         source: &S,
         destination: &mut D,
         root: ObjectRef,
+        resolve: impl FnMut(&D, ObjectRef) -> Result<Option<ObjectRef>>,
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<ObjectRef> {
+        self.copy_root_observing(source, destination, root, resolve, |_, _| {}, cancelled)
+    }
+
+    /// Report each completed destination subtree. The callback may retain a
+    /// placement hint, but readers must still check their own file identity
+    /// and committed extent. A callback does not indicate a durable commit.
+    pub fn copy_root_observing<S: ObjectStore + ?Sized, D: ObjectStore + ?Sized>(
+        &mut self,
+        source: &S,
+        destination: &mut D,
+        root: ObjectRef,
         mut resolve: impl FnMut(&D, ObjectRef) -> Result<Option<ObjectRef>>,
+        mut copied: impl FnMut(&D, ObjectRef),
         cancelled: &impl Fn() -> bool,
     ) -> Result<ObjectRef> {
         // Validate each physical occurrence and copy in the same postorder
@@ -607,6 +622,7 @@ impl ClosureCopy {
                         }
                         destination.validate_reference(rewritten)?;
                         self.copied.insert_cancellable(rewritten, cancelled)?;
+                        copied(destination, rewritten);
                         self.validated.insert_cancellable(&key, &[], cancelled)?;
                         continue;
                     }
@@ -678,6 +694,7 @@ impl ClosureCopy {
                             .insert_cancellable(&reference.hash.0, &[0], cancelled)?;
                     }
                     self.copied.insert_cancellable(rewritten, cancelled)?;
+                    copied(destination, rewritten);
                 }
                 self.validated.insert_cancellable(&key, &[], cancelled)?;
             }

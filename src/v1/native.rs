@@ -8,6 +8,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+mod fresh;
 pub(crate) mod graph;
 #[cfg(unix)]
 mod leases;
@@ -19,6 +20,7 @@ mod platform;
 mod spill;
 mod temporary;
 mod validation;
+use fresh::FreshAppends;
 #[cfg(unix)]
 pub use maintenance::{OnlineReclamation, ReclamationOptions, ReclamationStatistics};
 pub use memtable::{MemtableIoStatistics, MemtableOptions, MemtableStatistics, MemtableStore, Mutation};
@@ -50,6 +52,8 @@ pub struct NativeStore {
     fence: Option<File>,
     recent: DiskRefs,
     cache: Arc<CacheLock>,
+    // This writer's most recent payload appends; see `FreshAppends`.
+    fresh: FreshAppends,
     file_identity: u64,
     generation: Arc<FileGeneration>,
     io: Arc<PhysicalCounters>,
@@ -77,6 +81,22 @@ pub struct NativeStore {
     // Empty until the first check and after `file` is replaced.
     #[cfg_attr(not(unix), allow(dead_code))]
     node: std::sync::OnceLock<(u64, u64)>,
+}
+/// How a writer's object reads were served ([`NativeStore::writer_read_statistics`]):
+/// by its copies of recent payload appends, by the shared decoded cache, or
+/// by reading and authenticating the file. Counts accumulate from open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriterReadStatistics {
+    pub copy_hits: u64,
+    pub cache_hits: u64,
+    pub file_reads: u64,
+    /// Payload appends copied, copies the budget evicted, and appends not
+    /// copied (over 64 KiB or the whole budget).
+    pub copies_kept: u64,
+    pub copies_evicted: u64,
+    pub copies_skipped: u64,
+    /// Resident bytes the copies are charged now.
+    pub copy_bytes: u64,
 }
 // Coalesce small immutable frames before positional I/O. Reads that miss the
 // authenticated object cache drain this buffer only when they need buffered
@@ -304,6 +324,7 @@ impl NativeStore {
             fence: Some(fence),
             recent: DiskRefs::new()?,
             cache: new_cache(),
+            fresh: FreshAppends::default(),
             file_identity: next_file_identity(),
             generation: Arc::new(FileGeneration::default()),
             io: Arc::new(PhysicalCounters::default()),
@@ -403,6 +424,7 @@ impl NativeStore {
             fence,
             recent: DiskRefs::new()?,
             cache: new_cache(),
+            fresh: FreshAppends::default(),
             file_identity: next_file_identity(),
             generation: Arc::new(FileGeneration::default()),
             io,
@@ -449,24 +471,12 @@ impl NativeStore {
             store.finish_compaction(job)?;
         }
         if writable {
-            let publication = store
-                .root()
-                .ok_or_else(|| corrupt("live database has no publication"))?;
-            let trailer_offset = publication.committed_end - 160;
-            let trailer = read_trailer(
-                &store.file.lock().unwrap(),
-                &store.reader.header,
-                trailer_offset,
-                &store.io,
-            )?;
-            let slot = wire::Slot {
-                preamble_digest: store.reader.header.digest(),
-                generation: publication.generation,
-                trailer_offset,
-                trailer_digest: trailer.digest(),
-            };
+            // Admission checked the selected slot's checksum, parity and
+            // trailer under the exclusive writer fence. Its bytes are already
+            // present, including after a failed slot sync. Flush them in place:
+            // rewriting an identical bootstrap page forces copy-on-write on
+            // large cloned files and introduces a fresh torn-write opportunity.
             store.barrier(false)?;
-            store.write_publication_slot(&slot.encode(), publication.generation)?;
             store.barrier(true)?;
             verify_file_path(store.file.get_mut().unwrap(), &store.path)?;
         }
@@ -607,6 +617,19 @@ impl NativeStore {
     pub fn set_decoded_cache_budget(&self, bytes: usize) {
         self.cache.lock().unwrap().set_budget(bytes);
     }
+    /// Keep decoded copies of up to `bytes` of the payload objects this writer
+    /// appended most recently, for a writer that reads its new objects back.
+    /// Such a read then needs no shared cache, file I/O, decompression or hash
+    /// check. Payloads over 64 KiB are not copied. Zero, the default, keeps
+    /// none; the budget evicts the oldest copies, and a new file, a reused
+    /// frame and [`Self::discard_disposable_caches`] clear them.
+    pub fn set_appended_payload_budget(&mut self, bytes: usize) {
+        self.fresh.set_budget(bytes);
+    }
+    /// How this writer's reads were served, and its appended-payload copies.
+    pub fn writer_read_statistics(&self) -> WriterReadStatistics {
+        self.fresh.statistics()
+    }
     /// Bound the resident append-ID index independently of decoded objects.
     /// The default is 8 MiB. Lowering this budget spills an oversized table;
     /// lookups and deduplication remain exact after the spill. A failed spill
@@ -623,6 +646,7 @@ impl NativeStore {
     /// put may append a duplicate rather than scan historical frames.
     pub fn discard_disposable_caches(&mut self) {
         self.cache.lock().unwrap().clear();
+        self.fresh.clear();
         self.authentication = AuthenticationFrames::default();
         self.rewrite_edges = Vec::new();
         let budget = self.recent.0.budget.clone();
@@ -1075,6 +1099,7 @@ impl NativeStore {
         let resident = self.recent.0.resident_limit();
         self.recent = DiskRefs::with_budget(resident, index_budget);
         self.file_identity = next_file_identity();
+        self.fresh.clear();
         self.generation = Arc::new(FileGeneration::default());
         // Defer requested bootstrap roots and their ancestors until all other
         // dependencies have been emitted. This produces one physical copy per
@@ -1293,9 +1318,22 @@ impl NativeStore {
             self.reused_unpublished = true;
             self.file_identity = next_file_identity();
             self.cache.lock().unwrap().clear();
+            self.fresh.clear();
             self.recent.insert_cancellable(reference, &|| false)?;
             return Ok(reference);
         }
+        let structural = matches!(kind, 1..=4 | 6 | 8 | 9);
+        // A copy of a large payload keeps its Zstandard bytes (`FreshAppends`).
+        let compressed_copy = (retain_payload
+            && !structural
+            && frame[4] == 1
+            && self
+                .fresh
+                .keeps_compressed(8 + children.len() * 32 + bytes.len(), bytes.len()))
+        .then(|| {
+            let stored = u32::from_le_bytes(frame[8..12].try_into().unwrap()) as usize;
+            frame[wire::FRAME..wire::FRAME + stored].to_vec()
+        });
         let reference = ObjectRef {
             hash,
             address: ChunkAddress {
@@ -1340,12 +1378,13 @@ impl NativeStore {
         }
         let mut cache = self.cache.lock().unwrap();
         // Payload leaves feed parents through authenticated references. Extent
-        // leaves, byte leaves and opaque objects need no decoded copy
-        // until read. Retain mutable tree pages and publication controls for
-        // read-after-write locality without displacing them with leaf payloads.
-        let structural = matches!(kind, 1..=4 | 6 | 8 | 9);
-        let decoded = if retain_payload && structural {
-            cache.admit_append(
+        // leaves, byte leaves and opaque objects need no decoded copy in the
+        // shared cache until read. Retain mutable tree pages and publication
+        // controls there for read-after-write locality without displacing
+        // them with leaf payloads. A writer that reads its payloads back
+        // keeps them apart (`set_appended_payload_budget`).
+        if retain_payload && structural {
+            let decoded = cache.admit_append(
                 self.file_identity,
                 reference,
                 AppendObject {
@@ -1354,19 +1393,74 @@ impl NativeStore {
                     bytes,
                     children,
                 },
-            )
-        } else {
-            false
-        };
-        if !decoded {
-            cache.verify(self.file_identity, reference, (kind, version));
+            );
+            if !decoded {
+                cache.verify(self.file_identity, reference, (kind, version));
+            }
+            return Ok(reference);
+        }
+        cache.verify(self.file_identity, reference, (kind, version));
+        drop(cache);
+        if retain_payload && self.fresh.budget() != 0 {
+            self.fresh.admit(
+                self.file_identity,
+                reference,
+                CanonicalObject {
+                    kind,
+                    version,
+                    bytes: bytes.into_owned(),
+                    children: children.into_owned(),
+                },
+                compressed_copy,
+            );
         }
         Ok(reference)
+    }
+    /// This writer's copy of its payload append at `reference`, if kept.
+    fn fresh_object(&self, reference: ObjectRef) -> Option<&Arc<CanonicalObject>> {
+        self.fresh.get(self.file_identity, reference)
     }
     pub fn rehint(&self, source: &NativeReader, reference: ObjectRef) -> Result<Option<ObjectRef>> {
         rehint_to(self, self.file_identity, self.end, source, reference)
     }
 }
+// A clean writer can abandon the append frames it owns when its last handle
+// goes away. Readers only pin a published extent. An uncertain publication,
+// externally changed extent or replaced inode must enter normal recovery.
+impl Drop for NativeStore {
+    fn drop(&mut self) {
+        let committed = self.reader.committed_end();
+        if !self.writable
+            || self.poisoned
+            || self.pending.is_some()
+            || self.reader.header.policy != wire::LocatorPolicy::Live
+            || self.end <= committed
+            || self.reused_unpublished
+            || self.root().is_none()
+        {
+            return;
+        }
+        let (Ok(buffer), Ok(file)) = (self.append_buffer.get_mut(), self.file.get_mut()) else {
+            return;
+        };
+        let persisted_end = if buffer.bytes.is_empty() {
+            self.end
+        } else {
+            buffer.offset
+        };
+        if !buffer.failed
+            && persisted_end > committed
+            && file
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() == persisted_end)
+            && verify_file_path(file, &self.path).is_ok()
+        {
+            // Failure leaves the last published slot authoritative on reopen.
+            let _ = file.set_len(committed);
+        }
+    }
+}
+
 impl ObjectStore for NativeStore {
     fn get_verified_shared(&self, r: ObjectRef) -> Result<Arc<CanonicalObject>> {
         self.get_shared(r)
@@ -1374,6 +1468,9 @@ impl ObjectStore for NativeStore {
     fn cached_object_type(&self, reference: ObjectRef) -> Result<Option<(u16, u16)>> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
+        if let Some(object) = self.fresh_object(reference) {
+            return Ok(Some((object.kind, object.version)));
+        }
         Ok(self.cache.verified_type(self.file_identity, reference))
     }
     fn object_type(&self, reference: ObjectRef) -> Result<(u16, u16)> {
@@ -1391,10 +1488,11 @@ impl ObjectStore for NativeStore {
     fn validate_reference(&self, reference: ObjectRef) -> Result<()> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
-        if self
-            .cache
-            .verified_type(self.file_identity, reference)
-            .is_some()
+        if self.fresh_object(reference).is_some()
+            || self
+                .cache
+                .verified_type(self.file_identity, reference)
+                .is_some()
         {
             return Ok(());
         }
@@ -1550,6 +1648,11 @@ impl ObjectStore for NativeStore {
         }
         if let Some(reference) = self.recent.get(hash)? {
             self.admit_duplicate(reference)?;
+            return Ok(reference);
+        }
+        if let Some(reference) =
+            self.reuse_read_leaf(object.kind, object.version, object.bytes.len(), hash)
+        {
             return Ok(reference);
         }
         self.append_encoded(object.into(), hash, frame, None, true)
@@ -1730,6 +1833,34 @@ impl ObjectStore for NativeStore {
 }
 
 impl NativeStore {
+    // A cold writer has no append-ID index for earlier publications. A pin
+    // that authenticated a large byte leaf can donate its location. Recheck
+    // the physical frame before adoption; a cache hit alone cannot publish it.
+    fn reuse_read_leaf(
+        &mut self,
+        kind: u16,
+        version: u16,
+        bytes: usize,
+        hash: ObjectHash,
+    ) -> Option<ObjectRef> {
+        if kind != 7
+            || version != 1
+            || bytes < 64 * 1024
+            || self.free_frames.is_some()
+            || self.reused_unpublished
+        {
+            return None;
+        }
+        let reference = self.cache.lock().unwrap().leaf_location(self.file_identity, hash)?;
+        wire::validate_address(
+            reference.address,
+            self.reader.first_record_offset(),
+            self.reader.trailer_offset(),
+        ).ok()?;
+        self.authenticate_child(reference).ok()?;
+        Some(reference)
+    }
+
     fn admit_duplicate(&mut self, reference: ObjectRef) -> Result<()> {
         let scope = self.physical_read_scope().unwrap();
         wire::validate_address(reference.address, scope.first, scope.end)?;
@@ -1794,9 +1925,18 @@ impl NativeStore {
     fn shared_keeping(&self, r: ObjectRef, keep: bool) -> Result<ObjectRead> {
         let end = self.physical_read_scope().unwrap().end;
         wire::validate_address(r.address, self.reader.first_record_offset(), end)?;
+        // A caller keeping the frame copies its compressed bytes onward. A copy
+        // has them for a large object; a smaller one is encoded again, as after
+        // a decoded cache hit.
+        if let Some((object, compressed)) = self.fresh.get_encoded(self.file_identity, r) {
+            self.fresh.note_copy_hit();
+            return Ok((object, compressed.filter(|_| keep)));
+        }
         if let Some(object) = self.cache.get(self.file_identity, r) {
+            self.fresh.note_cache_hit();
             return Ok((object, None));
         }
+        self.fresh.note_file_read();
         let disk_end = self.readable_frame_end(r, end)?;
         read_object_keeping(
             &self.file.lock().unwrap(),
@@ -1901,6 +2041,11 @@ impl NativeStore {
             self.admit_duplicate(reference)?;
             return Ok(reference);
         }
+        if children.is_empty()
+            && let Some(reference) = self.reuse_read_leaf(kind, version, bytes.len(), hash)
+        {
+            return Ok(reference);
+        }
         // Zstandard bytes that a source authenticated as this object are
         // what this store's encoder makes from the same canonical bytes.
         // Store them again unless this store would keep the object raw.
@@ -2001,6 +2146,15 @@ impl NativeReader {
     }
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_file(options(false).open(path)?)
+    }
+    /// Whether two pins refer to the same open file, including independently
+    /// opened descriptors and hard links. A byte-for-byte file copy is distinct.
+    pub fn shares_backing_file(&self, other: &Self) -> Result<bool> {
+        if self.file_identity == other.file_identity {
+            return Ok(true);
+        }
+        Ok(same_file::Handle::from_file(self.file.try_clone()?)?
+            == same_file::Handle::from_file(other.file.try_clone()?)?)
     }
     pub fn reader(&self) -> &Reader {
         &self.reader
@@ -2274,6 +2428,11 @@ impl ObjectStore for NativeReader {
             reference,
             true,
         )?;
+        if object.kind == 7 && object.version == 1 && object.bytes.len() >= 64 * 1024
+            && object.children.is_empty()
+        {
+            self.cache.lock().unwrap().remember_leaf(self.file_identity, reference);
+        }
         Ok(VerifiedObject {
             hash: reference.hash,
             object,

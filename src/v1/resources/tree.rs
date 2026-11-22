@@ -391,10 +391,7 @@ fn splice_leaf<S: ObjectStore + ?Sized>(
     if children.len() > 1024 || size > DIRECTORY_LEAF_LIMIT || size > budget.directory_write_limit {
         return Ok(None);
     }
-    let reference = match store.rewrite_source(root)? {
-        Some(source) => store.rewrite(&source, 3, 1, &body, &children)?,
-        None => store.put(3, 1, &body, &children)?,
-    };
+    let reference = store.rewrite_at(root, 3, 1, &body, &children)?;
     let last = if position >= rows.len() - usize::from(replaced) {
         entry.name.clone()
     } else {
@@ -493,12 +490,8 @@ fn put_tree_value<S: ObjectStore + ?Sized>(
     value: Value,
     children: &[ObjectRef],
 ) -> Result<ObjectRef> {
-    if let Some(source) = prior
-        .map(|r| store.rewrite_source(r))
-        .transpose()?
-        .flatten()
-    {
-        store.rewrite(&source, kind, 1, &cbor::encode(&value), children)
+    if let Some(parent) = prior {
+        store.rewrite_at(parent, kind, 1, &cbor::encode(&value), children)
     } else {
         put_value(store, kind, value, children)
     }
@@ -862,6 +855,14 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         )
     }
     pub fn remove_file(&mut self, path: &[Vec<u8>]) -> Result<()> {
+        self.remove(path, false)
+    }
+    /// Remove one existing entry of any kind. A directory leaves with its
+    /// whole subtree in one edit; its pages stay intact for older roots.
+    pub fn remove_entry(&mut self, path: &[Vec<u8>]) -> Result<()> {
+        self.remove(path, true)
+    }
+    fn remove(&mut self, path: &[Vec<u8>], directories: bool) -> Result<()> {
         #[cfg(feature = "native")]
         if self.bulk.is_some() {
             return Err(Error::Unsupported(
@@ -872,7 +873,14 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveBuilder<'a, S> {
         let root = self.root.ok_or(Error::Missing)?;
         let mut budget = Budget::new(self.limits.clone());
         budget.directory_write_limit = self.page_limit;
-        self.root = Some(remove_path(self.store, root, path, &mut budget, 0)?);
+        self.root = Some(remove_path(
+            self.store,
+            root,
+            path,
+            directories,
+            &mut budget,
+            0,
+        )?);
         Ok(())
     }
     fn insert(
@@ -1024,6 +1032,7 @@ fn remove_path<S: ObjectStore + ?Sized>(
     store: &mut S,
     root: ObjectRef,
     path: &[Vec<u8>],
+    directories: bool,
     budget: &mut Budget,
     depth: usize,
 ) -> Result<ObjectRef> {
@@ -1033,7 +1042,7 @@ fn remove_path<S: ObjectStore + ?Sized>(
         let EntryData::Directory(child) = existing.data else {
             return Err(corrupt("path parent is not directory"));
         };
-        let replacement = remove_path(store, child, &path[1..], budget, depth + 1)?;
+        let replacement = remove_path(store, child, &path[1..], directories, budget, depth + 1)?;
         let entry = Entry {
             name: existing.name,
             metadata: existing.metadata,
@@ -1046,7 +1055,7 @@ fn remove_path<S: ObjectStore + ?Sized>(
         };
         return finish_directory_pages(store, height, updated, budget);
     }
-    if matches!(existing.data, EntryData::Directory(_)) {
+    if !directories && matches!(existing.data, EntryData::Directory(_)) {
         return Err(corrupt("remove_file requires file or symlink"));
     }
     match remove_page(store, root, &path[0], budget, depth)? {
@@ -1393,10 +1402,7 @@ fn splice_branch<S: ObjectStore + ?Sized>(
     let size = 8 + 32 * children.len() + body.len();
     if children.len() <= MAX_CHILDREN && size <= PAGE_LIMIT && size <= budget.directory_write_limit
     {
-        let reference = match store.rewrite_source(root)? {
-            Some(source) => store.rewrite(&source, 4, 1, &body, &children)?,
-            None => store.put(4, 1, &body, &children)?,
-        };
+        let reference = store.rewrite_at(root, 4, 1, &body, &children)?;
         return Ok(vec![(fences.last().unwrap().0.to_vec(), reference)]);
     }
     let fences = fences

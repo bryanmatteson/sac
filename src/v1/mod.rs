@@ -543,6 +543,22 @@ pub trait ObjectStore {
         let object = source.object();
         self.put(object.kind, object.version, object.bytes, children)
     }
+    /// Replace a persistent page using its actual previous occurrence. A
+    /// buffering store may defer this operation until its final page is
+    /// emitted. The destination still authenticates the prior and new edges.
+    fn rewrite_at(
+        &mut self,
+        parent: ObjectRef,
+        kind: u16,
+        version: u16,
+        bytes: &[u8],
+        children: &[ObjectRef],
+    ) -> Result<ObjectRef> {
+        match self.rewrite_source(parent)? {
+            Some(source) => self.rewrite(&source, kind, version, bytes, children),
+            None => self.put(kind, version, bytes, children),
+        }
+    }
     /// Obtain a bounded, source-bound prior parent for a checked tree update.
     /// None means use ordinary put. Native stores may also bind pages appended
     /// by this writer when their original full physical-edge layout is retained.

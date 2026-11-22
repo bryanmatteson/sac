@@ -2,6 +2,16 @@
 
 ## Unreleased — 0.2.0 prerelease
 
+- Add `NativeStore::set_appended_payload_budget`: a writer keeps decoded copies of
+  its most recent payload appends (up to 64 KiB each), so reading them back needs
+  no shared-cache lock, file read, decompression or hash check. Frame-keeping
+  reads (`verified_object`, as a closure copy makes) use them too: a copy of an
+  object of 4 KiB or more keeps its frame's compressed bytes. Off by default;
+  the budget evicts the oldest, and a new file, frame reuse and cache discard clear
+  them. `NativeStore::writer_read_statistics` counts how reads were served.
+  Add `ArchiveBuilder::remove_entry`, which removes a file or a directory subtree
+  in one edit, and `ArchiveReader::store`.
+
 - Add typed snapshot profile discovery, authenticated profile-root access and
   caller-supplied semantic validators. `sac inspect` lists profiles and capabilities,
   and `--validate-profiles` checks generic metadata. Add two complete historical

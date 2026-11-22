@@ -55,6 +55,10 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     pub fn snapshot(&self) -> ObjectRef {
         self.snapshot
     }
+    /// The store this reader resolves its snapshot from.
+    pub fn store(&self) -> &'a S {
+        self.store
+    }
     pub fn directory_root(&self) -> ObjectRef {
         self.directory
     }
@@ -236,6 +240,26 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     ) -> Result<()> {
         let mut budget = Budget::new(self.limits.clone());
         self.visit_internal(&mut budget, true, &mut |entry, _| visitor(entry))
+    }
+    /// Visit entries and optionally read their authenticated file bodies without
+    /// repeating a path lookup. File handles borrow the current traversal row.
+    pub fn visit_entries_with_files<F>(&self, mut visitor: F) -> Result<()>
+    where
+        F: FnMut(ResourceEntry, Option<VisitedFile<'_, 'a, S>>) -> Result<()>,
+    {
+        let mut budget = Budget::new(self.limits.clone());
+        self.visit_raw_with_budget(&mut budget, true, &mut |path, entry, _| {
+            let file = match &entry.data {
+                EntryData::File { length, data } => Some(VisitedFile {
+                    reader: self,
+                    entry: &entry,
+                    length: *length,
+                    data,
+                }),
+                _ => None,
+            };
+            visitor(entry.public(path.clone()), file)
+        })
     }
     pub(crate) fn visit_internal<F: FnMut(ResourceEntry, &mut Budget) -> Result<()>>(
         &self,
@@ -653,7 +677,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         self.verify_from(commit, budget)
     }
     fn verify_from(&self, root: ObjectRef, mut budget: Budget) -> Result<VerificationReport> {
-        let mut report = self.verify_namespace(&mut budget, false)?;
+        let mut report = self.verify_namespace(&mut budget)?;
         // Repeated immutable occurrences share graph validation. Namespace
         // expansion and file lengths are charged by verify_namespace.
         self.verify_graph(root, &mut budget)?;
@@ -662,23 +686,13 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         report.profile_checked = !self.has_profiles;
         Ok(report)
     }
-    fn verify_namespace(
-        &self,
-        budget: &mut Budget,
-        defer_byte_leaves_to_copy: bool,
-    ) -> Result<VerificationReport> {
+    fn verify_namespace(&self, budget: &mut Budget) -> Result<VerificationReport> {
         let mut report = VerificationReport {
             snapshot_id: self.snapshot.hash.0,
             root_admitted: true,
             ..Default::default()
         };
-        self.verify_directory(
-            self.directory,
-            0,
-            budget,
-            defer_byte_leaves_to_copy,
-            &mut report,
-        )?;
+        self.verify_directory(self.directory, 0, budget, &mut report)?;
         let snapshot = budget.get(self.store, self.snapshot)?;
         let snapshot_body = cbor::decode(&snapshot.bytes)?;
         for declaration in values(&values(&snapshot_body)?[1])? {
@@ -705,7 +719,6 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         root: ObjectRef,
         depth: usize,
         budget: &mut Budget,
-        defer_byte_leaves_to_copy: bool,
         report: &mut VerificationReport,
     ) -> Result<()> {
         budget.depth(depth)?;
@@ -730,18 +743,15 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                     let [_, storage, data] = value.fields::<3>()?;
                     if storage.uint()? == 1 {
                         let extent = entry.child(data)?;
-                        let mut sink = std::io::sink();
                         self.extents(
                             extent,
                             logical,
                             None,
                             0,
                             logical,
-                            if defer_byte_leaves_to_copy {
-                                None
-                            } else {
-                                Some(&mut sink)
-                            },
+                            // The graph walk authenticates every physical
+                            // byte occurrence and its declared extent length.
+                            None::<&mut std::io::Sink>,
                             budget,
                             0,
                         )?;
@@ -749,13 +759,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                     // Inline byte lengths and contents were authenticated by
                     // the intrinsic directory admission; no owned copy is needed.
                 }
-                1 => self.verify_directory(
-                    entry.child(value)?,
-                    depth + 1,
-                    budget,
-                    defer_byte_leaves_to_copy,
-                    report,
-                )?,
+                1 => self.verify_directory(entry.child(value)?, depth + 1, budget, report)?,
                 _ => {}
             }
             Ok(())
@@ -791,7 +795,7 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
         let mut verification = Budget::new(self.limits.clone());
         // The copy's direct role checks authenticate every extent byte leaf
         // before it is exported, including its declared length.
-        self.verify_namespace(&mut verification, true)?;
+        self.verify_namespace(&mut verification)?;
         let mut copy_limits = self.limits.clone();
         copy_limits.max_temp_bytes = copy_limits.max_temp_bytes.min(max_copy_temp_bytes);
         super::super::pack_commit_impl(
@@ -806,26 +810,38 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
     fn verify_graph(&self, root: ObjectRef, budget: &mut Budget) -> Result<()> {
         let mut graph = super::graph::Workspace::new(budget)?;
         graph.push(root, false, budget)?;
-        while let Some((reference, expanded)) = graph.pop()? {
+        let mut byte_lengths = [0; super::super::MAX_CHILDREN];
+        while let Some((reference, expanded, byte_length)) = graph.pop_for_copy()? {
             budget.time()?;
             if expanded {
                 graph.complete(reference, budget)?;
                 continue;
             }
-            if graph.completed(reference)? {
+            if graph.completed_for_copy(reference, byte_length)? {
                 continue;
             }
             graph.enter(reference, budget)?;
-            let object = budget.get(self.store, reference)?;
-            crate::v1::validate_core_edges(&object, |child| budget.get(self.store, child))?;
-            for child in &object.children {
-                budget.edge()?;
-                budget.check_reference(reference, *child)?;
-            }
-            graph.push(reference, true, budget)?;
-            for child in object.children.iter().rev() {
-                graph.push(*child, false, budget)?;
-            }
+            budget.visit_for_copy(self.store, reference, None, &mut |object, budget, _| {
+                if byte_length != 0 {
+                    super::super::schema::CoreRole::Bytes(u64::from(byte_length)).check::<false>(
+                        super::super::schema::CoreShape {
+                            kind: object.kind,
+                            version: object.version,
+                            bytes: object.bytes,
+                            child_count: object.children.len(),
+                        },
+                    )?;
+                }
+                budget.check_graph_children(self.store, reference, object, &mut byte_lengths, None)?;
+                if object.children.is_empty() {
+                    return graph.complete_for_copy(reference, object, budget);
+                }
+                graph.push(reference, true, budget)?;
+                for (index, child) in object.children.iter().enumerate().rev() {
+                    graph.push_for_copy(*child, byte_lengths[index], budget)?;
+                }
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -841,6 +857,32 @@ pub(crate) fn write_zeros<W: Write>(output: &mut W, mut count: u64, budget: &Bud
     Ok(())
 }
 
+/// File descriptor borrowed from an authenticated entry during traversal.
+pub struct VisitedFile<'r, 'a, S: ObjectStore + ?Sized> {
+    reader: &'r ArchiveReader<'a, S>,
+    entry: &'r Entry,
+    length: u64,
+    data: &'r FileData,
+}
+impl<S: ObjectStore + ?Sized> VisitedFile<'_, '_, S> {
+    pub fn contents(&self) -> FileContents<'_> {
+        match self.data {
+            FileData::Inline(bytes) => FileContents::Inline(bytes),
+            FileData::Extents(root) => FileContents::Extents { length: self.length, root: *root },
+        }
+    }
+    pub fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>> {
+        let length = usize::try_from(self.length).map_err(|_| Error::Limit("file length"))?;
+        if length > max_bytes.min(self.reader.limits.max_memory_bytes / 2) {
+            return Err(Error::Limit("bounded file output memory"));
+        }
+        let mut budget = Budget::new(self.reader.limits.clone());
+        budget.entry(self.length)?;
+        let mut output = Vec::with_capacity(length);
+        self.reader.read_entry(self.entry, 0, self.length, &mut output, &mut budget)?;
+        Ok(output)
+    }
+}
 /// Immutable file descriptor with retained authenticated backing. Repeated ranges
 /// avoid both path resolution and owned metadata decoding.
 pub struct OpenedFile<'r, 'a, S: ObjectStore + ?Sized> {

@@ -574,6 +574,10 @@ struct DecodedCache {
     track_encoding: bool,
     // The authenticated kind and version of one physical occurrence.
     verified: Lru<(u16, u16)>,
+    // Committed byte leaves observed through this file generation’s pins.
+    // Keeping locators separate from decoded bodies lets a cold writer reuse
+    // the capture after a verified closure has been detached and relocated.
+    leaf_locations: Lru<ChunkAddress>,
     windows: BTreeMap<(u64, u64), (Vec<u8>, u64, u64)>,
     window_oldest: BTreeSet<(u64, (u64, u64))>,
     window_bytes: usize,
@@ -612,6 +616,7 @@ impl DecodedCache {
         self.borrowed = Default::default();
         self.objects.clear();
         self.verified.clear();
+        self.leaf_locations.clear();
         self.windows.clear();
         self.window_oldest.clear();
         self.window_bytes = 0;
@@ -627,6 +632,9 @@ impl DecodedCache {
     }
     fn set_budget(&mut self, bytes: usize) {
         self.budget = bytes;
+        while self.leaf_locations.len() > self.leaf_location_limit() {
+            self.evict_leaf_location();
+        }
         let window_limit = (self.budget.saturating_sub(self.pinned_metadata) / 8).min(1024 * 1024);
         while self.window_bytes > window_limit {
             if !self.evict_window() {
@@ -638,6 +646,43 @@ impl DecodedCache {
                 break;
             }
         }
+    }
+    fn leaf_location_limit(&self) -> usize {
+        self.budget.saturating_sub(self.pinned_metadata) / 4 / DECODED_ENTRY_METADATA
+    }
+    fn evict_leaf_location(&mut self) -> bool {
+        if self.leaf_locations.remove_oldest().is_none() {
+            return false;
+        }
+        self.bytes -= DECODED_ENTRY_METADATA;
+        true
+    }
+    fn remember_leaf(&mut self, identity: u64, reference: ObjectRef) {
+        let limit = self.leaf_location_limit();
+        if limit == 0 {
+            return;
+        }
+        let key = (identity, reference.hash, 0, 0);
+        let age = self.tick();
+        if self.leaf_locations.touch(&key, age).is_some() {
+            return;
+        }
+        if self.leaf_locations.len() >= limit {
+            self.evict_leaf_location();
+        }
+        let available = self.budget.saturating_sub(self.pinned_metadata);
+        while self.bytes.saturating_add(DECODED_ENTRY_METADATA) > available {
+            if !self.evict_oldest() {
+                return;
+            }
+        }
+        self.leaf_locations.insert(key, reference.address, age, 0);
+        self.bytes += DECODED_ENTRY_METADATA;
+    }
+    fn leaf_location(&mut self, identity: u64, hash: ObjectHash) -> Option<ObjectRef> {
+        let age = self.tick();
+        let address = *self.leaf_locations.touch(&(identity, hash, 0, 0), age)?;
+        Some(ObjectRef { hash, address })
     }
     fn tick(&mut self) -> u64 {
         if self.clock == u64::MAX {
@@ -794,6 +839,9 @@ impl DecodedCache {
             return true;
         }
         let Some((key, (mut object, size, _), fronted)) = self.objects.remove_oldest() else {
+            if self.evict_leaf_location() {
+                return true;
+            }
             if let Some(read) = self.borrowed.iter_mut().find_map(Option::take) {
                 self.bytes -= read.retained_bytes();
                 return true;

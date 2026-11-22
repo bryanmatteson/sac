@@ -19,6 +19,25 @@ fn packed(files: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 #[test]
+fn traversal_files_read_inline_and_extent_bodies_at_the_visited_path() {
+    let body = vec![42; 32 * 1024];
+    let bytes = packed(&[("dir/large", &body), ("dir/small", b"abc")]);
+    let store = PositionalStore::open(bytes).unwrap();
+    let reader = ArchiveReader::open(&store, store.reader().snapshot().unwrap(), Limits::default()).unwrap();
+    let mut files = Vec::new();
+    reader.visit_entries_with_files(|entry, file| {
+        if let Some(file) = file {
+            assert!(file.read_bounded(2).is_err());
+            files.push((entry.path, file.read_bounded(body.len())?));
+        } else {
+            assert_eq!(entry.path, path("dir"));
+        }
+        Ok(())
+    }).unwrap();
+    assert_eq!(files, vec![(path("dir/large"), body), (path("dir/small"), b"abc".to_vec())]);
+}
+
+#[test]
 fn tiny_sealed_archive_and_verified_absence() {
     let payload = b"a tiny twenty bytes!";
     let bytes = packed(&[("hello.txt", payload)]);
@@ -171,6 +190,9 @@ fn sealed_export_does_not_reload_childless_objects_for_postorder() {
         payload_reads: std::cell::Cell::new(0),
     };
     let snapshot = source.source.reader().snapshot().unwrap();
+    let archive = ArchiveReader::open(&source, snapshot, Limits::default()).unwrap();
+    assert!(archive.verify().unwrap().content_verified);
+    assert_eq!(source.payload_reads.replace(0), 1, "one read per byte occurrence");
     let exported = sac::pack_snapshot(&source, snapshot, Vec::new()).unwrap();
     // One authenticated read checks the extent role and supplies the bytes
     // to the destination, without an eager role read or postorder reload.
@@ -273,6 +295,8 @@ fn combined_export_checks_extent_geometry_and_deferred_byte_roles() {
             .unwrap();
         let limits = Limits::default();
         let reader = ArchiveReader::open(&source, snapshot, limits.clone()).unwrap();
+        assert!(matches!(reader.verify(),
+            Err(sac::Error::Corrupt(message)) if message == expected_error));
         let mut output = Vec::new();
         assert!(matches!(
             reader.pack_verified_commit(commit, &mut output, limits.max_temp_bytes),
@@ -353,6 +377,7 @@ fn extent_ranges_and_combined_export_use_borrowed_pages_and_payloads() {
     let commit = sac::resources::commit(&mut source, snapshot, None, None).unwrap();
     let borrowed = BorrowedExtents(&source);
     let archive = ArchiveReader::open(&borrowed, snapshot, Limits::default()).unwrap();
+    assert!(archive.verify().unwrap().content_verified);
     let expected = b"data\0\0\0\0data";
     assert_eq!(archive.read_range(&path("file"), 0, 12).unwrap(), expected);
     assert_eq!(

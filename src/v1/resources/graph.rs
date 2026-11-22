@@ -49,14 +49,8 @@ mod resident {
             self.pending.push((r, false, byte_length));
             Ok(())
         }
-        pub(crate) fn pop(&mut self) -> Result<Option<(ObjectRef, bool)>> {
-            Ok(self.pending.pop().map(|(r, expanded, _)| (r, expanded)))
-        }
         pub(crate) fn pop_for_copy(&mut self) -> Result<Option<(ObjectRef, bool, u32)>> {
             Ok(self.pending.pop())
-        }
-        pub(crate) fn completed(&self, r: ObjectRef) -> Result<bool> {
-            Ok(self.completed.contains_key(&r))
         }
         pub(crate) fn completed_for_copy(&self, r: ObjectRef, byte_length: u32) -> Result<bool> {
             let Some(fact) = self.completed.get(&r) else {

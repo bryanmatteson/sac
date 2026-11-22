@@ -18,7 +18,7 @@ mod salvage;
 mod tree;
 pub use extract::{ExtractionEntry, ExtractionReport};
 pub use read::{
-    ArchiveReader, DirectoryValidated, Lookup, OpenedFile, ResourceView, VerificationReport,
+    ArchiveReader, DirectoryValidated, Lookup, OpenedFile, ResourceView, VerificationReport, VisitedFile,
 };
 #[cfg(feature = "native")]
 pub use salvage::{SalvageReport, salvage};
@@ -219,7 +219,7 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
             } else {
                 verification.as_mut()
             },
-            &mut |verified, budget, mut verification| {
+            &mut |verified, budget, verification| {
                 let object = verified.object();
                 if byte_length != 0 {
                     super::schema::CoreRole::Bytes(u64::from(byte_length)).check::<false>(
@@ -232,47 +232,7 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
                     )?;
                 }
                 if !expanded {
-                    byte_lengths[..object.children.len()].fill(0);
-                    super::schema::visit_core_roles(object, |index, role| {
-                        let child = object.children[index];
-                        if let super::schema::CoreRole::Bytes(length) = role {
-                            // A valid byte leaf has no children and exactly
-                            // eight canonical header bytes. Charge every role
-                            // edge now, but authenticate its actual kind/length
-                            // on the ordinary copy visit, before writing it.
-                            if length == 0 || length > (super::MAX_CHUNK_SIZE - 8) as u64 {
-                                return Err(corrupt("extent byte length"));
-                            }
-                            let length = length as u32;
-                            let expected = &mut byte_lengths[index];
-                            if *expected != 0 && *expected != length {
-                                return Err(corrupt("extent byte length"));
-                            }
-                            *expected = length;
-                            budget.charge_byte_role(child, length, verification.as_deref_mut())?;
-                            return Ok(());
-                        }
-                        budget.visit_for_copy(
-                            source,
-                            child,
-                            verification.as_deref_mut(),
-                            &mut |child, _, _| {
-                                role.check::<false>(super::schema::CoreShape {
-                                    kind: child.kind,
-                                    version: child.version,
-                                    bytes: child.bytes,
-                                    child_count: child.children.len(),
-                                })
-                            },
-                        )
-                    })?;
-                    for child in object.children {
-                        budget.edge()?;
-                        if let Some(verification) = &mut verification {
-                            verification.charge_edge()?;
-                        }
-                        budget.check_reference(r, *child)?;
-                    }
+                    budget.check_graph_children(source, r, object, &mut byte_lengths, verification)?;
                     // Retain only references across descendants, never payloads.
                     if !object.children.is_empty() {
                         graph.push(r, true, budget)?;
@@ -536,6 +496,59 @@ impl Budget {
             self.charge_decoded(object.canonical_len())?;
             visitor(object, self, verification.as_deref_mut())
         })
+    }
+    /// Authenticate direct core roles and bounds while scheduling byte-leaf
+    /// checks on their ordinary traversal. Both walks charge repeated edges.
+    fn check_graph_children<S: ObjectStore + ?Sized>(
+        &mut self,
+        store: &S,
+        parent: ObjectRef,
+        object: ObjectView<'_>,
+        byte_lengths: &mut [u32; super::MAX_CHILDREN],
+        mut verification: Option<&mut Self>,
+    ) -> Result<()> {
+        byte_lengths[..object.children.len()].fill(0);
+        super::schema::visit_core_roles(object, |index, role| {
+            let child = object.children[index];
+            if let super::schema::CoreRole::Bytes(length) = role {
+                // A valid byte leaf has no children and exactly
+                // eight canonical header bytes. Charge every role
+                // edge now, but authenticate its actual kind/length
+                // when the graph walk authenticates that occurrence.
+                if length == 0 || length > (super::MAX_CHUNK_SIZE - 8) as u64 {
+                    return Err(corrupt("extent byte length"));
+                }
+                let length = length as u32;
+                let expected = &mut byte_lengths[index];
+                if *expected != 0 && *expected != length {
+                    return Err(corrupt("extent byte length"));
+                }
+                *expected = length;
+                self.charge_byte_role(child, length, verification.as_deref_mut())?;
+                return Ok(());
+            }
+            self.visit_for_copy(
+                store,
+                child,
+                verification.as_deref_mut(),
+                &mut |child, _, _| {
+                    role.check::<false>(super::schema::CoreShape {
+                        kind: child.kind,
+                        version: child.version,
+                        bytes: child.bytes,
+                        child_count: child.children.len(),
+                    })
+                },
+            )
+        })?;
+        for child in object.children {
+            self.edge()?;
+            if let Some(verification) = &mut verification {
+                verification.charge_edge()?;
+            }
+            self.check_reference(parent, *child)?;
+        }
+        Ok(())
     }
     fn charge_byte_role(
         &mut self,
