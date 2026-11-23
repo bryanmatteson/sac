@@ -351,6 +351,17 @@ impl NativeStore {
     pub fn open(path: impl AsRef<Path>, writable: bool) -> Result<Self> {
         Self::open_with_recovery_check(path.as_ref(), writable, None)
     }
+    /// Open for writing, recovering a damaged publication slot or an
+    /// uncommitted suffix once `check` accepts the store that the intact slot
+    /// selects. A publication only the damaged slot held is not selected; the
+    /// damaged original is kept as this store's recovery input (see
+    /// [`Self::preserved_recovery_input`]).
+    pub fn open_recovering(
+        path: impl AsRef<Path>,
+        check: &dyn Fn(&NativeStore) -> Result<()>,
+    ) -> Result<Self> {
+        Self::open_with_recovery_check(path.as_ref(), true, Some(check))
+    }
     // A WAL-owning consumer may explicitly opt into recovery of a torn slot
     // after validating its durable recovery input. Ordinary NativeStore opens
     // retain their fail-closed RecoveryRequired contract.

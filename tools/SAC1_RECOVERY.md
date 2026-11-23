@@ -147,8 +147,8 @@ elapsed-work, resident-memory, temporary-storage and output limits. Run `--help`
 for each override. Holes count as expanded logical and allocated output before
 file creation. There is no sparse-hole exemption. Inventories and preflight
 maps use a disk-backed SQLite index with a bounded page cache. CBOR
-limits are 64 open containers and 1,048,576 items, with conservative per-item
-memory charging. Physical caches are bounded; each physical occurrence and each
+nesting is limited to 64 open containers; a declared count must fit the bytes
+that remain, and each item is charged conservatively against the memory budget. Physical caches are bounded; each physical occurrence and each
 contextual tree edge is checked. The memory budget is conservative accounting
 for reader objects, not a process RSS guarantee including the Python interpreter
 and native libraries. Temp accounting reserves staged payloads and index rows;

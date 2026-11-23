@@ -151,11 +151,14 @@ and lengths and map keys in strictly increasing encoded-byte order. Duplicate
 keys, floats, tags, undefined, other simple values, indefinite lengths and
 trailing items reject. Allowed values are integers, byte/text strings, arrays,
 maps, booleans and null. Text must be UTF-8. The parser permits at most 64 open
-containers and 1,048,576 items per object; byte strings remain opaque until an
-owning schema parses them. Canonical byte length, item count and nesting depth are portable wire limits.
+containers per object; byte strings remain opaque until an owning schema parses
+them. Every item occupies at least one encoded byte, so the canonical byte
+length bounds the item count, and a declared count or length must fit the bytes
+that remain. Canonical byte length and nesting depth are portable wire limits.
 Reader allocation budgets are operational limits: reaching one means incomplete
-verification, not malformed input. The Rust owned-value decoder uses a
-16 MiB requested-allocation budget; its in-memory layout is not a wire rule.
+verification, not malformed input. The Rust owned-value decoder allocates only
+what the checked counts and lengths of its input require; its in-memory layout
+is not a wire rule.
 Borrowed readers can validate the same items without constructing value trees.
 Coalesced physical reads do not confer authentication on adjacent frames.
 Reader read-ahead remains subject to the operation's source-byte budget; frame,
@@ -333,7 +336,7 @@ workspace contains at most the 128 KiB directory canonical limit plus the
 identity domain and 33 four-chunk subtree values. The final canonical hash,
 intrinsic schema admission, child authentication and publication barriers are
 unchanged. Directory schema admission may consume fields in one pass while
-preserving deterministic CBOR and the whole-value depth and item limits.
+preserving deterministic CBOR and the whole-value depth limit.
 Native authenticated visits may reuse two idle frame/decoder/child workspaces
 within the decoded-cache budget so a parent can synchronously check a child.
 Borrowed verified writes preserve the complete ordered child identity sequence

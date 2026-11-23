@@ -13,7 +13,7 @@ fn path(s: &str) -> Vec<Vec<u8>> {
 }
 
 #[test]
-fn borrowed_cbor_agrees_with_owned_and_separates_operational_memory_limits() {
+fn borrowed_cbor_agrees_with_owned_and_both_are_bounded_by_their_input() {
     for bytes in [
         vec![0x83, 0x01, 0x42, 0xff, 0x00, 0xf6],
         vec![0xa2, 0, 0xf4, 1, 0x61, b'a'],
@@ -38,7 +38,10 @@ fn borrowed_cbor_agrees_with_owned_and_separates_operational_memory_limits() {
     let mut deep = vec![0x81; 65];
     deep.push(0);
     assert!(matches!(cbor_view::view(&deep), Err(Error::Limit(_))));
-    let count = 600_000u32;
+    assert!(matches!(cbor::decode(&deep), Err(Error::Limit(_))));
+    // No fixed item or allocation budget: a large well-formed value decodes
+    // in both forms, its declared count checked against the bytes it has.
+    let count = 1_200_000u32;
     let mut large = vec![0x9a];
     large.extend_from_slice(&count.to_be_bytes());
     large.resize(large.len() + count as usize, 0xf6);
@@ -46,7 +49,13 @@ fn borrowed_cbor_agrees_with_owned_and_separates_operational_memory_limits() {
         cbor_view::view(&large).unwrap().array().unwrap().len(),
         count as usize
     );
-    assert!(matches!(cbor::decode(&large), Err(Error::Limit(_))));
+    assert_eq!(
+        cbor::decode(&large).unwrap().as_array().unwrap().len(),
+        count as usize
+    );
+    large.pop();
+    assert!(cbor_view::view(&large).is_err());
+    assert!(cbor::decode(&large).is_err());
 }
 
 #[test]

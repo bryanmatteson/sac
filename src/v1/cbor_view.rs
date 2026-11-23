@@ -1,5 +1,5 @@
 //! Borrowed deterministic CBOR; no heap allocation or owned value tree.
-use super::cbor::{MAX_DEPTH, MAX_ITEMS};
+use super::cbor::MAX_DEPTH;
 use super::{Error, Result, corrupt};
 #[derive(Clone, Copy, Debug)]
 pub struct Item<'a> {
@@ -9,7 +9,8 @@ pub struct Item<'a> {
     argument: u64,
 }
 pub fn view(bytes: &[u8]) -> Result<Item<'_>> {
-    let mut remaining = MAX_ITEMS;
+    // Each item occupies at least one byte, so the input bounds the count.
+    let mut remaining = bytes.len();
     if scan(bytes, 0, &mut remaining, true)? != bytes.len() {
         return Err(corrupt("trailing CBOR items"));
     }
@@ -28,7 +29,7 @@ impl<'a> CheckedCursor<'a> {
     pub(crate) fn new(bytes: &'a [u8]) -> Self {
         Self {
             bytes,
-            remaining: MAX_ITEMS,
+            remaining: bytes.len(),
         }
     }
     #[inline]
@@ -132,7 +133,7 @@ fn valid_header(bytes: &[u8]) -> Option<(u8, u64, usize)> {
     (n >= minimum).then_some((major, n, 1 + width))
 }
 #[inline]
-fn header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
+pub(crate) fn header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
     let first = *bytes.first().ok_or_else(|| corrupt("truncated CBOR"))?;
     let major = first >> 5;
     let ai = first & 31;
@@ -167,7 +168,12 @@ fn header(bytes: &[u8]) -> Result<(u8, u64, usize)> {
     }
     Ok((major, n, 1 + width))
 }
-fn scan(bytes: &[u8], depth: usize, remaining: &mut usize, validate: bool) -> Result<usize> {
+pub(crate) fn scan(
+    bytes: &[u8],
+    depth: usize,
+    remaining: &mut usize,
+    validate: bool,
+) -> Result<usize> {
     *remaining = remaining.checked_sub(1).ok_or(Error::Limit("CBOR items"))?;
     let (major, n, head) = header(bytes)?;
     match major {
@@ -296,7 +302,7 @@ fn prefix(bytes: &[u8]) -> Result<Item<'_>> {
             end
         }
         _ => {
-            let mut remaining = MAX_ITEMS;
+            let mut remaining = bytes.len();
             skip(bytes, &mut remaining)?
         }
     };
@@ -529,7 +535,7 @@ mod tests {
                 .collect();
             inputs.push([&encoded[..], &[0xff, 0x00]].concat());
             for input in inputs {
-                for limit in [MAX_ITEMS, 3] {
+                for limit in [usize::MAX, 3] {
                     let (mut left, mut right) = (limit, limit);
                     let expected = scan(&input, 0, &mut left, false);
                     let actual = skip(&input, &mut right);
@@ -544,7 +550,7 @@ mod tests {
         for levels in [MAX_DEPTH, MAX_DEPTH + 1] {
             let mut input = vec![0x81; levels];
             input.push(0x00);
-            let (mut left, mut right) = (MAX_ITEMS, MAX_ITEMS);
+            let (mut left, mut right) = (usize::MAX, usize::MAX);
             assert_eq!(
                 format!("{:?}", scan(&input, 0, &mut left, false)),
                 format!("{:?}", skip(&input, &mut right))

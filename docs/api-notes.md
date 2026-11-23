@@ -224,7 +224,7 @@ view pins its page outside the store cache's residency budget.
 native codec contexts. Borrowed CBOR navigation uses each validated value's
 exact boundary for its last child, so a nested final field is not scanned again
 to find its end. Directory leaf admission consumes the outer arrays and fields
-in one forward pass, retaining deterministic CBOR, shared depth/item limits,
+in one forward pass, retaining deterministic CBOR, the shared depth limit,
 metadata, ordering and child-index checks. Other schemas validate the complete
 value before navigation.
 Schema-known unsigned integers and byte strings consume their checked header

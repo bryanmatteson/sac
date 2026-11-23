@@ -118,8 +118,8 @@ def cbor_decode(data, memory_limit=64 * MIB, *, text_keys=True):
     def parse(depth=0):
         nonlocal pos, items
         items += 1
-        if items > 1048576 or len(data) + items * 128 > memory_limit:
-            raise SacError("exhausted_limits", "CBOR item/memory limit", "resident_memory")
+        if len(data) + items * 128 > memory_limit:
+            raise SacError("exhausted_limits", "CBOR memory limit", "resident_memory")
         require(pos < len(data), "truncated CBOR")
         initial = data[pos]
         pos += 1
@@ -150,8 +150,7 @@ def cbor_decode(data, memory_limit=64 * MIB, *, text_keys=True):
             return result
         require(depth < 64, "CBOR nesting limit", "exhausted_limits")
         count = n * (2 if major == 5 else 1)
-        require(count <= len(data) - pos and count <= 1048576 - items,
-                "CBOR count exceeds enclosing bytes/items")
+        require(count <= len(data) - pos, "CBOR count exceeds enclosing bytes")
         if major == 4:
             return [parse(depth + 1) for _ in range(n)]
         pairs, previous = [], None
