@@ -1258,7 +1258,11 @@ fn execute(args: Args) -> Result<()> {
     let source = NativeReader::open_file(input.file.try_clone()?)?;
     // Encoded copies stream payloads and only need a small decoded role cache.
     // Keep that working set smaller than ordinary reads/recompression.
-    source.set_decoded_cache_budget(if args.preserve_encoding { 4 << 20 } else { 8 << 20 });
+    source.set_decoded_cache_budget(if args.preserve_encoding {
+        4 << 20
+    } else {
+        8 << 20
+    });
     let snapshot = source
         .reader()
         .snapshot()

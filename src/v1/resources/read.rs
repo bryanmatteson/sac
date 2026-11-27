@@ -580,18 +580,25 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                                 budget.check_reference(root, r)?;
                                 budget.edge()?;
                                 if let Some(output) = output.as_deref_mut() {
-                                    budget.visit_for_copy(self.store, r, None, &mut |data, _, _| {
-                                        if data.kind != 7
-                                            || data.version != 1
-                                            || !data.children.is_empty()
-                                            || data.bytes.len() as u64 != length
-                                        {
-                                            return Err(corrupt("extent byte object length or type"));
-                                        }
-                                        output
-                                            .write_all(&data.bytes[a as usize..b as usize])
-                                            .map_err(Error::from)
-                                    })?;
+                                    budget.visit_for_copy(
+                                        self.store,
+                                        r,
+                                        None,
+                                        &mut |data, _, _| {
+                                            if data.kind != 7
+                                                || data.version != 1
+                                                || !data.children.is_empty()
+                                                || data.bytes.len() as u64 != length
+                                            {
+                                                return Err(corrupt(
+                                                    "extent byte object length or type",
+                                                ));
+                                            }
+                                            output
+                                                .write_all(&data.bytes[a as usize..b as usize])
+                                                .map_err(Error::from)
+                                        },
+                                    )?;
                                 } else {
                                     // A successful graph copy checks this exact edge's
                                     // kind and length. Charge the namespace visit now.
@@ -599,7 +606,9 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                                         .checked_add(8)
                                         .and_then(|len| usize::try_from(len).ok())
                                         .filter(|len| *len <= super::super::MAX_CHUNK_SIZE)
-                                        .ok_or_else(|| corrupt("extent byte object length or type"))?;
+                                        .ok_or_else(|| {
+                                            corrupt("extent byte object length or type")
+                                        })?;
                                     budget.charge_reference(r)?;
                                     budget.charge_decoded(decoded)?;
                                 }
@@ -832,7 +841,13 @@ impl<'a, S: ObjectStore + ?Sized> ArchiveReader<'a, S> {
                         },
                     )?;
                 }
-                budget.check_graph_children(self.store, reference, object, &mut byte_lengths, None)?;
+                budget.check_graph_children(
+                    self.store,
+                    reference,
+                    object,
+                    &mut byte_lengths,
+                    None,
+                )?;
                 if object.children.is_empty() {
                     return graph.complete_for_copy(reference, object, budget);
                 }
@@ -868,7 +883,10 @@ impl<S: ObjectStore + ?Sized> VisitedFile<'_, '_, S> {
     pub fn contents(&self) -> FileContents<'_> {
         match self.data {
             FileData::Inline(bytes) => FileContents::Inline(bytes),
-            FileData::Extents(root) => FileContents::Extents { length: self.length, root: *root },
+            FileData::Extents(root) => FileContents::Extents {
+                length: self.length,
+                root: *root,
+            },
         }
     }
     pub fn read_bounded(&self, max_bytes: usize) -> Result<Vec<u8>> {
@@ -879,7 +897,8 @@ impl<S: ObjectStore + ?Sized> VisitedFile<'_, '_, S> {
         let mut budget = Budget::new(self.reader.limits.clone());
         budget.entry(self.length)?;
         let mut output = Vec::with_capacity(length);
-        self.reader.read_entry(self.entry, 0, self.length, &mut output, &mut budget)?;
+        self.reader
+            .read_entry(self.entry, 0, self.length, &mut output, &mut budget)?;
         Ok(output)
     }
 }

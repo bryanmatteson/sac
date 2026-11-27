@@ -1,13 +1,13 @@
 //! Authenticated flat maps with an immutable resource base and bucketed trie delta.
 //! Updates copy only the changed trie path; checkpoint merges only changed keys.
 use super::{
-    self as resources, ArchiveBuilder, ArchiveReader, EntryKind, ExtentAccumulator, Feature,
-    FileContents, Limits, Profile,
+    ArchiveBuilder, ArchiveReader, EntryKind, ExtentAccumulator, Feature, FileContents, Limits,
+    Profile,
 };
 use crate::v1::{
     Error, ObjectRef, ObjectStore, Result,
     cbor::{self, Value as V},
-    cbor_view,
+    cbor_view, resources,
 };
 use std::collections::BTreeMap;
 #[doc(hidden)]

@@ -214,6 +214,8 @@ enum Stage {
     Published,
     Renamed,
 }
+#[cfg(test)]
+type StageHook = Box<dyn Fn(Stage) + Send + Sync>;
 struct Shared {
     state: Mutex<State>,
     // Lock order is WAL then state. State is never held for durability barriers
@@ -224,7 +226,7 @@ struct Shared {
     path: PathBuf,
     wake: Condvar,
     #[cfg(test)]
-    hook: Mutex<Option<Box<dyn Fn(Stage) + Send + Sync>>>,
+    hook: Mutex<Option<StageHook>>,
 }
 
 /// Thread-safe byte-key/value storage with synchronous WAL acknowledgment.

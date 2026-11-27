@@ -188,7 +188,9 @@ impl Delta {
                     (
                         key,
                         match value {
-                            sac::resources::live_map::Value::Inline(bytes) => MergeValue::Inline(bytes),
+                            sac::resources::live_map::Value::Inline(bytes) => {
+                                MergeValue::Inline(bytes)
+                            }
                             sac::resources::live_map::Value::Blob { length, reference } => {
                                 MergeValue::Blob { length, reference }
                             }
@@ -544,7 +546,7 @@ impl DualMap {
             if !key_valid(key) {
                 return Err(bad("overlay resource key"));
             }
-            if let Some(previous) = reader.lookup_shared(&[key.clone()])? {
+            if let Some(previous) = reader.lookup_shared(std::slice::from_ref(key))? {
                 next_bytes = next_bytes
                     .checked_sub(
                         previous

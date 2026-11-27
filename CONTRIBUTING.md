@@ -37,7 +37,7 @@ tools/ci.sh rust python
 
 | Job | Checks |
 | --- | --- |
-| `rust` | Format check, clippy and tests with all features. |
+| `rust` | Workspace format check, clippy and tests with all features, including the registry companion. |
 | `core-only` | Clippy and tests with no default features. |
 | `features` | Tests with each optional feature alone. |
 | `msrv` | Build with the minimum supported Rust version. |
@@ -58,6 +58,8 @@ The CLI and privacy integration tests accept `SAC_TEST_BIN` as an override for
 the production executable. Use it to pin an already-built executable with the
 matching feature set when running test binaries directly in a shared checkout;
 concurrent builds with other features can replace the usual `target/debug/sac`.
+For Python/native interoperability tests, set `SAC_TEST_BINARY` to the matching
+production executable when running the `python` job.
 
 ## Independent Python reader
 

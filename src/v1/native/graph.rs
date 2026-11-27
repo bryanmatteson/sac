@@ -392,7 +392,10 @@ mod tests {
             graph.complete(r, &budget).unwrap();
             assert!(graph.completed_for_copy(r, length).unwrap());
             assert!(graph.completed_for_copy(r, length + 1).is_err());
-            let other = ObjectRef { address: reference(index + 20_000).address, ..r };
+            let other = ObjectRef {
+                address: reference(index + 20_000).address,
+                ..r
+            };
             assert!(!graph.completed_for_copy(other, length).unwrap());
         }
         assert!(graph.pop_for_copy().unwrap().is_none());

@@ -501,7 +501,7 @@ fn dual_base_overlay_checkpoint_and_sealed_resource_export() {
         for (key, value) in &expected {
             assert_eq!(
                 &resource
-                    .read_file_bounded(&[key.clone()], 65536)
+                    .read_file_bounded(std::slice::from_ref(key), 65536)
                     .unwrap()
                     .unwrap()
                     .1,
@@ -630,7 +630,9 @@ fn dual_reference_checkpoint_preserves_bytes_across_inline_blob_and_zero_transit
         assert_eq!(rebuild_control.verify(&store).unwrap(), values);
         let mut reference = ArchiveBuilder::bulk(&mut store, resources::Limits::default()).unwrap();
         for (key, bytes) in &values {
-            reference.add_file(&[key.clone()], bytes).unwrap();
+            reference
+                .add_file(std::slice::from_ref(key), bytes)
+                .unwrap();
         }
         let reference = reference.finish().unwrap();
         assert_eq!(rebuilt.hash, reference.hash);
@@ -641,7 +643,7 @@ fn dual_reference_checkpoint_preserves_bytes_across_inline_blob_and_zero_transit
         for (key, value) in &values {
             assert_eq!(
                 &reader
-                    .read_file_bounded(&[key.clone()], 262145)
+                    .read_file_bounded(std::slice::from_ref(key), 262145)
                     .unwrap()
                     .unwrap()
                     .1,

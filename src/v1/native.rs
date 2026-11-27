@@ -23,7 +23,9 @@ mod validation;
 use fresh::FreshAppends;
 #[cfg(unix)]
 pub use maintenance::{OnlineReclamation, ReclamationOptions, ReclamationStatistics};
-pub use memtable::{MemtableIoStatistics, MemtableOptions, MemtableStatistics, MemtableStore, Mutation};
+pub use memtable::{
+    MemtableIoStatistics, MemtableOptions, MemtableStatistics, MemtableStore, Mutation,
+};
 pub use spill::ClosureCopy;
 use spill::{DiskRefs, DiskStack};
 pub use temporary::TemporaryIoStatistics;
@@ -1866,12 +1868,17 @@ impl NativeStore {
         {
             return None;
         }
-        let reference = self.cache.lock().unwrap().leaf_location(self.file_identity, hash)?;
+        let reference = self
+            .cache
+            .lock()
+            .unwrap()
+            .leaf_location(self.file_identity, hash)?;
         wire::validate_address(
             reference.address,
             self.reader.first_record_offset(),
             self.reader.trailer_offset(),
-        ).ok()?;
+        )
+        .ok()?;
         self.authenticate_child(reference).ok()?;
         Some(reference)
     }
@@ -2300,7 +2307,8 @@ impl NativeReader {
             // Compute a proof only if an authenticated decoded entry can
             // retain it. One-pass encoded leaves have no entry to certify;
             // their ordinary decode already authenticated these exact bytes.
-            let proof = || track_encoding.then(|| ObjectHash(*blake3::hash(&read.frame).as_bytes()));
+            let proof =
+                || track_encoding.then(|| ObjectHash(*blake3::hash(&read.frame).as_bytes()));
             // Encoded reads only refresh proofs on existing entries. Their
             // borrowed payloads never force another owned cache allocation.
             // Ordinary role/read visits retain bounded cache admission.
@@ -2443,10 +2451,15 @@ impl ObjectStore for NativeReader {
             reference,
             true,
         )?;
-        if object.kind == 7 && object.version == 1 && object.bytes.len() >= 64 * 1024
+        if object.kind == 7
+            && object.version == 1
+            && object.bytes.len() >= 64 * 1024
             && object.children.is_empty()
         {
-            self.cache.lock().unwrap().remember_leaf(self.file_identity, reference);
+            self.cache
+                .lock()
+                .unwrap()
+                .remember_leaf(self.file_identity, reference);
         }
         Ok(VerifiedObject {
             hash: reference.hash,

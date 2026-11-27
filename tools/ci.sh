@@ -33,7 +33,7 @@ LOGS="target/ci"
 
 describe() {
     case "$1" in
-        rust) echo "format check, clippy and tests with all features" ;;
+        rust) echo "workspace format check, clippy and tests with all features" ;;
         core-only) echo "clippy and tests with no default features" ;;
         features) echo "tests with each optional feature alone" ;;
         msrv) echo "build with the minimum supported Rust version" ;;
@@ -52,13 +52,15 @@ step() {
 
 job_rust() {
     step $CARGO fmt --all --check &&
-        step $CARGO clippy --all-targets --all-features -- -D warnings &&
-        step $CARGO test --all-features
+        step $CARGO clippy --workspace --all-targets --all-features -- -D warnings &&
+        step $CARGO test --workspace --all-features --lib --bins --tests --examples &&
+        step $CARGO test --workspace --all-features --doc
 }
 
 job_core_only() {
     step $CARGO clippy --all-targets --no-default-features -- -D warnings &&
-        step $CARGO test --no-default-features
+        step $CARGO test --no-default-features --lib --bins --tests --examples &&
+        step $CARGO test --no-default-features --doc
 }
 
 # Each optional feature must build and pass its tests alone. A feature that
@@ -66,7 +68,8 @@ job_core_only() {
 # fails for the user who enables only that feature.
 job_features() {
     for feature in $FEATURES; do
-        step $CARGO test --no-default-features --features "$feature" || return 1
+        step $CARGO test --no-default-features --features "$feature" --lib --bins --tests --examples &&
+            step $CARGO test --no-default-features --features "$feature" --doc || return 1
     done
 }
 
@@ -82,7 +85,7 @@ job_msrv() {
         return 1
     fi
     step cargo "+$version" build --no-default-features &&
-        step cargo "+$version" build --all-features
+        step cargo "+$version" build --workspace --all-features
 }
 
 job_fuzz_build() {

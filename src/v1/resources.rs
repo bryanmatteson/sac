@@ -18,7 +18,8 @@ mod salvage;
 mod tree;
 pub use extract::{ExtractionEntry, ExtractionReport};
 pub use read::{
-    ArchiveReader, DirectoryValidated, Lookup, OpenedFile, ResourceView, VerificationReport, VisitedFile,
+    ArchiveReader, DirectoryValidated, Lookup, OpenedFile, ResourceView, VerificationReport,
+    VisitedFile,
 };
 #[cfg(feature = "native")]
 pub use salvage::{SalvageReport, salvage};
@@ -232,7 +233,13 @@ pub(super) fn copy_snapshot_with_verification<S: ObjectStore + ?Sized, D: Object
                     )?;
                 }
                 if !expanded {
-                    budget.check_graph_children(source, r, object, &mut byte_lengths, verification)?;
+                    budget.check_graph_children(
+                        source,
+                        r,
+                        object,
+                        &mut byte_lengths,
+                        verification,
+                    )?;
                     // Retain only references across descendants, never payloads.
                     if !object.children.is_empty() {
                         graph.push(r, true, budget)?;

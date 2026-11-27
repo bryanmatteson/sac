@@ -819,8 +819,10 @@ fn mixed_file_batches_reject_bad_descriptors_order_and_limits_atomically() {
         assert!(builder.set_files_batch(&edits).is_err());
         assert_eq!(builder.directory_root(), Some(base));
     }
-    let mut limits = Limits::default();
-    limits.max_logical_bytes = 3;
+    let limits = Limits {
+        max_logical_bytes: 3,
+        ..Limits::default()
+    };
     let mut builder = ArchiveBuilder::from_directory(&mut store, base, limits);
     assert!(
         builder

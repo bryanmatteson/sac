@@ -409,13 +409,11 @@ impl PrefixTrie {
                         remaining = &remaining[1..];
                     }
                     // A terminal must be an empty-suffix leaf, never another branch.
-                    if selected.is_none() {
-                        if let Some(reference) = next {
-                            if !matches!(Node::read(store, reference)?, Node::Leaf { suffix, .. } if suffix.is_empty())
-                            {
-                                return Err(bad("terminal must be an empty leaf"));
-                            }
-                        }
+                    if selected.is_none()
+                        && let Some(reference) = next
+                        && !matches!(Node::read(store, reference)?, Node::Leaf { suffix, .. } if suffix.is_empty())
+                    {
+                        return Err(bad("terminal must be an empty leaf"));
                     }
                 }
             }

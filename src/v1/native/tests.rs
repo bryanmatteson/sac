@@ -122,17 +122,43 @@ fn closure_copy_reports_only_completed_subtrees_in_the_destination() {
     destination.put(7, 1, b"distinct placement", &[]).unwrap();
     let mut copy = ClosureCopy::new().unwrap();
     let mut completed = Vec::new();
-    let result = copy.copy_root_observing(
-        &source, &mut destination, root, |_, _| Ok(None),
-        |store, found| { store.validate_reference(found).unwrap(); completed.push(found); },
-        &|| false,
-    ).unwrap();
-    assert_eq!(completed, vec![destination.get(result).unwrap().children[0], result]);
+    let result = copy
+        .copy_root_observing(
+            &source,
+            &mut destination,
+            root,
+            |_, _| Ok(None),
+            |store, found| {
+                store.validate_reference(found).unwrap();
+                completed.push(found);
+            },
+            &|| false,
+        )
+        .unwrap();
+    assert_eq!(
+        completed,
+        vec![destination.get(result).unwrap().children[0], result]
+    );
     assert_eq!(completed[0].hash, child.hash);
     let mut reported = false;
-    let bad = ObjectRef { address: ChunkAddress { offset: u64::MAX, length: 64 }, ..root };
-    assert!(copy.copy_root_observing(&source, &mut destination, bad, |_, _| Ok(None),
-        |_, _| reported = true, &|| false).is_err());
+    let bad = ObjectRef {
+        address: ChunkAddress {
+            offset: u64::MAX,
+            length: 64,
+        },
+        ..root
+    };
+    assert!(
+        copy.copy_root_observing(
+            &source,
+            &mut destination,
+            bad,
+            |_, _| Ok(None),
+            |_, _| reported = true,
+            &|| false
+        )
+        .is_err()
+    );
     assert!(!reported);
 }
 #[cfg(feature = "compression")]
@@ -144,7 +170,10 @@ fn retained_compressed_frames_authenticate_detached_child_ids() {
     let body = vec![0x55; 128 * 1024];
     let parent = source.put(65002, 1, &body, &[child]).unwrap();
     let verified = source.verified_object(parent).unwrap();
-    let detached = ObjectRef { hash: child.hash, address: ChunkAddress::default() };
+    let detached = ObjectRef {
+        hash: child.hash,
+        address: ChunkAddress::default(),
+    };
     let mut encoder = wire::FrameEncoder::default();
     let frame = encoder.encode_verified(&verified, &[detached]).unwrap();
     assert!(frame.len() < body.len() / 8);
@@ -157,9 +186,13 @@ fn retained_compressed_frames_authenticate_detached_child_ids() {
     assert!(wire::decode_detached_frame(parent.hash, physical).is_err());
     let mut memory = MemoryStore::sealed();
     let raw = memory.put(7, 1, b"raw canonical bytes", &[]).unwrap();
-    let frame = encoder.encode_verified(&memory.verified_object(raw).unwrap(), &[]).unwrap();
-    assert_eq!(wire::decode_detached_frame(raw.hash, frame).unwrap(), memory.get(raw).unwrap());
-
+    let frame = encoder
+        .encode_verified(&memory.verified_object(raw).unwrap(), &[])
+        .unwrap();
+    assert_eq!(
+        wire::decode_detached_frame(raw.hash, frame).unwrap(),
+        memory.get(raw).unwrap()
+    );
 }
 
 #[test]
@@ -724,8 +757,16 @@ fn reader_identity_distinguishes_a_file_copy_from_a_second_descriptor() {
     std::fs::hard_link(&path, &hard_link).unwrap();
     std::fs::copy(&path, &copy).unwrap();
     assert!(original.shares_backing_file(&store.pin().unwrap()).unwrap());
-    assert!(original.shares_backing_file(&NativeReader::open(&hard_link).unwrap()).unwrap());
-    assert!(!original.shares_backing_file(&NativeReader::open(&copy).unwrap()).unwrap());
+    assert!(
+        original
+            .shares_backing_file(&NativeReader::open(&hard_link).unwrap())
+            .unwrap()
+    );
+    assert!(
+        !original
+            .shares_backing_file(&NativeReader::open(&copy).unwrap())
+            .unwrap()
+    );
 }
 
 #[test]

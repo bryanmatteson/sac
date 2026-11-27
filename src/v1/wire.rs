@@ -675,9 +675,19 @@ impl FrameEncoder {
                 object.canonical_len(),
                 children,
                 source.hash(),
-                super::EncodedPayload { codec: 1, bytes: compressed },
+                super::EncodedPayload {
+                    codec: 1,
+                    bytes: compressed,
+                },
             ),
-            None => self.encode_parts(object.kind, object.version, &object.bytes, children, 0, source.hash()),
+            None => self.encode_parts(
+                object.kind,
+                object.version,
+                &object.bytes,
+                children,
+                0,
+                source.hash(),
+            ),
         }
     }
     /// A frame from the Zstandard bytes of another frame. A
@@ -871,9 +881,16 @@ pub fn decode_frame_owned(
 /// is looked up by its verified identity within that store's own namespace.
 pub fn decode_detached_frame(expected: ObjectHash, frame: &[u8]) -> Result<CanonicalObject> {
     let length = u32::try_from(frame.len()).map_err(|_| corrupt("detached frame size"))?;
-    let reference = ObjectRef { hash: expected, address: ChunkAddress { offset: 0, length } };
+    let reference = ObjectRef {
+        hash: expected,
+        address: ChunkAddress { offset: 0, length },
+    };
     let object = decode_frame_inner(reference, frame, None)?;
-    if object.children.iter().any(|child| child.address != ChunkAddress::default()) {
+    if object
+        .children
+        .iter()
+        .any(|child| child.address != ChunkAddress::default())
+    {
         return Err(corrupt("physical locator in detached frame"));
     }
     Ok(object)

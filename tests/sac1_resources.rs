@@ -23,18 +23,31 @@ fn traversal_files_read_inline_and_extent_bodies_at_the_visited_path() {
     let body = vec![42; 32 * 1024];
     let bytes = packed(&[("dir/large", &body), ("dir/small", b"abc")]);
     let store = PositionalStore::open(bytes).unwrap();
-    let reader = ArchiveReader::open(&store, store.reader().snapshot().unwrap(), Limits::default()).unwrap();
+    let reader = ArchiveReader::open(
+        &store,
+        store.reader().snapshot().unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
     let mut files = Vec::new();
-    reader.visit_entries_with_files(|entry, file| {
-        if let Some(file) = file {
-            assert!(file.read_bounded(2).is_err());
-            files.push((entry.path, file.read_bounded(body.len())?));
-        } else {
-            assert_eq!(entry.path, path("dir"));
-        }
-        Ok(())
-    }).unwrap();
-    assert_eq!(files, vec![(path("dir/large"), body), (path("dir/small"), b"abc".to_vec())]);
+    reader
+        .visit_entries_with_files(|entry, file| {
+            if let Some(file) = file {
+                assert!(file.read_bounded(2).is_err());
+                files.push((entry.path, file.read_bounded(body.len())?));
+            } else {
+                assert_eq!(entry.path, path("dir"));
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        files,
+        vec![
+            (path("dir/large"), body),
+            (path("dir/small"), b"abc".to_vec())
+        ]
+    );
 }
 
 #[test]
@@ -192,7 +205,11 @@ fn sealed_export_does_not_reload_childless_objects_for_postorder() {
     let snapshot = source.source.reader().snapshot().unwrap();
     let archive = ArchiveReader::open(&source, snapshot, Limits::default()).unwrap();
     assert!(archive.verify().unwrap().content_verified);
-    assert_eq!(source.payload_reads.replace(0), 1, "one read per byte occurrence");
+    assert_eq!(
+        source.payload_reads.replace(0),
+        1,
+        "one read per byte occurrence"
+    );
     let exported = sac::pack_snapshot(&source, snapshot, Vec::new()).unwrap();
     // One authenticated read checks the extent role and supplies the bytes
     // to the destination, without an eager role read or postorder reload.
