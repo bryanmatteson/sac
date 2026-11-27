@@ -38,6 +38,7 @@ usage:
   sac metadata remove <live-archive> <key> [--strip-local]
   sac metadata export <archive|-> <new-directory>
   sac inspect <archive> [--validate-profiles]
+  sac registry <command> [options]
   sac privacy-wrap <sealed-archive> <new-wrapper> --recipient age1... [--recipient ...]
   sac privacy-open <wrapper> <new-sealed-archive> --identity <key-file> [--identity ...]
 
@@ -494,8 +495,17 @@ pub fn main_with_args(
     command_name: &str,
     arguments: impl IntoIterator<Item = OsString>,
 ) -> ExitCode {
-    match Args::parse(arguments).and_then(|args| run(args, command_name)) {
-        Ok(()) => ExitCode::SUCCESS,
+    let mut arguments = arguments.into_iter().peekable();
+    let result = if arguments.peek().is_some_and(|arg| arg == "registry") {
+        arguments.next();
+        run_registry(arguments)
+    } else {
+        Args::parse(arguments)
+            .and_then(|args| run(args, command_name))
+            .map(|()| ExitCode::SUCCESS)
+    };
+    match result {
+        Ok(status) => status,
         Err(error) => {
             let code = error_code(error.as_ref());
             let _ = writeln!(
@@ -505,6 +515,43 @@ pub fn main_with_args(
             );
             ExitCode::from(if code == "Usage" { 2 } else { 1 })
         }
+    }
+}
+
+fn run_registry(arguments: impl IntoIterator<Item = OsString>) -> Result<ExitCode> {
+    let binary_name = format!("sac-registry{}", std::env::consts::EXE_SUFFIX);
+    let binary = std::env::var_os("SAC_REGISTRY_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = std::env::current_exe().ok()?.with_file_name(&binary_name);
+            path.is_file().then_some(path)
+        })
+        .unwrap_or_else(|| PathBuf::from(binary_name));
+    let mut command = std::process::Command::new(binary);
+    command
+        .args(arguments)
+        .env("SAC_REGISTRY_COMMAND", "sac registry");
+    #[cfg(unix)]
+    let error = std::os::unix::process::CommandExt::exec(&mut command);
+    #[cfg(not(unix))]
+    let error = match command.status() {
+        Ok(status) => {
+            return Ok(ExitCode::from(
+                status
+                    .code()
+                    .and_then(|code| u8::try_from(code).ok())
+                    .unwrap_or(1),
+            ));
+        }
+        Err(error) => error,
+    };
+    if error.kind() == io::ErrorKind::NotFound {
+        Err(failure(
+            "Unsupported",
+            "sac registry requires the sac-registry companion. Install it from the SAC checkout with cargo install --locked --path registry",
+        ))
+    } else {
+        Err(error.into())
     }
 }
 

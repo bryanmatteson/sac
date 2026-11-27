@@ -37,6 +37,37 @@ fn snapshot(archive: &Path) -> String {
 }
 
 #[test]
+#[cfg(unix)]
+fn registry_dispatches_arguments_to_the_companion() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = tempfile::tempdir().unwrap();
+    let companion = directory.path().join("sac-registry");
+    fs::write(
+        &companion,
+        "#!/bin/sh\nprintf '%s\n' \"$SAC_REGISTRY_COMMAND\" \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&companion, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = success(
+        command()
+            .env("SAC_REGISTRY_BIN", companion)
+            .args([
+                "registry",
+                "resolve",
+                "team/demo@1",
+                "--registry",
+                "a directory",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        output.stdout,
+        b"sac registry\nresolve\nteam/demo@1\n--registry\na directory\n"
+    );
+}
+
+#[test]
 fn inspect_reports_discovery_and_explicit_owner_validation() {
     use sac::cbor::{self, Value};
     use sac::resources::{self, Limits, Profile};

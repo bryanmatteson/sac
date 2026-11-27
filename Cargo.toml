@@ -19,6 +19,7 @@ exclude = [
     "docs/",
     "examples/",
     "tests/",
+    "registry/",
 ]
 
 [features]
@@ -62,3 +63,8 @@ unsafe_code = "deny"
 
 [lints.clippy]
 all = "warn"
+
+[workspace]
+members = ["registry"]
+default-members = ["."]
+resolver = "3"

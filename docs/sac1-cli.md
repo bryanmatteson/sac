@@ -348,3 +348,10 @@ Live maps created through `NativeStore::live_map` declare the required
 `LiveMap::checkpoint` and explicitly publish its returned ordinary resource
 snapshot before listing or extracting it with resource CLI commands. Generic
 core packing preserves a live map without interpreting it.
+
+## Artifact registry
+
+`sac registry` runs the optional registry companion. Install it from the SAC
+checkout with `cargo install --locked --path registry`. Run `sac registry --help`
+for filesystem, HTTP, and OCI commands. See the [registry guide](../registry/README.md)
+for profile discovery, exact downloads, and server setup.

@@ -1,0 +1,11 @@
+Koda — Knowledge as a Sealed Artifact
+Copyright 2026 Bryan Matteson
+
+This product is licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+SAC Registry adapts Koda Archive's bounded transfer reader and OCI manifest,
+descriptor, upload and publication logic, and the historical HTTP and filesystem
+missing-blob publication workflow from Koda revision
+765bb521b69d094d7eee2831bfcfaa55dc9cbfb8. Its records, validation and transports
+have been adapted to sealed SAC1 snapshots and their canonical objects.

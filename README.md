@@ -171,6 +171,12 @@ compressed frames with a bounded pure-Rust Zstandard decoder.
 
 ## Optional functions
 
+### Artifact registry
+
+The optional [SAC Registry](registry/README.md), available through `sac registry`,
+publishes sealed archives by exact release name. It shares frame bodies across
+archives and supports filesystem storage, HTTP ranges, and OCI distribution.
+
 ### Recovery records
 
 [Recovery records](specs/03-recovery-records-v1.md) add Reed–Solomon parity. The
