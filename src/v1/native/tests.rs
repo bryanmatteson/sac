@@ -61,6 +61,36 @@ fn save_has_two_barriers_and_durable_noop_has_none() {
     store.validate().unwrap();
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_publication_fences_case_and_hard_link_aliases_without_blocking_readers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sac");
+    let alternate_case = dir.path().join("DB.SAC");
+    let hard_link = dir.path().join("alias.sac");
+    let mut writer = NativeStore::create_live(&path, [2; 16]).unwrap();
+    assert!(!path.exists());
+    assert!(matches!(
+        NativeStore::create_live(&alternate_case, [3; 16]),
+        Err(Error::Busy)
+    ));
+
+    let snapshot = snapshot(&mut writer, b"first publication");
+    let publication = writer.publish(snapshot).unwrap();
+    std::fs::hard_link(&path, &hard_link).unwrap();
+    assert!(matches!(
+        NativeStore::open(&hard_link, true),
+        Err(Error::Busy)
+    ));
+    let pin = NativeReader::open(&hard_link).unwrap();
+    assert_eq!(pin.root(), Some(publication));
+    assert_eq!(pin.get(snapshot).unwrap(), writer.get(snapshot).unwrap());
+
+    drop(writer);
+    let mut writer = NativeStore::open(&hard_link, true).unwrap();
+    assert_eq!(writer.publish(snapshot).unwrap(), publication);
+}
+
 #[test]
 fn verified_cold_capture_leaf_is_reused_after_detaching_its_source() {
     let (dir, mut writer) = store();

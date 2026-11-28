@@ -463,19 +463,12 @@ fn install_file(staged: &Path, destination: &Path) -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(staged, fs::Permissions::from_mode(0o600))?;
     }
-    let file = File::open(staged)?;
-    file.sync_all()?;
-    #[cfg(target_os = "macos")]
-    rustix::fs::fcntl_fullfsync(&file).map_err(io::Error::from)?;
-    fs::hard_link(staged, destination)?;
-    let parent = destination
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let directory = File::open(parent)?;
-    directory.sync_all()?;
-    #[cfg(target_os = "macos")]
-    rustix::fs::fcntl_fullfsync(&directory).map_err(io::Error::from)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(cfg!(windows))
+        .open(staged)?;
+    sac::v1::durable(&file)?;
+    sac::v1::publish_link(staged, destination)?;
     Ok(())
 }
 
@@ -936,28 +929,6 @@ fn add_source<S: sac::v1::ObjectStore>(
     Ok(())
 }
 
-fn incarnation() -> Result<[u8; 16]> {
-    #[cfg(unix)]
-    {
-        let mut random = File::open("/dev/urandom")?;
-        let mut instance = [0u8; 16];
-        loop {
-            random.read_exact(&mut instance)?;
-            if instance != [0; 16] {
-                break;
-            }
-        }
-        Ok(instance)
-    }
-    #[cfg(not(unix))]
-    {
-        Err(failure(
-            "Unsupported",
-            "this native writer host lacks a supported durability contract",
-        ))
-    }
-}
-
 fn copy_limits(args: &Args) -> sac::v1::resources::Limits {
     let mut result = limits(args);
     result.max_temp_bytes = args.max_temp / 16;
@@ -1133,7 +1104,7 @@ fn execute(args: Args) -> Result<()> {
         }
         let scratch = Scratch::create(&std::env::temp_dir())?;
         let path = scratch.path.join("builder.sac");
-        let mut store = NativeStore::create_live(&path, incarnation()?)?;
+        let mut store = NativeStore::create_live(&path, sac::v1::new_incarnation()?)?;
         store.set_decoded_cache_budget(8 << 20);
         store.set_temporary_disk_budget(args.max_temp / 16)?;
         store.set_total_temporary_disk_budget(args.max_temp - args.max_temp / 4)?;
@@ -1184,7 +1155,7 @@ fn execute(args: Args) -> Result<()> {
                     .checked_add(copy_limits(&args).max_temp_bytes)
                     .ok_or_else(|| failure("LimitExceeded", "temporary byte count overflow"))?,
             )?;
-            let mut output = NativeStore::create_live(&staged, incarnation()?)?;
+            let mut output = NativeStore::create_live(&staged, sac::v1::new_incarnation()?)?;
             output.set_temporary_disk_budget(args.max_temp / 16)?;
             output.set_total_temporary_disk_budget(budget)?;
             let remaining = args
@@ -1388,7 +1359,7 @@ fn execute(args: Args) -> Result<()> {
                         .checked_add(copy_limits(&args).max_temp_bytes)
                         .ok_or_else(|| failure("LimitExceeded", "temporary byte count overflow"))?,
                 )?;
-                let mut output = NativeStore::create_live(&staged, incarnation()?)?;
+                let mut output = NativeStore::create_live(&staged, sac::v1::new_incarnation()?)?;
                 output.set_temporary_disk_budget(args.max_temp / 16)?;
                 output.set_total_temporary_disk_budget(budget)?;
                 let available = args
@@ -1697,8 +1668,10 @@ fn salvage(args: &Args, input: Input) -> Result<()> {
             .ok_or_else(|| failure("LimitExceeded", "temporary byte count overflow"))?,
     )?;
     let scratch = Scratch::create(&std::env::temp_dir())?;
-    let mut inner =
-        sac::v1::NativeStore::create_live(scratch.path.join("repaired.sac"), incarnation()?)?;
+    let mut inner = sac::v1::NativeStore::create_live(
+        scratch.path.join("repaired.sac"),
+        sac::v1::new_incarnation()?,
+    )?;
     inner.set_temporary_disk_budget(args.max_temp / 16)?;
     inner.set_total_temporary_disk_budget(budget)?;
     inner.set_decoded_cache_budget(8 << 20);

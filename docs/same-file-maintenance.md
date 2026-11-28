@@ -74,9 +74,9 @@ It discards only complete 16 KiB allocation units strictly inside dead stored
 payloads, preserving frame headers, locators and padding. Small dead frames can
 be reusable without being punchable. Unsupported filesystems return an error;
 there is no zero-writing fallback presented as disk reclamation. Other Unix
-hosts can use compaction and reuse with punching disabled. Windows native
-writable publication and these maintenance APIs remain unsupported; the portable
-SAC1 reader is separate from that native filesystem capability.
+hosts can use compaction and reuse with punching disabled. Windows supports
+ordinary native publication and replacement compaction on local NTFS. The
+same-file maintenance APIs and their reader lease protocol require Unix.
 
 ## Recovery and reuse
 

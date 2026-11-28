@@ -27,7 +27,7 @@ exclude = [
 default = ["native", "trust", "privacy-age"]
 trust = ["dep:ed25519-dalek"]
 compression = ["dep:zstd"]
-native = ["compression", "dep:tempfile", "dep:same-file", "dep:cap-std", "dep:rustix", "dep:libc"]
+native = ["compression", "dep:tempfile", "dep:same-file", "dep:cap-std", "dep:rustix", "dep:libc", "dep:getrandom", "dep:windows-sys"]
 serde = ["dep:serde"]
 http = ["dep:reqwest"]
 privacy-age = ["native", "dep:age"]
@@ -52,6 +52,10 @@ libc                  = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 rustix                = { version = "1.1.4", features = ["fs"], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+getrandom = { version = "0.4", optional = true }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_System_IO"], optional = true }
 
 [[bin]]
 name = "sac"

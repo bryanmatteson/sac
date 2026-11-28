@@ -242,8 +242,10 @@ A limit error means that the check is incomplete. Read the
 
 ## Platform support
 
-- Development and tests use macOS and Linux. Other hosts are not tested.
-- Live-store publication and confined extraction need a Unix host.
+- Native live-store publication supports Unix and local NTFS on Windows.
+  Windows uses file and directory flushes and requires a writable parent
+  directory for the publication fence and namespace changes.
+- Confined extraction and same-file maintenance require a Unix host.
 - Hole punching for same-file maintenance operates on supported macOS and
   Linux filesystems.
 

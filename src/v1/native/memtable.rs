@@ -4,7 +4,7 @@
 //! directory in the same snapshot. A separate WAL holds atomic mutation batches.
 //! A worker publishes one immutable generation while a bounded active table and
 //! a second durable WAL segment accept writes. Reads use a pinned checkpoint.
-use super::{durable, sync_parent, verify_file_path};
+use super::{durable, lock_data, sync_parent, verify_file_path};
 use crate::v1::{
     Error, NativeReader, NativeStore, ObjectRef, ObjectStore, Result, cbor, corrupt, resources,
 };
@@ -367,10 +367,7 @@ impl MemtableStore {
         let mut replacement = tempfile::Builder::new()
             .prefix(".sac-memtable-wal-")
             .tempfile_in(primary.parent().unwrap())?;
-        replacement
-            .as_file()
-            .try_lock()
-            .map_err(super::lock_error)?;
+        lock_data(replacement.as_file())?;
         replacement.write_all(&wal_header(id, state.stats.sequence))?;
         durable(replacement.as_file())?;
         let (file, temp) = replacement.into_parts();
@@ -840,7 +837,7 @@ fn private_wal(path: &Path) -> Result<File> {
         options.mode(0o600);
     }
     let file = options.open(path)?;
-    file.try_lock().map_err(super::lock_error)?;
+    lock_data(&file)?;
     Ok(file)
 }
 fn next_wal_path(primary: &Path) -> PathBuf {
@@ -919,7 +916,7 @@ fn prepare_wal(shared: &Shared, base_sequence: u64) -> Result<PreparedWal> {
     let mut prepared = tempfile::Builder::new()
         .prefix(".sac-memtable-wal-")
         .tempfile_in(primary.parent().unwrap())?;
-    prepared.as_file().try_lock().map_err(super::lock_error)?;
+    lock_data(prepared.as_file())?;
     prepared.write_all(&wal_header(id, base_sequence))?;
     let sync_start = Instant::now();
     durable(prepared.as_file())?;
@@ -1329,7 +1326,7 @@ fn validate_logs(
             return Err(corrupt("secondary WAL on legacy store"));
         }
         let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        file.try_lock().map_err(super::lock_error)?;
+        lock_data(&file)?;
         verify_file_path(&file, &path)?;
         let mut header = [0; HEADER as usize];
         file.read_exact(&mut header)?;

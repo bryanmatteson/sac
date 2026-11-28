@@ -20,6 +20,8 @@ mod platform;
 mod spill;
 mod temporary;
 mod validation;
+#[cfg(windows)]
+mod windows;
 use fresh::FreshAppends;
 #[cfg(unix)]
 pub use maintenance::{OnlineReclamation, ReclamationOptions, ReclamationStatistics};
@@ -249,35 +251,47 @@ fn lock_error(error: std::fs::TryLockError) -> Error {
         std::fs::TryLockError::Error(error) => error.into(),
     }
 }
+fn lock_data(file: &File) -> Result<()> {
+    #[cfg(windows)]
+    return windows::lock_data(file);
+    #[cfg(not(windows))]
+    file.try_lock().map_err(lock_error)
+}
 fn publication_fence(path: &Path) -> Result<(PathBuf, File)> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
-        return Err(Error::Unsupported(
+        Err(Error::Unsupported(
             "native writable host requires namespace durability".into(),
-        ));
+        ))
     }
-    let parent = std::fs::canonicalize(
-        path.parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new(".")),
-    )?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| corrupt("destination filename"))?;
-    let path = parent.join(name);
-    let lock_name = format!(
-        ".sac1-publication-{}.lock",
-        blake3::hash(name.as_encoded_bytes()).to_hex()
-    );
-    let fence = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(parent.join(lock_name))?;
-    fence.try_lock().map_err(lock_error)?;
-    Ok((path, fence))
+    #[cfg(any(unix, windows))]
+    {
+        let parent = std::fs::canonicalize(parent_directory(path))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| corrupt("destination filename"))?;
+        #[cfg(unix)]
+        let fence = {
+            let lock_name = format!(
+                ".sac1-publication-{}.lock",
+                blake3::hash(name.as_encoded_bytes()).to_hex()
+            );
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(parent.join(lock_name))?
+        };
+        #[cfg(windows)]
+        let fence = {
+            windows::directory_for_sync(&parent)?;
+            windows::open_fence(&parent, name)?
+        };
+        fence.try_lock().map_err(lock_error)?;
+        Ok((parent.join(name), fence))
+    }
 }
 impl NativeStore {
     /// Create an unpublished live container. The incarnation binds its physical
@@ -303,7 +317,7 @@ impl NativeStore {
         let (mut file, pending) = temporary.into_parts();
         #[cfg(unix)]
         platform::random_reads(&file);
-        file.try_lock().map_err(lock_error)?;
+        lock_data(&file)?;
         let first = preamble.first_record_offset();
         let mut bootstrap = vec![0; first as usize];
         bootstrap[..128].copy_from_slice(&preamble.encode());
@@ -382,7 +396,7 @@ impl NativeStore {
         #[cfg(unix)]
         platform::random_reads(&file);
         if writable {
-            file.try_lock().map_err(lock_error)?;
+            lock_data(&file)?;
             verify_file_path(&file, &path)?;
         }
         let directory = if writable {
@@ -1021,8 +1035,7 @@ impl NativeStore {
             self.barrier(true)?;
         }
         if let Some(pending) = &self.pending {
-            std::fs::hard_link(pending, &self.path)?;
-            sync_parent(&self.path)?;
+            publish_link(pending, &self.path)?;
             verify_file_path(self.file.get_mut().unwrap(), &self.path)?;
             self.pending.take();
         }
@@ -1101,7 +1114,7 @@ impl NativeStore {
         #[cfg(unix)]
         platform::random_reads(&file);
         file.write_all(&self.reader.header.encode())?;
-        file.try_lock().map_err(lock_error)?;
+        lock_data(&file)?;
         _source_extent = self.temporary_extent.replace(replacement_extent);
         self.file = Mutex::new(file);
         self.append_buffer.get_mut().unwrap().extent = AppendExtent::default();
@@ -2658,7 +2671,7 @@ fn read_trailer(
 fn slot_offset(generation: u64) -> u64 {
     4096 + (generation % 2) * 4096
 }
-fn durable(file: &File) -> Result<()> {
+pub(crate) fn durable(file: &File) -> Result<()> {
     #[cfg(target_os = "macos")]
     {
         rustix::fs::fcntl_fullfsync(file).map_err(std::io::Error::from)?;
@@ -2667,19 +2680,63 @@ fn durable(file: &File) -> Result<()> {
     file.sync_all()?;
     Ok(())
 }
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
 fn sync_parent(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        let directory = File::open(path.parent().unwrap_or(Path::new(".")))?;
+        let directory = File::open(parent_directory(path))?;
         directory.sync_all()?;
         #[cfg(target_os = "macos")]
         rustix::fs::fcntl_fullfsync(&directory).map_err(std::io::Error::from)?;
+        Ok(())
     }
-    #[cfg(not(unix))]
-    return Err(Error::Unsupported(
-        "namespace durability unavailable".into(),
-    ));
-    Ok(())
+    #[cfg(windows)]
+    {
+        windows::directory_for_sync(parent_directory(path))?.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(Error::Unsupported(
+            "namespace durability unavailable".into(),
+        ))
+    }
+}
+pub(crate) fn publish_link(source: &Path, destination: &Path) -> Result<()> {
+    #[cfg(windows)]
+    let directory = windows::directory_for_sync(parent_directory(destination))?;
+    std::fs::hard_link(source, destination)?;
+    #[cfg(windows)]
+    {
+        directory.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    sync_parent(destination)
+}
+pub(crate) fn new_incarnation() -> Result<[u8; 16]> {
+    #[cfg(any(unix, windows))]
+    {
+        let mut incarnation = [0; 16];
+        #[cfg(unix)]
+        let mut random = File::open("/dev/urandom")?;
+        while incarnation == [0; 16] {
+            #[cfg(unix)]
+            random.read_exact(&mut incarnation)?;
+            #[cfg(windows)]
+            getrandom::fill(&mut incarnation).map_err(std::io::Error::other)?;
+        }
+        Ok(incarnation)
+    }
+    #[cfg(not(any(unix, windows)))]
+    Err(Error::Unsupported(
+        "native writable host lacks an incarnation source".into(),
+    ))
 }
 fn verify_file_path(file: &File, path: &Path) -> Result<()> {
     // Check the namespace on every operation. On Unix, same-file identity is
@@ -2752,7 +2809,20 @@ fn write_at(file: &mut File, buffer: &[u8], offset: u64) -> Result<()> {
         use std::os::unix::fs::FileExt;
         file.write_all_at(buffer, offset)?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut written = 0;
+        while written < buffer.len() {
+            match file.seek_write(&buffer[written..], offset + written as u64) {
+                Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into()),
+                Ok(count) => written += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(buffer)?;
@@ -3366,8 +3436,7 @@ impl NativeStore {
         }
         let result = (|| {
             let source = self.pin()?;
-            let mut incarnation = [0; 16];
-            File::open("/dev/urandom")?.read_exact(&mut incarnation)?;
+            let incarnation = new_incarnation()?;
             // A candidate left by a killed process can carry a recycled
             // process ID and the same counter value. It is never ours.
             let mut attempts = 0;
